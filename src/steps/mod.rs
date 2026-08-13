@@ -1,3 +1,8 @@
+pub mod api;
+pub mod assert;
+pub mod vars;
+
+use crate::world::World;
 use regex::Regex;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -97,6 +102,51 @@ impl Registry {
                 hits.iter().map(|(id, _)| id).collect::<Vec<_>>()
             )),
         }
+    }
+}
+
+/// Step arguments after interpolation.
+pub struct Args {
+    pub caps: Vec<String>,
+    pub docstring: Option<String>,
+    pub table: Option<Vec<Vec<String>>>,
+}
+
+impl Args {
+    fn cap(&self, i: usize) -> &str {
+        self.caps.get(i).map(String::as_str).unwrap_or("")
+    }
+}
+
+/// One `match` instead of boxed futures and trait objects.
+pub async fn dispatch(w: &mut World, id: StepId, a: &Args) -> Result<(), String> {
+    match id {
+        StepId::SetRequestHeader => api::set_header(w, a.cap(0), a.cap(1)),
+        // The step names the value before the name: `I add "V" to the "H" request header`.
+        StepId::AddRequestHeader => api::add_header(w, a.cap(1), a.cap(0)),
+        StepId::SetQueryParam => api::set_query(w, a.cap(0), a.cap(1)),
+        StepId::SetRequestBody => api::set_body(w, a.docstring.as_ref()),
+        StepId::EmptyRequestBody => api::clear_body(w),
+        StepId::SetFormParams => api::set_form(w, a.table.as_ref()),
+        StepId::RequestPath => api::request(w, a.cap(0), "GET").await,
+        StepId::RequestPathWithMethod => {
+            let (p, m) = (a.cap(0).to_string(), a.cap(1).to_string());
+            api::request(w, &p, &m).await
+        }
+        StepId::ResponseCode => assert::response_code(w, a.cap(0)),
+        StepId::ResponseHeader => assert::response_header(w, a.cap(0), a.cap(1)),
+        StepId::ResponseBodyContainsJson => assert::body_contains_json(w, a.docstring.as_ref()),
+        StepId::ResponseBodyEqualsJson => assert::body_equals_json(w, a.docstring.as_ref()),
+        StepId::ResponseArrayLength => assert::array_length(w, a.cap(0)),
+        StepId::JsonNodeExists => assert::json_node_exists(w, a.cap(0)),
+        StepId::SetVariable => vars::set_variable(w, a.cap(0), a.cap(1), false),
+        StepId::SetVariableGlobal => vars::set_variable(w, a.cap(0), a.cap(1), true),
+        StepId::ExtractFromJson => vars::extract_from_json(w, a.cap(0), a.cap(1), false),
+        StepId::ExtractFromJsonGlobal => vars::extract_from_json(w, a.cap(0), a.cap(1), true),
+        StepId::ExtractFromCookies => vars::extract_from_cookies(w, a.cap(0), a.cap(1), false),
+        StepId::ExtractFromCookiesGlobal => vars::extract_from_cookies(w, a.cap(0), a.cap(1), true),
+        StepId::VariableEquals => vars::variable_equals(w, a.cap(0), a.cap(1), false),
+        StepId::VariableNotEquals => vars::variable_equals(w, a.cap(0), a.cap(1), true),
     }
 }
 
