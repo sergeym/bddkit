@@ -6,6 +6,7 @@ mod steps;
 mod json;
 mod http;
 mod world;
+mod validate;
 
 fn main() {
     println!("bddkit");
