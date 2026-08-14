@@ -38,7 +38,11 @@ fn apply_matcher(expected: &str, actual: &Value, path: &str) -> Option<Result<()
     let name = caps.get(1)?.as_str();
     let arg = caps.get(2)?.as_str().trim();
     let fail = |exp: String| {
-        Some(Err(Mismatch { path: path.into(), expected: exp, actual: short(actual) }))
+        Some(Err(Mismatch {
+            path: path.into(),
+            expected: exp,
+            actual: short(actual),
+        }))
     };
 
     match name {
@@ -53,7 +57,11 @@ fn apply_matcher(expected: &str, actual: &Value, path: &str) -> Option<Result<()
                 "null" => actual.is_null(),
                 _ => return fail(format!("@variableType({arg}) — unknown type")),
             };
-            if ok { Some(Ok(())) } else { fail(format!("@variableType({arg})")) }
+            if ok {
+                Some(Ok(()))
+            } else {
+                fail(format!("@variableType({arg})"))
+            }
         }
         "arrayLength" => {
             let want: usize = match arg.parse() {
@@ -62,12 +70,17 @@ fn apply_matcher(expected: &str, actual: &Value, path: &str) -> Option<Result<()
             };
             match actual.as_array() {
                 Some(a) if a.len() == want => Some(Ok(())),
-                Some(a) => fail(format!("@arrayLength({want}), actual length is {}", a.len())),
+                Some(a) => fail(format!(
+                    "@arrayLength({want}), actual length is {}",
+                    a.len()
+                )),
                 None => fail(format!("@arrayLength({want}), but the value is not an array")),
             }
         }
         "regExp" => {
-            let pattern = arg.strip_prefix('/').and_then(|s| s.rfind('/').map(|i| &s[..i]));
+            let pattern = arg
+                .strip_prefix('/')
+                .and_then(|s| s.rfind('/').map(|i| &s[..i]));
             let pattern = match pattern {
                 Some(p) => p,
                 None => return fail("@regExp(/pattern/)".into()),
@@ -80,17 +93,21 @@ fn apply_matcher(expected: &str, actual: &Value, path: &str) -> Option<Result<()
                 Some(s) => s,
                 None => return fail(format!("@regExp({arg}), but the value is not a string")),
             };
-            if re.is_match(s) { Some(Ok(())) } else { fail(format!("@regExp({arg})")) }
+            if re.is_match(s) {
+                Some(Ok(()))
+            } else {
+                fail(format!("@regExp({arg})"))
+            }
         }
         _ => fail(format!("unknown matcher @{name}")),
     }
 }
 
 fn cmp(actual: &Value, expected: &Value, path: &str, strict: bool) -> Result<(), Mismatch> {
-    if let Some(s) = expected.as_str() {
-        if let Some(r) = apply_matcher(s, actual, path) {
-            return r;
-        }
+    if let Some(s) = expected.as_str()
+        && let Some(r) = apply_matcher(s, actual, path)
+    {
+        return r;
     }
     match (actual, expected) {
         (Value::Object(a), Value::Object(e)) => {
@@ -129,9 +146,7 @@ fn cmp(actual: &Value, expected: &Value, path: &str, strict: bool) -> Result<(),
             // Loose mode: every expected element must be found somewhere,
             // order does not matter, extra elements are allowed (Imbo semantics).
             for ev in e {
-                let found = a
-                    .iter()
-                    .any(|av| cmp(av, ev, "", false).is_ok());
+                let found = a.iter().any(|av| cmp(av, ev, "", false).is_ok());
                 if !found {
                     return Err(Mismatch {
                         path: path.into(),
@@ -146,7 +161,11 @@ fn cmp(actual: &Value, expected: &Value, path: &str, strict: bool) -> Result<(),
             if actual == expected {
                 Ok(())
             } else {
-                Err(Mismatch { path: path.into(), expected: short(expected), actual: short(actual) })
+                Err(Mismatch {
+                    path: path.into(),
+                    expected: short(expected),
+                    actual: short(actual),
+                })
             }
         }
     }
@@ -248,6 +267,9 @@ mod tests {
     fn mismatch_display_shows_path_expected_actual() {
         let m = contains(&json!({"code": 422}), &json!({"code": 200})).unwrap_err();
         let s = m.to_string();
-        assert!(s.contains("root.code") && s.contains("expected") && s.contains("actual"), "{s}");
+        assert!(
+            s.contains("root.code") && s.contains("expected") && s.contains("actual"),
+            "{s}"
+        );
     }
 }

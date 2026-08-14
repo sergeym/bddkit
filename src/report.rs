@@ -15,7 +15,10 @@ pub struct FileResult {
 
 impl FileResult {
     pub fn failed(&self) -> usize {
-        self.scenarios.iter().filter(|s| s.failure.is_some()).count()
+        self.scenarios
+            .iter()
+            .filter(|s| s.failure.is_some())
+            .count()
     }
 }
 
@@ -24,7 +27,11 @@ impl FileResult {
 pub fn print_file(r: &FileResult) {
     let failed = r.failed();
     let mark = if failed == 0 { "✓" } else { "✗" };
-    println!("  {mark} {} — scenarios: {}", r.path.display(), r.scenarios.len());
+    println!(
+        "  {mark} {} — scenarios: {}",
+        r.path.display(),
+        r.scenarios.len()
+    );
     for s in &r.scenarios {
         if let Some(f) = &s.failure {
             println!("\nFAIL  {}:{} › {}", r.path.display(), s.line, s.name);

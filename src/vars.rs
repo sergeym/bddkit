@@ -1,6 +1,6 @@
+use crate::unique::{Generator, parse_kind};
 use std::collections::HashMap;
 use std::sync::LazyLock;
-use crate::unique::{Generator, parse_kind};
 
 /// Frame stack: reads look downward, writes always go to the top.
 /// The runner creates one frame per feature file; macro frames arrive in M3.
@@ -11,7 +11,10 @@ pub struct VarStack {
 
 impl VarStack {
     pub fn new() -> Self {
-        Self { frames: vec![HashMap::new()], globals: HashMap::new() }
+        Self {
+            frames: vec![HashMap::new()],
+            globals: HashMap::new(),
+        }
     }
 
     pub fn get(&self, name: &str) -> Option<&str> {
@@ -24,7 +27,10 @@ impl VarStack {
     }
 
     pub fn set(&mut self, name: &str, value: String) {
-        self.frames.last_mut().expect("the frame stack is never empty").insert(name.to_string(), value);
+        self.frames
+            .last_mut()
+            .expect("the frame stack is never empty")
+            .insert(name.to_string(), value);
     }
 
     pub fn set_global(&mut self, name: &str, value: String) {
@@ -49,7 +55,10 @@ impl VarStack {
         if self.frames.len() <= 1 {
             return Err("cannot pop the root frame".into());
         }
-        let top = self.frames.pop().ok_or("attempted to pop a frame from an empty stack")?;
+        let top = self
+            .frames
+            .pop()
+            .ok_or("attempted to pop a frame from an empty stack")?;
         let mut exported: Vec<(String, String)> = Vec::new();
         for pattern in exports {
             if let Some(prefix) = pattern.strip_suffix('*') {
@@ -85,7 +94,7 @@ static SLOT: LazyLock<regex::Regex> = LazyLock::new(|| {
 
 /// Substitutes `<<…>>`. Applied ONLY to arguments, doc strings, and table
 /// cells — never to the whole step text, or pre-run validation would be impossible.
-pub fn interpolate(input: &str, vars: &VarStack, r#gen: &Generator) -> Result<String, String> {
+pub fn interpolate(input: &str, vars: &VarStack, generator: &Generator) -> Result<String, String> {
     let mut out = String::with_capacity(input.len());
     let mut last = 0usize;
     for c in SLOT.captures_iter(input) {
@@ -94,7 +103,7 @@ pub fn interpolate(input: &str, vars: &VarStack, r#gen: &Generator) -> Result<St
         let name = c.get(1).expect("group 1 is required").as_str();
         let args = c.get(2).map(|g| g.as_str());
         let value = match (name, args) {
-            ("unique", a) => r#gen.next(parse_kind(a.unwrap_or(""))?),
+            ("unique", a) => generator.next(parse_kind(a.unwrap_or(""))?),
             ("uuid", _) => uuid::Uuid::now_v7().to_string(),
             (n, None) => vars
                 .get(n)
@@ -132,7 +141,11 @@ mod tests {
         s.set("t", "inner".into());
         assert_eq!(s.get("t"), Some("inner"));
         s.pop_frame(&[]).unwrap();
-        assert_eq!(s.get("t"), Some("outer"), "a macro must not clobber the scenario's variable");
+        assert_eq!(
+            s.get("t"),
+            Some("outer"),
+            "a macro must not clobber the scenario's variable"
+        );
     }
 
     #[test]
@@ -164,7 +177,10 @@ mod tests {
         let mut s = VarStack::new();
         s.push_frame();
         let err = s.pop_frame(&["companyId".to_string()]).unwrap_err();
-        assert!(err.contains("companyId"), "the error must name the variable: {err}");
+        assert!(
+            err.contains("companyId"),
+            "the error must name the variable: {err}"
+        );
     }
 
     #[test]
@@ -189,11 +205,22 @@ mod tests {
         let mut s = VarStack::new();
         s.set("a", "1".into());
         let err = s.pop_frame(&[]).unwrap_err();
-        assert!(err.contains("root"), "the error must explain why: {err}");
+        assert!(
+            err.contains("root"),
+            "the error must explain why: {err}"
+        );
         // the stack must stay untouched: data is in place, set() does not panic
-        assert_eq!(s.get("a"), Some("1"), "the root frame must not be damaged by the refusal");
+        assert_eq!(
+            s.get("a"),
+            Some("1"),
+            "the root frame must not be damaged by the refusal"
+        );
         s.set("b", "2".into());
-        assert_eq!(s.get("b"), Some("2"), "the stack must stay usable after the refusal");
+        assert_eq!(
+            s.get("b"),
+            Some("2"),
+            "the stack must stay usable after the refusal"
+        );
     }
 
     #[test]
@@ -203,11 +230,19 @@ mod tests {
         s.set_global("globalVar", "global".into());
         s.remove("frameVar");
         s.remove("globalVar");
-        assert_eq!(s.get("frameVar"), None, "remove must clear the frame variable");
-        assert_eq!(s.get("globalVar"), None, "remove must clear the global variable");
+        assert_eq!(
+            s.get("frameVar"),
+            None,
+            "remove must clear the frame variable"
+        );
+        assert_eq!(
+            s.get("globalVar"),
+            None,
+            "remove must clear the global variable"
+        );
     }
 
-    fn r#gen() -> Generator {
+    fn generator() -> Generator {
         Generator::new()
     }
 
@@ -215,7 +250,10 @@ mod tests {
     fn substitutes_variable() {
         let mut s = VarStack::new();
         s.set("email", "a@b.net".into());
-        assert_eq!(interpolate("to:<<email>>!", &s, &r#gen()).unwrap(), "to:a@b.net!");
+        assert_eq!(
+            interpolate("to:<<email>>!", &s, &generator()).unwrap(),
+            "to:a@b.net!"
+        );
     }
 
     #[test]
@@ -223,26 +261,29 @@ mod tests {
         let mut s = VarStack::new();
         s.set("a", "1".into());
         s.set("b", "2".into());
-        assert_eq!(interpolate("<<a>>-<<b>>", &s, &r#gen()).unwrap(), "1-2");
+        assert_eq!(interpolate("<<a>>-<<b>>", &s, &generator()).unwrap(), "1-2");
     }
 
     #[test]
     fn leaves_text_without_slots_untouched() {
         let s = VarStack::new();
-        assert_eq!(interpolate("plain text", &s, &r#gen()).unwrap(), "plain text");
+        assert_eq!(
+            interpolate("plain text", &s, &generator()).unwrap(),
+            "plain text"
+        );
     }
 
     #[test]
     fn unknown_variable_is_an_error_naming_it() {
         let s = VarStack::new();
-        let err = interpolate("<<missing>>", &s, &r#gen()).unwrap_err();
+        let err = interpolate("<<missing>>", &s, &generator()).unwrap_err();
         assert!(err.contains("is not set"), "{err}");
     }
 
     #[test]
     fn unique_calls_differ_within_one_string() {
         let s = VarStack::new();
-        let out = interpolate("<<unique(token)>>|<<unique(token)>>", &s, &r#gen()).unwrap();
+        let out = interpolate("<<unique(token)>>|<<unique(token)>>", &s, &generator()).unwrap();
         let (a, b) = out.split_once('|').unwrap();
         assert_ne!(a, b, "each call must produce a new value");
     }
@@ -250,20 +291,20 @@ mod tests {
     #[test]
     fn unique_without_argument_is_token() {
         let s = VarStack::new();
-        let out = interpolate("<<unique()>>", &s, &r#gen()).unwrap();
+        let out = interpolate("<<unique()>>", &s, &generator()).unwrap();
         assert!(out.starts_with('u'), "{out}");
     }
 
     #[test]
     fn unknown_unique_kind_is_rejected() {
         let s = VarStack::new();
-        assert!(interpolate("<<unique(banana)>>", &s, &r#gen()).is_err());
+        assert!(interpolate("<<unique(banana)>>", &s, &generator()).is_err());
     }
 
     #[test]
     fn uuid_function_produces_v7() {
         let s = VarStack::new();
-        let out = interpolate("<<uuid()>>", &s, &r#gen()).unwrap();
+        let out = interpolate("<<uuid()>>", &s, &generator()).unwrap();
         let parsed = uuid::Uuid::parse_str(&out).unwrap();
         assert_eq!(parsed.get_version_num(), 7);
     }
@@ -271,7 +312,7 @@ mod tests {
     #[test]
     fn unknown_function_is_rejected() {
         let s = VarStack::new();
-        let err = interpolate("<<microtime(true)>>", &s, &r#gen()).unwrap_err();
+        let err = interpolate("<<microtime(true)>>", &s, &generator()).unwrap_err();
         assert!(err.contains("unknown function"), "{err}");
     }
 }

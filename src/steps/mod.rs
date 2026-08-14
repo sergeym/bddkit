@@ -40,28 +40,94 @@ pub struct StepDef {
 }
 
 pub const BUILTIN_STEPS: &[StepDef] = &[
-    StepDef { id: StepId::SetRequestHeader, pattern: r#"^the "([^"]*)" request header is "([^"]*)"$"# },
-    StepDef { id: StepId::AddRequestHeader, pattern: r#"^I add "([^"]*)" to the "([^"]*)" request header$"# },
-    StepDef { id: StepId::SetQueryParam, pattern: r#"^the query parameter "([^"]*)" is "([^"]*)"$"# },
-    StepDef { id: StepId::SetRequestBody, pattern: r#"^the request body is:$"# },
-    StepDef { id: StepId::EmptyRequestBody, pattern: r#"^the request body is empty$"# },
-    StepDef { id: StepId::SetFormParams, pattern: r#"^the request form parameters are:$"# },
-    StepDef { id: StepId::RequestPathWithMethod, pattern: r#"^I request "([^"]*)" using HTTP (GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)$"# },
-    StepDef { id: StepId::RequestPath, pattern: r#"^I request "([^"]*)"$"# },
-    StepDef { id: StepId::ResponseCode, pattern: r#"^the response code is (\d+)$"# },
-    StepDef { id: StepId::ResponseBodyContainsJson, pattern: r#"^the response body contains JSON:$"# },
-    StepDef { id: StepId::ResponseBodyEqualsJson, pattern: r#"^the response body equals JSON:$"# },
-    StepDef { id: StepId::ResponseArrayLength, pattern: r#"^the response body is a JSON array of length (\d+)$"# },
-    StepDef { id: StepId::ResponseHeader, pattern: r#"^the "([^"]*)" response header is "([^"]*)"$"# },
-    StepDef { id: StepId::JsonNodeExists, pattern: r#"^the JSON node "([^"]*)" should exist$"# },
-    StepDef { id: StepId::SetVariableGlobal, pattern: r#"^set variable "([^"]*)" to "([^"]*)" global$"# },
-    StepDef { id: StepId::SetVariable, pattern: r#"^set variable "([^"]*)" to "([^"]*)"$"# },
-    StepDef { id: StepId::ExtractFromJsonGlobal, pattern: r#"^extract "([^"]*)" from JSON as "([^"]*)" global$"# },
-    StepDef { id: StepId::ExtractFromJson, pattern: r#"^extract "([^"]*)" from JSON as "([^"]*)"$"# },
-    StepDef { id: StepId::ExtractFromCookiesGlobal, pattern: r#"^extract "([^"]*)" from cookies as "([^"]*)" global$"# },
-    StepDef { id: StepId::ExtractFromCookies, pattern: r#"^extract "([^"]*)" from cookies as "([^"]*)"$"# },
-    StepDef { id: StepId::VariableNotEquals, pattern: r#"^variable "([^"]*)" should not be equal to "([^"]*)"$"# },
-    StepDef { id: StepId::VariableEquals, pattern: r#"^variable "([^"]*)" should be equal to "([^"]*)"$"# },
+    StepDef {
+        id: StepId::SetRequestHeader,
+        pattern: r#"^the "([^"]*)" request header is "([^"]*)"$"#,
+    },
+    StepDef {
+        id: StepId::AddRequestHeader,
+        pattern: r#"^I add "([^"]*)" to the "([^"]*)" request header$"#,
+    },
+    StepDef {
+        id: StepId::SetQueryParam,
+        pattern: r#"^the query parameter "([^"]*)" is "([^"]*)"$"#,
+    },
+    StepDef {
+        id: StepId::SetRequestBody,
+        pattern: r#"^the request body is:$"#,
+    },
+    StepDef {
+        id: StepId::EmptyRequestBody,
+        pattern: r#"^the request body is empty$"#,
+    },
+    StepDef {
+        id: StepId::SetFormParams,
+        pattern: r#"^the request form parameters are:$"#,
+    },
+    StepDef {
+        id: StepId::RequestPathWithMethod,
+        pattern: r#"^I request "([^"]*)" using HTTP (GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)$"#,
+    },
+    StepDef {
+        id: StepId::RequestPath,
+        pattern: r#"^I request "([^"]*)"$"#,
+    },
+    StepDef {
+        id: StepId::ResponseCode,
+        pattern: r#"^the response code is (\d+)$"#,
+    },
+    StepDef {
+        id: StepId::ResponseBodyContainsJson,
+        pattern: r#"^the response body contains JSON:$"#,
+    },
+    StepDef {
+        id: StepId::ResponseBodyEqualsJson,
+        pattern: r#"^the response body equals JSON:$"#,
+    },
+    StepDef {
+        id: StepId::ResponseArrayLength,
+        pattern: r#"^the response body is a JSON array of length (\d+)$"#,
+    },
+    StepDef {
+        id: StepId::ResponseHeader,
+        pattern: r#"^the "([^"]*)" response header is "([^"]*)"$"#,
+    },
+    StepDef {
+        id: StepId::JsonNodeExists,
+        pattern: r#"^the JSON node "([^"]*)" should exist$"#,
+    },
+    StepDef {
+        id: StepId::SetVariableGlobal,
+        pattern: r#"^set variable "([^"]*)" to "([^"]*)" global$"#,
+    },
+    StepDef {
+        id: StepId::SetVariable,
+        pattern: r#"^set variable "([^"]*)" to "([^"]*)"$"#,
+    },
+    StepDef {
+        id: StepId::ExtractFromJsonGlobal,
+        pattern: r#"^extract "([^"]*)" from JSON as "([^"]*)" global$"#,
+    },
+    StepDef {
+        id: StepId::ExtractFromJson,
+        pattern: r#"^extract "([^"]*)" from JSON as "([^"]*)"$"#,
+    },
+    StepDef {
+        id: StepId::ExtractFromCookiesGlobal,
+        pattern: r#"^extract "([^"]*)" from cookies as "([^"]*)" global$"#,
+    },
+    StepDef {
+        id: StepId::ExtractFromCookies,
+        pattern: r#"^extract "([^"]*)" from cookies as "([^"]*)"$"#,
+    },
+    StepDef {
+        id: StepId::VariableNotEquals,
+        pattern: r#"^variable "([^"]*)" should not be equal to "([^"]*)"$"#,
+    },
+    StepDef {
+        id: StepId::VariableEquals,
+        pattern: r#"^variable "([^"]*)" should be equal to "([^"]*)"$"#,
+    },
 ];
 
 pub struct Registry {
@@ -202,7 +268,10 @@ mod tests {
 
     #[test]
     fn captures_path_and_method() {
-        let (id, caps) = reg().find(r#"I request "/api/v1/x" using HTTP PATCH"#).unwrap().unwrap();
+        let (id, caps) = reg()
+            .find(r#"I request "/api/v1/x" using HTTP PATCH"#)
+            .unwrap()
+            .unwrap();
         assert_eq!(id, StepId::RequestPathWithMethod);
         assert_eq!(caps, vec!["/api/v1/x".to_string(), "PATCH".to_string()]);
     }
@@ -216,7 +285,10 @@ mod tests {
 
     #[test]
     fn global_suffix_picks_the_global_variant() {
-        let (id, _) = reg().find(r#"set variable "a" to "1" global"#).unwrap().unwrap();
+        let (id, _) = reg()
+            .find(r#"set variable "a" to "1" global"#)
+            .unwrap()
+            .unwrap();
         assert_eq!(id, StepId::SetVariableGlobal);
         let (id, _) = reg().find(r#"set variable "a" to "1""#).unwrap().unwrap();
         assert_eq!(id, StepId::SetVariable);
@@ -224,7 +296,12 @@ mod tests {
 
     #[test]
     fn unknown_method_is_not_a_known_step() {
-        assert!(reg().find(r#"I request "/ping" using HTTP POSTT"#).unwrap().is_none());
+        assert!(
+            reg()
+                .find(r#"I request "/ping" using HTTP POSTT"#)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

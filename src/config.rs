@@ -104,20 +104,26 @@ suites:
     #[test]
     fn suite_concurrency_overrides_global() {
         let c = parse(SAMPLE).unwrap();
-        assert_eq!(c.suite_concurrency("review"), 4, "the suite's value overrides");
+        assert_eq!(
+            c.suite_concurrency("review"),
+            4,
+            "the suite's value overrides"
+        );
         assert_eq!(c.suite_concurrency("billing"), 8, "otherwise the global one");
     }
 
     #[test]
     fn expands_environment_variables() {
         unsafe { std::env::set_var("BDDKIT_TEST_HOST", "example.test") };
-        let c = parse("suites:\n  s:\n    base_url: http://${BDDKIT_TEST_HOST}\n    paths: [f]\n").unwrap();
+        let c = parse("suites:\n  s:\n    base_url: http://${BDDKIT_TEST_HOST}\n    paths: [f]\n")
+            .unwrap();
         assert_eq!(c.suites["s"].base_url, "http://example.test");
     }
 
     #[test]
     fn missing_environment_variable_is_an_error() {
-        let err = parse("suites:\n  s:\n    base_url: ${BDDKIT_ABSENT_VAR}\n    paths: [f]\n").unwrap_err();
+        let err = parse("suites:\n  s:\n    base_url: ${BDDKIT_ABSENT_VAR}\n    paths: [f]\n")
+            .unwrap_err();
         assert!(err.to_string().contains("BDDKIT_ABSENT_VAR"), "{err}");
     }
 
@@ -143,12 +149,16 @@ suites:
         let c = load(&path).unwrap();
         assert_eq!(c.suites.len(), 1);
         assert_eq!(c.suites["review"].base_url, "http://review.local");
-        assert_eq!(c.suites["review"].paths, vec![PathBuf::from("features/review")]);
+        assert_eq!(
+            c.suites["review"].paths,
+            vec![PathBuf::from("features/review")]
+        );
     }
 
     #[test]
     fn concurrency_defaults_to_eight_when_omitted() {
-        let path = std::env::temp_dir().join("bddkit_cfg_concurrency_defaults_to_eight_when_omitted.yaml");
+        let path = std::env::temp_dir()
+            .join("bddkit_cfg_concurrency_defaults_to_eight_when_omitted.yaml");
         std::fs::write(
             &path,
             "suites:\n  s:\n    base_url: http://s.local\n    paths: [f]\n",

@@ -91,7 +91,11 @@ mod tests {
     #[test]
     fn run_id_is_twelve_chars() {
         let g = Generator::new();
-        assert_eq!(g.run_id().len(), 12, "run_id = 6 time chars + 6 random chars");
+        assert_eq!(
+            g.run_id().len(),
+            12,
+            "run_id = 6 time chars + 6 random chars"
+        );
     }
 
     #[test]
@@ -101,7 +105,10 @@ mod tests {
         let uniq: HashSet<&String> = vals.iter().collect();
         assert_eq!(uniq.len(), 1000, "all values from one run must be distinct");
         for v in &vals {
-            assert!(v.starts_with(&format!("u{}", g.run_id())), "shared run prefix: {v}");
+            assert!(
+                v.starts_with(&format!("u{}", g.run_id())),
+                "shared run prefix: {v}"
+            );
         }
     }
 
@@ -135,6 +142,9 @@ mod tests {
             assert_eq!(parse_kind(s).unwrap(), UniqueKind::Token, "{s}");
         }
         assert_eq!(parse_kind("number").unwrap(), UniqueKind::Number);
-        assert!(parse_kind("uuid").is_err(), "an unknown kind must be rejected");
+        assert!(
+            parse_kind("uuid").is_err(),
+            "an unknown kind must be rejected"
+        );
     }
 }

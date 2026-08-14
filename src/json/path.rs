@@ -5,9 +5,9 @@ use serde_json::Value;
 /// only ever used this syntax.
 pub fn read<'a>(root: &'a Value, path: &str) -> Result<&'a Value, String> {
     let path = path.trim();
-    let path = path.strip_prefix("root.").unwrap_or_else(|| {
-        if path == "root" { "" } else { path }
-    });
+    let path = path
+        .strip_prefix("root.")
+        .unwrap_or_else(|| if path == "root" { "" } else { path });
     let mut cur = root;
     let mut walked = String::from("root");
 
@@ -75,7 +75,10 @@ mod tests {
 
     #[test]
     fn reads_nested_key() {
-        assert_eq!(read(&doc(), "data.items[1].email").unwrap(), &json!("c@d.net"));
+        assert_eq!(
+            read(&doc(), "data.items[1].email").unwrap(),
+            &json!("c@d.net")
+        );
     }
 
     #[test]

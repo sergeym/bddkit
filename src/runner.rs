@@ -7,7 +7,12 @@ use crate::world::World;
 use anyhow::Result;
 use std::sync::Arc;
 
-fn prepare(step: &ExpandedStep, caps: Vec<String>, vars: &VarStack, generator: &Generator) -> Result<Args, String> {
+fn prepare(
+    step: &ExpandedStep,
+    caps: Vec<String>,
+    vars: &VarStack,
+    generator: &Generator,
+) -> Result<Args, String> {
     // Substitution is applied to arguments, doc strings, and table cells —
     // never to the whole step text.
     let caps = caps
@@ -24,11 +29,19 @@ fn prepare(step: &ExpandedStep, caps: Vec<String>, vars: &VarStack, generator: &
         .as_ref()
         .map(|rows| {
             rows.iter()
-                .map(|r| r.iter().map(|c| interpolate(c, vars, generator)).collect::<Result<Vec<_>, _>>())
+                .map(|r| {
+                    r.iter()
+                        .map(|c| interpolate(c, vars, generator))
+                        .collect::<Result<Vec<_>, _>>()
+                })
                 .collect::<Result<Vec<_>, _>>()
         })
         .transpose()?;
-    Ok(Args { caps, docstring, table })
+    Ok(Args {
+        caps,
+        docstring,
+        table,
+    })
 }
 
 /// Runs one feature file. The variable frame is shared for the file; HTTP state
@@ -90,8 +103,15 @@ pub async fn run_file(
                     break;
                 }
             }
-            scenarios.push(ScenarioResult { name: ex.name, line: ex.line, failure });
+            scenarios.push(ScenarioResult {
+                name: ex.name,
+                line: ex.line,
+                failure,
+            });
         }
     }
-    Ok(FileResult { path: lf.path.clone(), scenarios })
+    Ok(FileResult {
+        path: lf.path.clone(),
+        scenarios,
+    })
 }

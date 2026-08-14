@@ -34,7 +34,10 @@ pub fn set_form(w: &mut World, table: Option<&Vec<Vec<String>>>) -> Result<(), S
     if head.len() != 2 || head[0] != "name" || head[1] != "value" {
         return Err("table must have exactly two columns: name | value".into());
     }
-    let pairs = rows[1..].iter().map(|r| (r[0].clone(), r[1].clone())).collect();
+    let pairs = rows[1..]
+        .iter()
+        .map(|r| (r[0].clone(), r[1].clone()))
+        .collect();
     w.http.set_form(pairs);
     Ok(())
 }

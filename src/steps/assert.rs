@@ -1,12 +1,16 @@
 use crate::json::{matcher, path};
 use crate::world::World;
 
-fn last<'a>(w: &'a World) -> Result<&'a crate::http::Exchange, String> {
-    w.http.last().ok_or_else(|| "no request has been sent yet".to_string())
+fn last(w: &World) -> Result<&crate::http::Exchange, String> {
+    w.http
+        .last()
+        .ok_or_else(|| "no request has been sent yet".to_string())
 }
 
 pub fn response_code(w: &World, expected: &str) -> Result<(), String> {
-    let want: u16 = expected.parse().map_err(|_| format!("invalid code {expected:?}"))?;
+    let want: u16 = expected
+        .parse()
+        .map_err(|_| format!("invalid code {expected:?}"))?;
     let got = last(w)?.status;
     if got == want {
         Ok(())
@@ -46,13 +50,18 @@ pub fn body_equals_json(w: &World, docstring: Option<&String>) -> Result<(), Str
 }
 
 pub fn array_length(w: &World, expected: &str) -> Result<(), String> {
-    let want: usize = expected.parse().map_err(|_| format!("invalid length {expected:?}"))?;
+    let want: usize = expected
+        .parse()
+        .map_err(|_| format!("invalid length {expected:?}"))?;
     let v = last(w)?.json()?;
     let arr = v.as_array().ok_or("response body is not an array")?;
     if arr.len() == want {
         Ok(())
     } else {
-        Err(format!("    expected: array of length {want}\n    actual:   length {}", arr.len()))
+        Err(format!(
+            "    expected: array of length {want}\n    actual:   length {}",
+            arr.len()
+        ))
     }
 }
 

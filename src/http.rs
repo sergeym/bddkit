@@ -26,10 +26,10 @@ impl Exchange {
                 continue;
             }
             let pair = v.split(';').next().unwrap_or("");
-            if let Some((k, val)) = pair.split_once('=') {
-                if k.trim() == name {
-                    return Some(val.trim().to_string());
-                }
+            if let Some((k, val)) = pair.split_once('=')
+                && k.trim() == name
+            {
+                return Some(val.trim().to_string());
             }
         }
         None
@@ -121,6 +121,10 @@ impl HttpState {
     }
 
     pub async fn send(&mut self, path: &str, method: &str) -> Result<(), String> {
+        // Reset the previous exchange BEFORE sending: on a network failure (connection
+        // refused, timeout) no successful exchange is recorded, and a failure dump would
+        // otherwise show a stale response from a previous step as the failed one's.
+        self.last = None;
         let mut url = self
             .base_url
             .join(path)
@@ -153,14 +157,20 @@ impl HttpState {
             None
         };
 
-        let resp = req.send().await.map_err(|e| format!("request failed: {e}"))?;
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| format!("request failed: {e}"))?;
         let status = resp.status().as_u16();
         let resp_headers = resp
             .headers()
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("<non-UTF8>").to_string()))
             .collect();
-        let body = resp.text().await.map_err(|e| format!("failed to read response body: {e}"))?;
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| format!("failed to read response body: {e}"))?;
 
         self.last = Some(Exchange {
             method: m.to_string(),
@@ -200,6 +210,15 @@ mod tests {
         assert_eq!(s.headers.len(), 2);
     }
 
+    #[tokio::test]
+    async fn failed_send_leaves_no_stale_exchange() {
+        // Port 1 is unreachable: send fails at the transport level. `last` must stay
+        // None, or a failure dump would show a stale exchange.
+        let mut s = state();
+        assert!(s.send("/x", "GET").await.is_err());
+        assert!(s.last().is_none(), "a failed send must not leave a stale exchange");
+    }
+
     #[test]
     fn body_and_form_are_mutually_exclusive() {
         let mut s = state();
@@ -219,7 +238,10 @@ mod tests {
             req_body: None,
             status: 200,
             resp_headers: vec![
-                ("set-cookie".into(), "jwt_token=abc123; Path=/; HttpOnly".into()),
+                (
+                    "set-cookie".into(),
+                    "jwt_token=abc123; Path=/; HttpOnly".into(),
+                ),
                 ("set-cookie".into(), "refresh_token=def; Path=/".into()),
             ],
             body: String::new(),

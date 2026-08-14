@@ -1,0 +1,4 @@
+suites:
+  demo:
+    base_url: ${BDDKIT_STUB_URL}
+    paths: [tests/features]

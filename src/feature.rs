@@ -31,8 +31,9 @@ fn to_step(s: &gherkin::Step) -> ExpandedStep {
     }
 }
 
-static PLACEHOLDER: std::sync::LazyLock<regex::Regex> =
-    std::sync::LazyLock::new(|| regex::Regex::new(r"<<(\w+)>>|<(\w+)>").expect("constant regex"));
+static PLACEHOLDER: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"<<(\w+)>>|<(\w+)>").expect("constant regex")
+});
 
 /// Substitutes `<key>` from an Examples row. Single pass, because a naive
 /// `replace("<key>", v)` would eat the inner `<key>` inside the runtime token `<<key>>`
@@ -45,10 +46,17 @@ fn substitute(text: &str, keys: &[String], row: &[String]) -> String {
             if let Some(m) = caps.get(1) {
                 return format!("<<{}>>", m.as_str()); // runtime token, leave untouched
             }
-            let key = caps.get(2).expect("second group when the first is absent").as_str();
+            let key = caps
+                .get(2)
+                .expect("second group when the first is absent")
+                .as_str();
             match keys.iter().position(|k| k == key) {
                 Some(i) => row[i].clone(),
-                None => caps.get(0).expect("group 0 always exists").as_str().to_string(),
+                None => caps
+                    .get(0)
+                    .expect("group 0 always exists")
+                    .as_str()
+                    .to_string(),
             }
         })
         .into_owned()
@@ -68,7 +76,9 @@ pub fn expand_outlines(sc: &gherkin::Scenario) -> Vec<ExpandedScenario> {
     let mut out = Vec::new();
     for ex in &sc.examples {
         let Some(table) = &ex.table else { continue };
-        let Some(keys) = table.rows.first() else { continue };
+        let Some(keys) = table.rows.first() else {
+            continue;
+        };
         for row in table.rows.iter().skip(1) {
             let steps = base
                 .iter()
@@ -96,7 +106,10 @@ pub fn expand_outlines(sc: &gherkin::Scenario) -> Vec<ExpandedScenario> {
 pub fn load(path: &Path) -> Result<LoadedFeature> {
     let feature = Feature::parse_path(path, GherkinEnv::default())
         .with_context(|| format!("failed to parse {}", path.display()))?;
-    Ok(LoadedFeature { path: path.to_path_buf(), feature })
+    Ok(LoadedFeature {
+        path: path.to_path_buf(),
+        feature,
+    })
 }
 
 /// Recursively collects `.feature` files from directories; a file path is taken as-is.
@@ -117,7 +130,9 @@ fn collect(p: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     if !p.is_dir() {
         anyhow::bail!("path {} does not exist", p.display());
     }
-    for entry in std::fs::read_dir(p).with_context(|| format!("failed to read {}", p.display()))? {
+    for entry in
+        std::fs::read_dir(p).with_context(|| format!("failed to read {}", p.display()))?
+    {
         let entry = entry?;
         let path = entry.path();
         if path.is_dir() {
@@ -163,7 +178,8 @@ Feature: demo
 
     #[test]
     fn scenario_without_examples_expands_to_one() {
-        let f = parse_str("Feature: f\n  Scenario: s\n    Then the response code is 200\n").unwrap();
+        let f =
+            parse_str("Feature: f\n  Scenario: s\n    Then the response code is 200\n").unwrap();
         let e = expand_outlines(&f.scenarios[0]);
         assert_eq!(e.len(), 1);
         assert_eq!(e[0].name, "s");
@@ -188,7 +204,11 @@ Feature: f
         assert_eq!(e[0].steps[0].text, "I request \"/ping\" using HTTP POST");
         assert_eq!(e[0].steps[1].text, "the response code is 405");
         assert_eq!(e[1].steps[0].text, "I request \"/ping\" using HTTP DELETE");
-        assert!(e[0].name.contains("POST"), "the name must distinguish rows: {}", e[0].name);
+        assert!(
+            e[0].name.contains("POST"),
+            "the name must distinguish rows: {}",
+            e[0].name
+        );
     }
 
     #[test]
@@ -207,7 +227,13 @@ Feature: f
         let f = parse_str(src).unwrap();
         let e = expand_outlines(&f.scenarios[0]);
         assert_eq!(e.len(), 1);
-        assert!(e[0].steps[0].docstring.as_ref().unwrap().contains("a@b.net"));
+        assert!(
+            e[0].steps[0]
+                .docstring
+                .as_ref()
+                .unwrap()
+                .contains("a@b.net")
+        );
     }
 
     #[test]
@@ -240,7 +266,10 @@ Feature: f
         let f = parse_str(src).unwrap();
         let e = expand_outlines(&f.scenarios[0]);
         assert_eq!(e.len(), 1);
-        assert_eq!(e[0].steps[0].text, "I request \"/users/<<userId>>/ban\" using HTTP GET");
+        assert_eq!(
+            e[0].steps[0].text,
+            "I request \"/users/<<userId>>/ban\" using HTTP GET"
+        );
     }
 
     #[test]

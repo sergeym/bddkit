@@ -14,7 +14,11 @@ pub struct World {
 
 impl World {
     pub fn new(base_url: &str, timeout_secs: u64, generator: Arc<Generator>) -> Result<Self> {
-        Ok(Self { vars: VarStack::new(), http: HttpState::new(base_url, timeout_secs)?, generator })
+        Ok(Self {
+            vars: VarStack::new(),
+            http: HttpState::new(base_url, timeout_secs)?,
+            generator,
+        })
     }
 
     /// Called at the scenario boundary: the request resets, variables remain.

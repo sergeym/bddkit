@@ -31,7 +31,12 @@ pub fn extract_from_json(w: &mut World, p: &str, name: &str, global: bool) -> Re
     Ok(())
 }
 
-pub fn extract_from_cookies(w: &mut World, cookie: &str, name: &str, global: bool) -> Result<(), String> {
+pub fn extract_from_cookies(
+    w: &mut World,
+    cookie: &str,
+    name: &str,
+    global: bool,
+) -> Result<(), String> {
     let ex = w.http.last().ok_or("no request has been sent yet")?;
     let value = ex
         .set_cookie(cookie)
@@ -45,11 +50,16 @@ pub fn extract_from_cookies(w: &mut World, cookie: &str, name: &str, global: boo
 }
 
 pub fn variable_equals(w: &World, name: &str, expected: &str, negate: bool) -> Result<(), String> {
-    let got = w.vars.get(name).ok_or_else(|| format!("variable {name:?} is not set"))?;
+    let got = w
+        .vars
+        .get(name)
+        .ok_or_else(|| format!("variable {name:?} is not set"))?;
     let equal = got == expected;
     match (equal, negate) {
         (true, false) | (false, true) => Ok(()),
         (false, false) => Err(format!("    expected: {expected}\n    actual:   {got}")),
-        (true, true) => Err(format!("value must not equal {expected:?}, but it does")),
+        (true, true) => Err(format!(
+            "value must not equal {expected:?}, but it does"
+        )),
     }
 }
