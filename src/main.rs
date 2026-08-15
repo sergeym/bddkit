@@ -1,4 +1,5 @@
 mod config;
+mod db;
 mod feature;
 mod http;
 mod json;
@@ -48,7 +49,7 @@ async fn main() -> Result<()> {
 
     let problems = validate::check(&loaded, &reg);
     if !problems.is_empty() {
-        eprintln!("error: {} problem(s) found, run not started\n", problems.len());
+        eprintln!("error: {} problem(s), run not started\n", problems.len());
         for p in &problems {
             eprintln!("{p}");
         }
@@ -73,8 +74,8 @@ async fn main() -> Result<()> {
                 report::print_file(&r);
                 results.push(r);
             }
-            // An infra-level error for a file (e.g. an invalid base_url)
-            // must not abort the whole run: print it and move to the next file.
+            // A file-level infrastructure error (e.g. an invalid base_url)
+            // must not abort the whole run: print it and move on to the next file.
             Err(e) => {
                 eprintln!("ERROR  {}: {e:#}", loaded[idx].path.display());
                 infra_failed = true;

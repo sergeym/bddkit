@@ -27,6 +27,15 @@ pub struct Suite {
     pub timeout_secs: u64,
     #[serde(default)]
     pub concurrency: Option<usize>,
+    #[serde(default)]
+    pub connections: BTreeMap<String, Connection>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Connection {
+    pub dsn: String,
+    #[serde(default)]
+    pub search_path: Vec<String>,
 }
 
 impl Config {
@@ -166,5 +175,33 @@ suites:
         .unwrap();
         let c = load(&path).unwrap();
         assert_eq!(c.concurrency, 8, "default global concurrency");
+    }
+
+    #[test]
+    fn reads_connections_with_search_path() {
+        let src = "\
+suites:
+  review:
+    base_url: http://review.local
+    paths: [features/review]
+    connections:
+      default:
+        dsn: postgres://u:p@db:5432/review
+        search_path: [app, public]
+      audit:
+        dsn: postgres://u:p@db2:5432/audit
+";
+        let c = parse(src).unwrap();
+        let conns = &c.suites["review"].connections;
+        assert_eq!(conns.len(), 2);
+        assert_eq!(conns["default"].dsn, "postgres://u:p@db:5432/review");
+        assert_eq!(conns["default"].search_path, vec!["app", "public"]);
+        assert!(conns["audit"].search_path.is_empty(), "search_path defaults to empty");
+    }
+
+    #[test]
+    fn suite_without_connections_parses() {
+        let c = parse(SAMPLE).unwrap();
+        assert!(c.suites["review"].connections.is_empty(), "connections are optional");
     }
 }

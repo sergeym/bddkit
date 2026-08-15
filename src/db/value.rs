@@ -1,0 +1,132 @@
+use crate::vars::NULL_SENTINEL;
+
+/// A column value: `None` is SQL NULL, `Some` is text (to be cast in SQL).
+type Pair = (String, Option<String>);
+
+fn make_value(raw: &str) -> Option<String> {
+    let v = raw.trim();
+    if v == NULL_SENTINEL {
+        None
+    } else {
+        Some(v.to_string())
+    }
+}
+
+/// Parses `col:val, col2:val2`. An escaped comma `\,` is a literal.
+/// A value equal to the NULL sentinel yields `None`. An empty string is an empty list.
+/// An ambiguous piece without `:` is an explicit error, not a silent bad split.
+pub fn parse_oneliner(s: &str) -> Result<Vec<Pair>, String> {
+    if s.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    const COMMA_ESCAPE: &str = "\u{0}comma\u{0}";
+    let protected = s.replace("\\,", COMMA_ESCAPE);
+    let mut out = Vec::new();
+    for piece in protected.split(',') {
+        let piece = piece.replace(COMMA_ESCAPE, ",");
+        let (col, val) = piece
+            .split_once(':')
+            .ok_or_else(|| format!("failed to split column on ':' in {piece:?}"))?;
+        let col = col.trim().to_string();
+        if col.is_empty() {
+            return Err(format!("empty column name in {piece:?}"));
+        }
+        out.push((col, make_value(val)));
+    }
+    Ok(out)
+}
+
+/// The "wide" table for `I have "T" where:`: the first row is column names,
+/// each following row is values. The result is one set of pairs per data row.
+pub fn pairs_from_wide(rows: &[Vec<String>]) -> Result<Vec<Vec<Pair>>, String> {
+    let header = rows.first().ok_or("table is empty")?;
+    let mut result = Vec::new();
+    for row in &rows[1..] {
+        let mut pairs = Vec::with_capacity(header.len());
+        for (i, col) in header.iter().enumerate() {
+            let raw = row.get(i).map(String::as_str).unwrap_or("");
+            pairs.push((col.trim().to_string(), make_value(raw)));
+        }
+        result.push(pairs);
+    }
+    Ok(result)
+}
+
+/// The "tall" table for `I should have "T" with:`: the first row is a header
+/// (`| column | value |`), each following row is a "column, value" pair.
+pub fn pairs_from_tall(rows: &[Vec<String>]) -> Result<Vec<Pair>, String> {
+    let mut out = Vec::new();
+    for row in rows.iter().skip(1) {
+        let col = row.first().ok_or("table row is empty")?.trim().to_string();
+        let raw = row.get(1).map(String::as_str).unwrap_or("");
+        out.push((col, make_value(raw)));
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oneliner_splits_columns() {
+        let p = parse_oneliner("name: Root, company_id: 5").unwrap();
+        assert_eq!(p, vec![
+            ("name".into(), Some("Root".into())),
+            ("company_id".into(), Some("5".into())),
+        ]);
+    }
+
+    #[test]
+    fn oneliner_null_sentinel_becomes_none() {
+        let raw = format!("deleted_at: {NULL_SENTINEL}");
+        let p = parse_oneliner(&raw).unwrap();
+        assert_eq!(p, vec![("deleted_at".into(), None)]);
+    }
+
+    #[test]
+    fn oneliner_escaped_comma_is_literal() {
+        let p = parse_oneliner(r"name: a\, b").unwrap();
+        assert_eq!(p, vec![("name".into(), Some("a, b".into()))]);
+    }
+
+    #[test]
+    fn oneliner_missing_colon_is_error() {
+        assert!(parse_oneliner("just_a_value").is_err());
+    }
+
+    #[test]
+    fn oneliner_empty_is_empty() {
+        assert!(parse_oneliner("").unwrap().is_empty());
+    }
+
+    #[test]
+    fn wide_table_one_set_per_data_row() {
+        let rows = vec![
+            vec!["company_id".to_string(), "name".to_string()],
+            vec!["5".to_string(), "first".to_string()],
+            vec!["6".to_string(), "second".to_string()],
+        ];
+        let sets = pairs_from_wide(&rows).unwrap();
+        assert_eq!(sets.len(), 2);
+        assert_eq!(sets[0], vec![
+            ("company_id".into(), Some("5".into())),
+            ("name".into(), Some("first".into())),
+        ]);
+        assert_eq!(sets[1][1], ("name".into(), Some("second".into())));
+    }
+
+    #[test]
+    fn tall_table_is_column_value_pairs() {
+        let rows = vec![
+            vec!["column".to_string(), "value".to_string()],
+            vec!["slug".to_string(), "abc".to_string()],
+            vec!["id".to_string(), "42".to_string()],
+        ];
+        let p = pairs_from_tall(&rows).unwrap();
+        assert_eq!(p, vec![
+            ("slug".into(), Some("abc".into())),
+            ("id".into(), Some("42".into())),
+        ]);
+    }
+}

@@ -87,6 +87,11 @@ impl Default for VarStack {
     }
 }
 
+/// SQL NULL sentinel. NUL bytes never occur in `.feature` text, so the
+/// value can't be confused with real data. `<<null>>` expands to it,
+/// and the DB layer reads it back as NULL — a single substitution point is kept.
+pub const NULL_SENTINEL: &str = "\u{0}__bddkit_null__\u{0}";
+
 static SLOT: LazyLock<regex::Regex> = LazyLock::new(|| {
     // <<name>> or <<function(arguments)>>
     regex::Regex::new(r"(?u)<<([^\W\d]\w*)(?:\(([^)]*)\))?>>").expect("constant regex")
@@ -105,6 +110,7 @@ pub fn interpolate(input: &str, vars: &VarStack, generator: &Generator) -> Resul
         let value = match (name, args) {
             ("unique", a) => generator.next(parse_kind(a.unwrap_or(""))?),
             ("uuid", _) => uuid::Uuid::now_v7().to_string(),
+            ("null", None) => NULL_SENTINEL.to_string(),
             (n, None) => vars
                 .get(n)
                 .ok_or_else(|| format!("variable {n:?} is not set"))?
@@ -314,5 +320,11 @@ mod tests {
         let s = VarStack::new();
         let err = interpolate("<<microtime(true)>>", &s, &generator()).unwrap_err();
         assert!(err.contains("unknown function"), "{err}");
+    }
+
+    #[test]
+    fn null_expands_to_sentinel() {
+        let s = VarStack::new();
+        assert_eq!(interpolate("<<null>>", &s, &generator()).unwrap(), NULL_SENTINEL);
     }
 }

@@ -19,6 +19,7 @@ clap = { version = "4.6", features = ["derive"] }
 uuid = { version = "1.24", features = ["v7"] }
 url = "2"
 anyhow = "1"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres"] }
 
 [dev-dependencies]
 axum = "0.8"
