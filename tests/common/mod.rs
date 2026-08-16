@@ -1,5 +1,9 @@
-//! Reference HTTP service for acceptance tests. Spun up in-process
-//! on a random port: docker-compose arrives in M2 together with Postgres.
+//! Reference HTTP service for the acceptance tests. Spun up in-process
+//! on a random port; docker-compose arrives in M2 alongside Postgres.
+
+#![allow(dead_code)]
+
+pub mod db;
 
 use axum::extract::Query;
 use axum::http::{HeaderMap, StatusCode};

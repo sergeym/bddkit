@@ -37,6 +37,16 @@ pub enum StepId {
     UseConnection,
     DebugOn,
     DebugOff,
+    HaveWith,
+    HaveWhere,
+    HaveMulti,
+    Update,
+    DeleteWhere,
+    DeleteAll,
+    ShouldHaveWith,
+    ShouldHaveTable,
+    ShouldNotHaveWith,
+    ShouldNotHaveTable,
 }
 
 pub struct StepDef {
@@ -145,6 +155,46 @@ pub const BUILTIN_STEPS: &[StepDef] = &[
         id: StepId::DebugOff,
         pattern: r#"^I am not in debug mode$"#,
     },
+    StepDef {
+        id: StepId::HaveWhere,
+        pattern: r#"^I have "([^"]*)" where:$"#,
+    },
+    StepDef {
+        id: StepId::HaveWith,
+        pattern: r#"^I have "([^"]*)" with "([^"]*)"$"#,
+    },
+    StepDef {
+        id: StepId::HaveMulti,
+        pattern: r#"^I have:$"#,
+    },
+    StepDef {
+        id: StepId::Update,
+        pattern: r#"^I update "([^"]*)" with "([^"]*)" where "([^"]*)"$"#,
+    },
+    StepDef {
+        id: StepId::DeleteAll,
+        pattern: r#"^I delete all "([^"]*)"$"#,
+    },
+    StepDef {
+        id: StepId::DeleteWhere,
+        pattern: r#"^I delete "([^"]*)" where "([^"]*)"$"#,
+    },
+    StepDef {
+        id: StepId::ShouldNotHaveTable,
+        pattern: r#"^I should not have "([^"]*)" with:$"#,
+    },
+    StepDef {
+        id: StepId::ShouldNotHaveWith,
+        pattern: r#"^I should not have "([^"]*)" with "([^"]*)"$"#,
+    },
+    StepDef {
+        id: StepId::ShouldHaveTable,
+        pattern: r#"^I should have "([^"]*)" with:$"#,
+    },
+    StepDef {
+        id: StepId::ShouldHaveWith,
+        pattern: r#"^I should have "([^"]*)" with "([^"]*)"$"#,
+    },
 ];
 
 pub struct Registry {
@@ -233,6 +283,16 @@ pub async fn dispatch(w: &mut World, id: StepId, a: &Args) -> Result<(), String>
         StepId::UseConnection => db::use_connection(w, a.cap(0)),
         StepId::DebugOn => db::debug_on(w),
         StepId::DebugOff => db::debug_off(w),
+        StepId::HaveWith => db::have_with(w, a.cap(0), a.cap(1)).await,
+        StepId::HaveWhere => db::have_where(w, a.cap(0), a.table.as_ref()).await,
+        StepId::HaveMulti => db::have_multi(w, a.table.as_ref()).await,
+        StepId::Update => db::update(w, a.cap(0), a.cap(1), a.cap(2)).await,
+        StepId::DeleteWhere => db::delete_where(w, a.cap(0), a.cap(1)).await,
+        StepId::DeleteAll => db::delete_all(w, a.cap(0)).await,
+        StepId::ShouldHaveWith => db::should_have(w, a.cap(0), a.cap(1)).await,
+        StepId::ShouldHaveTable => db::should_have_table(w, a.cap(0), a.table.as_ref()).await,
+        StepId::ShouldNotHaveWith => db::should_not_have(w, a.cap(0), a.cap(1)).await,
+        StepId::ShouldNotHaveTable => db::should_not_have_table(w, a.cap(0), a.table.as_ref()).await,
     }
 }
 
@@ -278,6 +338,12 @@ mod tests {
             r#"I use "main" connection"#,
             "I am in debug mode",
             "I am not in debug mode",
+            r#"I have "users" where:"#,
+            r#"I have "users" with "email: a@b.net""#,
+            "I have:",
+            r#"I update "companies" with "name: x" where "id: 1""#,
+            r#"I delete "companies" where "slug: x""#,
+            r#"I delete all "companies""#,
         ];
         let r = reg();
         for s in samples {
