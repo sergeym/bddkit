@@ -13,7 +13,7 @@ fn prepare(
     vars: &VarStack,
     generator: &Generator,
 ) -> Result<Args, String> {
-    // Substitution is applied to arguments, doc strings, and table cells —
+    // Substitution applies to arguments, the doc string, and table cells —
     // never to the whole step text.
     let caps = caps
         .iter()
@@ -44,16 +44,17 @@ fn prepare(
     })
 }
 
-/// Runs one feature file. The variable frame is shared for the file; HTTP state
-/// is recreated for every scenario; Background reruns before each one.
+/// Runs one feature file. The variable frame is shared for the whole file; HTTP state
+/// is recreated for each scenario; Background runs again before each one.
 pub async fn run_file(
     lf: &LoadedFeature,
     reg: &Registry,
     base_url: &str,
     timeout_secs: u64,
     generator: Arc<Generator>,
+    db: crate::db::DbHandle,
 ) -> Result<FileResult> {
-    let mut world = World::new(base_url, timeout_secs, generator)?;
+    let mut world = World::new(base_url, timeout_secs, generator, db)?;
     let mut scenarios = Vec::new();
 
     let background: Vec<ExpandedStep> = lf

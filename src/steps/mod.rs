@@ -1,5 +1,6 @@
 pub mod api;
 pub mod assert;
+pub mod db;
 pub mod vars;
 
 use crate::world::World;
@@ -32,6 +33,10 @@ pub enum StepId {
     ExtractFromCookiesGlobal,
     VariableEquals,
     VariableNotEquals,
+    // database
+    UseConnection,
+    DebugOn,
+    DebugOff,
 }
 
 pub struct StepDef {
@@ -128,6 +133,18 @@ pub const BUILTIN_STEPS: &[StepDef] = &[
         id: StepId::VariableEquals,
         pattern: r#"^variable "([^"]*)" should be equal to "([^"]*)"$"#,
     },
+    StepDef {
+        id: StepId::UseConnection,
+        pattern: r#"^I use "([^"]*)" connection$"#,
+    },
+    StepDef {
+        id: StepId::DebugOn,
+        pattern: r#"^I am in debug mode$"#,
+    },
+    StepDef {
+        id: StepId::DebugOff,
+        pattern: r#"^I am not in debug mode$"#,
+    },
 ];
 
 pub struct Registry {
@@ -213,6 +230,9 @@ pub async fn dispatch(w: &mut World, id: StepId, a: &Args) -> Result<(), String>
         StepId::ExtractFromCookiesGlobal => vars::extract_from_cookies(w, a.cap(0), a.cap(1), true),
         StepId::VariableEquals => vars::variable_equals(w, a.cap(0), a.cap(1), false),
         StepId::VariableNotEquals => vars::variable_equals(w, a.cap(0), a.cap(1), true),
+        StepId::UseConnection => db::use_connection(w, a.cap(0)),
+        StepId::DebugOn => db::debug_on(w),
+        StepId::DebugOff => db::debug_off(w),
     }
 }
 
@@ -255,6 +275,9 @@ mod tests {
             r#"extract "jwt" from cookies as "t" global"#,
             r#"variable "a" should be equal to "1""#,
             r#"variable "a" should not be equal to "1""#,
+            r#"I use "main" connection"#,
+            "I am in debug mode",
+            "I am not in debug mode",
         ];
         let r = reg();
         for s in samples {

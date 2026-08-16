@@ -56,17 +56,37 @@ async fn main() -> Result<()> {
         std::process::exit(2);
     }
 
+    // Pools are created once per suite, only for a suite that has connections.
+    // The M2 runner is sequential; max_connections leaves headroom for M4.
+    let mut db_by_suite: std::collections::HashMap<String, std::sync::Arc<db::SuiteDb>> =
+        std::collections::HashMap::new();
+    for (name, suite) in &cfg.suites {
+        if cli.suite.as_ref().is_some_and(|s| s != name) {
+            continue;
+        }
+        if suite.connections.is_empty() {
+            continue;
+        }
+        let max = cfg.suite_concurrency(name) as u32;
+        let sdb = db::SuiteDb::connect(&suite.connections, max)
+            .await
+            .map_err(anyhow::Error::msg)?;
+        db_by_suite.insert(name.clone(), std::sync::Arc::new(sdb));
+    }
+
     println!("run {}", generator.run_id());
     let mut results = Vec::new();
     let mut infra_failed = false;
     for (suite_name, idx) in plan {
         let suite = &cfg.suites[&suite_name];
+        let db = db::DbHandle::new(db_by_suite.get(&suite_name).cloned());
         match runner::run_file(
             &loaded[idx],
             &reg,
             &suite.base_url,
             suite.timeout_secs,
             generator.clone(),
+            db,
         )
         .await
         {
