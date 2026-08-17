@@ -36,6 +36,48 @@ pub fn parse_oneliner(s: &str) -> Result<Vec<Pair>, String> {
     Ok(out)
 }
 
+/// An argument to a procedure/function call. The type is guessed from the text, since
+/// the signature isn't introspected; this suffices for int/float/bool/text.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Arg {
+    Null,
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+    Text(String),
+}
+
+/// Guesses the argument's type from the text (`i64` → `f64` → `bool` → text).
+pub fn infer_arg(raw: &str) -> Arg {
+    let v = raw.trim();
+    if v == NULL_SENTINEL {
+        return Arg::Null;
+    }
+    if let Ok(i) = v.parse::<i64>() {
+        return Arg::Int(i);
+    }
+    if let Ok(f) = v.parse::<f64>() {
+        return Arg::Float(f);
+    }
+    match v {
+        "true" => Arg::Bool(true),
+        "false" => Arg::Bool(false),
+        _ => Arg::Text(v.to_string()),
+    }
+}
+
+/// Parses positional arguments `a:1,b:2` into value order;
+/// names are documentation only, casting follows the `infer_arg` heuristic.
+pub fn parse_args(s: &str) -> Result<Vec<Arg>, String> {
+    Ok(parse_oneliner(s)?
+        .into_iter()
+        .map(|(_, v)| match v {
+            None => Arg::Null,
+            Some(t) => infer_arg(&t),
+        })
+        .collect())
+}
+
 /// The "wide" table for `I have "T" where:`: the first row is column names,
 /// each following row is values. The result is one set of pairs per data row.
 pub fn pairs_from_wide(rows: &[Vec<String>]) -> Result<Vec<Vec<Pair>>, String> {
@@ -128,5 +170,22 @@ mod tests {
             ("slug".into(), Some("abc".into())),
             ("id".into(), Some("42".into())),
         ]);
+    }
+
+    #[test]
+    fn infer_arg_guesses_type_by_text() {
+        assert_eq!(infer_arg("42"), Arg::Int(42));
+        assert_eq!(infer_arg("1.5"), Arg::Float(1.5));
+        assert_eq!(infer_arg("true"), Arg::Bool(true));
+        assert_eq!(infer_arg("false"), Arg::Bool(false));
+        assert_eq!(infer_arg("abc"), Arg::Text("abc".into()));
+        assert_eq!(infer_arg(NULL_SENTINEL), Arg::Null);
+    }
+
+    #[test]
+    fn parse_args_positional_in_write_order() {
+        let args = parse_args("a: 1, b: two, c: 3.0").unwrap();
+        assert_eq!(args, vec![Arg::Int(1), Arg::Text("two".into()), Arg::Float(3.0)]);
+        assert!(parse_args("").unwrap().is_empty());
     }
 }

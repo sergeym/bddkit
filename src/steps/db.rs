@@ -58,6 +58,10 @@ pub async fn delete_all(w: &mut World, table: &str) -> Result<(), String> {
     ops::delete_all(w, table).await
 }
 
+pub async fn extract_from_db(w: &mut World, column: &str, table: &str, where_: &str, var: &str) -> Result<(), String> {
+    ops::extract(w, column, table, where_, var).await
+}
+
 pub async fn should_have(w: &mut World, table: &str, kv: &str) -> Result<(), String> {
     let pairs = value::parse_oneliner(kv)?;
     ops::assert_exists(w, table, &pairs, false).await
@@ -84,4 +88,16 @@ pub async fn should_not_have_table(
 ) -> Result<(), String> {
     let pairs = value::pairs_from_tall(rows.ok_or("step requires a table")?)?;
     ops::assert_exists(w, table, &pairs, true).await
+}
+
+pub async fn call_procedure(w: &mut World, name: &str, args: &str) -> Result<(), String> {
+    ops::call_procedure(w, name, args).await
+}
+
+pub async fn call_function(w: &mut World, name: &str, args: &str, var: &str) -> Result<(), String> {
+    ops::call_function(w, name, args, var).await
+}
+
+pub async fn get_sequence(w: &mut World, seq: &str, var: &str) -> Result<(), String> {
+    ops::next_sequence(w, seq, var).await
 }

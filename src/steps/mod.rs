@@ -43,10 +43,14 @@ pub enum StepId {
     Update,
     DeleteWhere,
     DeleteAll,
+    ExtractFromDb,
     ShouldHaveWith,
     ShouldHaveTable,
     ShouldNotHaveWith,
     ShouldNotHaveTable,
+    CallProcedure,
+    CallFunction,
+    GetSequence,
 }
 
 pub struct StepDef {
@@ -180,6 +184,10 @@ pub const BUILTIN_STEPS: &[StepDef] = &[
         pattern: r#"^I delete "([^"]*)" where "([^"]*)"$"#,
     },
     StepDef {
+        id: StepId::ExtractFromDb,
+        pattern: r#"^I extract "([^"]*)" from "([^"]*)" with "([^"]*)" as "([^"]*)"$"#,
+    },
+    StepDef {
         id: StepId::ShouldNotHaveTable,
         pattern: r#"^I should not have "([^"]*)" with:$"#,
     },
@@ -194,6 +202,18 @@ pub const BUILTIN_STEPS: &[StepDef] = &[
     StepDef {
         id: StepId::ShouldHaveWith,
         pattern: r#"^I should have "([^"]*)" with "([^"]*)"$"#,
+    },
+    StepDef {
+        id: StepId::CallProcedure,
+        pattern: r#"^I call procedure "([^"]*)" with "([^"]*)"$"#,
+    },
+    StepDef {
+        id: StepId::CallFunction,
+        pattern: r#"^I call function "([^"]*)" with "([^"]*)" as "([^"]*)"$"#,
+    },
+    StepDef {
+        id: StepId::GetSequence,
+        pattern: r#"^I get next value of sequence "([^"]*)" as "([^"]*)"$"#,
     },
 ];
 
@@ -289,10 +309,14 @@ pub async fn dispatch(w: &mut World, id: StepId, a: &Args) -> Result<(), String>
         StepId::Update => db::update(w, a.cap(0), a.cap(1), a.cap(2)).await,
         StepId::DeleteWhere => db::delete_where(w, a.cap(0), a.cap(1)).await,
         StepId::DeleteAll => db::delete_all(w, a.cap(0)).await,
+        StepId::ExtractFromDb => db::extract_from_db(w, a.cap(0), a.cap(1), a.cap(2), a.cap(3)).await,
         StepId::ShouldHaveWith => db::should_have(w, a.cap(0), a.cap(1)).await,
         StepId::ShouldHaveTable => db::should_have_table(w, a.cap(0), a.table.as_ref()).await,
         StepId::ShouldNotHaveWith => db::should_not_have(w, a.cap(0), a.cap(1)).await,
         StepId::ShouldNotHaveTable => db::should_not_have_table(w, a.cap(0), a.table.as_ref()).await,
+        StepId::CallProcedure => db::call_procedure(w, a.cap(0), a.cap(1)).await,
+        StepId::CallFunction => db::call_function(w, a.cap(0), a.cap(1), a.cap(2)).await,
+        StepId::GetSequence => db::get_sequence(w, a.cap(0), a.cap(1)).await,
     }
 }
 
@@ -344,6 +368,10 @@ mod tests {
             r#"I update "companies" with "name: x" where "id: 1""#,
             r#"I delete "companies" where "slug: x""#,
             r#"I delete all "companies""#,
+            r#"I extract "id" from "companies" with "slug: x" as "cid""#,
+            r#"I call procedure "p" with "a: 1""#,
+            r#"I call function "f" with "a: 1" as "r""#,
+            r#"I get next value of sequence "s" as "n""#,
         ];
         let r = reg();
         for s in samples {

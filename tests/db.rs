@@ -87,3 +87,110 @@ Feature: mutate
     let out = run_feature(src);
     assert!(!out.status.success(), "the table must be empty: {}", combined(&out));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn should_not_have_passes_for_absent_row() {
+    let _g = setup().await;
+    // A row with slug: acme exists; negating the existence of a missing slug passes.
+    let src = "\
+Feature: absence
+  Scenario: negative existence ok
+    Given I have \"companies\" with \"slug: acme\"
+    Then I should not have \"companies\" with \"slug: ghost\"
+";
+    let out = run_feature(src);
+    assert!(out.status.success(), "{}", combined(&out));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn should_not_have_fails_for_present_row() {
+    let _g = setup().await;
+    // Negating the existence of a row that's actually present must fail.
+    let src = "\
+Feature: absence
+  Scenario: negative existence violated
+    Given I have \"companies\" with \"slug: acme\"
+    Then I should not have \"companies\" with \"slug: acme\"
+";
+    let out = run_feature(src);
+    assert!(!out.status.success(), "an existing row must violate the negation: {}", combined(&out));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn null_sentinel_insert_matches_is_null() {
+    let _g = setup().await;
+    // deleted_at is inserted as <<null>> (SQL NULL); looking it up by <<null>> goes through IS NULL.
+    let src = "\
+Feature: null
+  Scenario: insert null and match is null
+    Given I have \"users\" with \"email: a@b.net, deleted_at: <<null>>\"
+    Then I should have \"users\" with \"deleted_at: <<null>>\"
+";
+    let out = run_feature(src);
+    assert!(out.status.success(), "{}", combined(&out));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn composite_pk_insert_reads_back_via_last_insert_vars() {
+    let _g = setup().await;
+    // pair(a, b) has a composite PK; RETURNING sets last_insert_pair_a / _b,
+    // which are then used to read the row back.
+    let src = "\
+Feature: composite pk
+  Scenario: insert and read back pair
+    Given I have \"pair\" with \"a: 1, b: 2, note: linked\"
+    Then I should have \"pair\" with \"a: <<last_insert_pair_a>>\"
+    And I should have \"pair\" with \"b: <<last_insert_pair_b>>\"
+";
+    let out = run_feature(src);
+    assert!(out.status.success(), "{}", combined(&out));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_all_sets_deleted_counter() {
+    let _g = setup().await;
+    // deleted_companies == 2 after DELETE ALL over two rows.
+    let src = "\
+Feature: mutate
+  Scenario: delete all counter
+    Given I have \"companies\" with \"slug: one\"
+    And I have \"companies\" with \"slug: two\"
+    When I delete all \"companies\"
+    Then variable \"deleted_companies\" should be equal to \"2\"
+";
+    let out = run_feature(src);
+    assert!(out.status.success(), "{}", combined(&out));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn extract_from_table_binds_variable() {
+    let _g = setup().await;
+    // extract stores the column value in a variable; the following step checks
+    // it via <<cid>> — a match confirms extract bound the variable correctly.
+    let src = "\
+Feature: extract
+  Scenario: pull id into var
+    Given I have \"companies\" with \"slug: acme\"
+    When I extract \"id\" from \"companies\" with \"slug: acme\" as \"cid\"
+    Then I should have \"companies\" with \"id: <<cid>>\"
+";
+    let out = run_feature(src);
+    assert!(out.status.success(), "{}", combined(&out));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sequence_and_builtin_function() {
+    let _g = setup().await;
+    // nextval increases; upper() is a built-in function with a text argument.
+    let src = "\
+Feature: routines
+  Scenario: sequence and function
+    Given I get next value of sequence \"apibdd_it.thing_seq\" as \"first\"
+    And I get next value of sequence \"apibdd_it.thing_seq\" as \"second\"
+    Then variable \"second\" should not be equal to \"<<first>>\"
+    When I call function \"upper\" with \"s: abc\" as \"up\"
+    Then variable \"up\" should be equal to \"ABC\"
+";
+    let out = run_feature(src);
+    assert!(out.status.success(), "{}", combined(&out));
+}
