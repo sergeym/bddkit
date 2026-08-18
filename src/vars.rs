@@ -79,6 +79,19 @@ impl VarStack {
         }
         Ok(())
     }
+
+    pub fn all_vars(&self) -> Vec<(String, String)> {
+        let mut result = Vec::new();
+        for (name, value) in &self.globals {
+            result.push((name.clone(), value.clone()));
+        }
+        for frame in &self.frames {
+            for (name, value) in frame {
+                result.push((name.clone(), value.clone()));
+            }
+        }
+        result
+    }
 }
 
 impl Default for VarStack {
@@ -87,9 +100,9 @@ impl Default for VarStack {
     }
 }
 
-/// SQL NULL sentinel. NUL bytes never occur in `.feature` text, so the
-/// value can't be confused with real data. `<<null>>` expands to it,
-/// and the DB layer reads it back as NULL — a single substitution point is kept.
+/// SQL NULL sentinel. NUL bytes never occur in `.feature` text, so
+/// the value can't be confused with real data. `<<null>>` expands to it,
+/// and the DB layer reads it back as NULL — a single point of substitution is kept.
 pub const NULL_SENTINEL: &str = "\u{0}__bddkit_null__\u{0}";
 
 static SLOT: LazyLock<regex::Regex> = LazyLock::new(|| {

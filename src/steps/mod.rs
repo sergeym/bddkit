@@ -51,6 +51,9 @@ pub enum StepId {
     CallProcedure,
     CallFunction,
     GetSequence,
+    Sleep,
+    ShowAllVariables,
+    ShowVariable,
 }
 
 pub struct StepDef {
@@ -215,6 +218,18 @@ pub const BUILTIN_STEPS: &[StepDef] = &[
         id: StepId::GetSequence,
         pattern: r#"^I get next value of sequence "([^"]*)" as "([^"]*)"$"#,
     },
+    StepDef {
+        id: StepId::Sleep,
+        pattern: r#"^I sleep "(\d+)" seconds$"#,
+    },
+    StepDef {
+        id: StepId::ShowAllVariables,
+        pattern: r#"^Show all variables$"#,
+    },
+    StepDef {
+        id: StepId::ShowVariable,
+        pattern: r#"^Show "([^"]*)" variable$"#,
+    },
 ];
 
 pub struct Registry {
@@ -317,6 +332,34 @@ pub async fn dispatch(w: &mut World, id: StepId, a: &Args) -> Result<(), String>
         StepId::CallProcedure => db::call_procedure(w, a.cap(0), a.cap(1)).await,
         StepId::CallFunction => db::call_function(w, a.cap(0), a.cap(1), a.cap(2)).await,
         StepId::GetSequence => db::get_sequence(w, a.cap(0), a.cap(1)).await,
+        StepId::Sleep => sleep(a.cap(0)).await,
+        StepId::ShowAllVariables => show_all_variables(w),
+        StepId::ShowVariable => show_variable(w, a.cap(0)),
+    }
+}
+
+async fn sleep(secs: &str) -> Result<(), String> {
+    let n = secs.parse::<u64>()
+        .map_err(|_| format!("not a number: {secs}"))?;
+    tokio::time::sleep(std::time::Duration::from_secs(n)).await;
+    Ok(())
+}
+
+fn show_all_variables(w: &World) -> Result<(), String> {
+    eprintln!("=== All variables ===");
+    for (name, value) in w.vars.all_vars() {
+        eprintln!("{}: {}", name, value);
+    }
+    Ok(())
+}
+
+fn show_variable(w: &World, name: &str) -> Result<(), String> {
+    match w.vars.get(name) {
+        Some(v) => {
+            eprintln!("{}: {}", name, v);
+            Ok(())
+        }
+        None => Err(format!("variable not found: {name}")),
     }
 }
 
@@ -372,6 +415,9 @@ mod tests {
             r#"I call procedure "p" with "a: 1""#,
             r#"I call function "f" with "a: 1" as "r""#,
             r#"I get next value of sequence "s" as "n""#,
+            r#"I sleep "5" seconds"#,
+            "Show all variables",
+            r#"Show "userId" variable"#,
         ];
         let r = reg();
         for s in samples {
