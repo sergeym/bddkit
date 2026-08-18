@@ -1,3 +1,4 @@
+macro_paths: [tests/macros]
 suites:
   demo:
     base_url: ${BDDKIT_STUB_URL}

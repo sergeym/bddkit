@@ -3,6 +3,7 @@ mod db;
 mod feature;
 mod http;
 mod json;
+mod macros;
 mod report;
 mod runner;
 mod steps;
@@ -31,7 +32,15 @@ struct Cli {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let cfg = config::load(&cli.config)?;
-    let reg = steps::Registry::new().map_err(anyhow::Error::msg)?;
+    let reg = match macros::MacroCatalog::load(&cfg.macro_paths)
+        .and_then(steps::Registry::with_macros)
+    {
+        Ok(registry) => registry,
+        Err(error) => {
+            eprintln!("error: 1 problem, run not started\n\n  {error}");
+            std::process::exit(2);
+        }
+    };
     let generator = Arc::new(unique::Generator::new());
 
     let mut loaded = Vec::new();
@@ -49,15 +58,15 @@ async fn main() -> Result<()> {
 
     let problems = validate::check(&loaded, &reg);
     if !problems.is_empty() {
-        eprintln!("error: {} problem(s), run not started\n", problems.len());
+        eprintln!("error: {} problems, run not started\n", problems.len());
         for p in &problems {
             eprintln!("{p}");
         }
         std::process::exit(2);
     }
 
-    // Pools are created once per suite, only for a suite that has connections.
-    // The M2 runner is sequential; max_connections leaves headroom for M4.
+    // Pools are created once per suite, only for suites with connections.
+    // The M2 runner is sequential; max_connections is set with headroom for M4.
     let mut db_by_suite: std::collections::HashMap<String, std::sync::Arc<db::SuiteDb>> =
         std::collections::HashMap::new();
     for (name, suite) in &cfg.suites {
@@ -94,8 +103,8 @@ async fn main() -> Result<()> {
                 report::print_file(&r);
                 results.push(r);
             }
-            // A file-level infrastructure error (e.g. an invalid base_url)
-            // must not abort the whole run: print it and move on to the next file.
+            // A file-level infra error (e.g. an invalid base_url)
+            // must not abort the whole run: print it and move to the next file.
             Err(e) => {
                 eprintln!("ERROR  {}: {e:#}", loaded[idx].path.display());
                 infra_failed = true;

@@ -3,8 +3,11 @@ pub mod assert;
 pub mod db;
 pub mod vars;
 
+use crate::macros::{MacroCatalog, MacroDef};
 use crate::world::World;
 use regex::Regex;
+use std::collections::{HashSet, VecDeque};
+use std::sync::LazyLock;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StepId {
@@ -232,34 +235,63 @@ pub const BUILTIN_STEPS: &[StepDef] = &[
     },
 ];
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepTarget {
+    Builtin(StepId),
+    Macro(usize),
+}
+
+impl PartialEq<StepId> for StepTarget {
+    fn eq(&self, other: &StepId) -> bool {
+        matches!(self, Self::Builtin(id) if id == other)
+    }
+}
+
+#[derive(Debug)]
 pub struct Registry {
-    entries: Vec<(StepId, Regex)>,
+    entries: Vec<(StepTarget, Regex)>,
+    macros: Vec<MacroDef>,
 }
 
 impl Registry {
+    #[cfg(test)]
     pub fn new() -> Result<Self, String> {
+        Self::with_macros(MacroCatalog {
+            definitions: Vec::new(),
+        })
+    }
+
+    pub fn with_macros(catalog: MacroCatalog) -> Result<Self, String> {
         let mut entries = Vec::with_capacity(BUILTIN_STEPS.len());
         for def in BUILTIN_STEPS {
             let re = Regex::new(def.pattern)
                 .map_err(|e| format!("invalid step pattern {:?}: {e}", def.pattern))?;
-            entries.push((def.id, re));
+            entries.push((StepTarget::Builtin(def.id), re));
         }
-        Ok(Self { entries })
+        for (index, definition) in catalog.definitions.iter().enumerate() {
+            entries.push((StepTarget::Macro(index), definition.regex.clone()));
+        }
+        let registry = Self {
+            entries,
+            macros: catalog.definitions,
+        };
+        registry.validate_macros()?;
+        Ok(registry)
     }
 
     /// Returns `Ok(None)` if the step is unknown, and `Err` if it is ambiguous.
     /// Ambiguity is an error, not "first wins": a silently shadowed step
     /// is more expensive to debug than a failed start.
-    pub fn find(&self, text: &str) -> Result<Option<(StepId, Vec<String>)>, String> {
-        let mut hits: Vec<(StepId, Vec<String>)> = Vec::new();
-        for (id, re) in &self.entries {
+    pub fn find(&self, text: &str) -> Result<Option<(StepTarget, Vec<String>)>, String> {
+        let mut hits: Vec<(StepTarget, Vec<String>)> = Vec::new();
+        for (target, re) in &self.entries {
             if let Some(c) = re.captures(text) {
                 let caps = c
                     .iter()
                     .skip(1)
                     .map(|g| g.map(|m| m.as_str().to_string()).unwrap_or_default())
                     .collect();
-                hits.push((*id, caps));
+                hits.push((*target, caps));
             }
         }
         match hits.len() {
@@ -267,9 +299,263 @@ impl Registry {
             1 => Ok(Some(hits.remove(0))),
             _ => Err(format!(
                 "step {text:?} matches several definitions: {:?}",
-                hits.iter().map(|(id, _)| id).collect::<Vec<_>>()
+                hits.iter().map(|(target, _)| target).collect::<Vec<_>>()
             )),
         }
+    }
+
+    pub fn macro_def(&self, index: usize) -> &MacroDef {
+        &self.macros[index]
+    }
+
+    fn validate_macros(&self) -> Result<(), String> {
+        for (left_index, left) in self.macros.iter().enumerate() {
+            for builtin in BUILTIN_STEPS {
+                if builtin_patterns(builtin.pattern)
+                    .iter()
+                    .any(|pattern| patterns_overlap(&macro_pattern(&left.step), pattern))
+                {
+                    return Err(format!(
+                        "macro step {:?} from {}:{} conflicts with builtin step {:?}",
+                        left.step,
+                        left.source.display(),
+                        left.line,
+                        builtin.pattern
+                    ));
+                }
+            }
+            for right in self.macros.iter().skip(left_index + 1) {
+                if patterns_overlap(&macro_pattern(&left.step), &macro_pattern(&right.step)) {
+                    return Err(format!(
+                        "macro step {:?} from {}:{} conflicts with {:?} from {}:{}",
+                        left.step,
+                        left.source.display(),
+                        left.line,
+                        right.step,
+                        right.source.display(),
+                        right.line,
+                    ));
+                }
+            }
+        }
+
+        let mut graph = vec![Vec::new(); self.macros.len()];
+        for (index, definition) in self.macros.iter().enumerate() {
+            for step in &definition.body {
+                match self.find(&step.text)? {
+                    Some((StepTarget::Builtin(_), _)) => {}
+                    Some((StepTarget::Macro(_), _)) if step.docstring.is_some() => {
+                        return Err(format!(
+                            "calling macro {:?} with a doc string in macro {:?} from {}:{} is not supported",
+                            step.text,
+                            definition.step,
+                            definition.source.display(),
+                            definition.line,
+                        ));
+                    }
+                    Some((StepTarget::Macro(target), _)) => graph[index].push(target),
+                    None => {
+                        return Err(format!(
+                            "unknown step {:?} in macro {:?} from {}:{}",
+                            step.text,
+                            definition.step,
+                            definition.source.display(),
+                            definition.line,
+                        ));
+                    }
+                }
+            }
+        }
+
+        let mut visited = vec![false; self.macros.len()];
+        let mut visiting = vec![false; self.macros.len()];
+        let mut path = Vec::new();
+        for index in 0..self.macros.len() {
+            self.visit(index, &graph, &mut visited, &mut visiting, &mut path)?;
+        }
+        let mut depths = vec![None; self.macros.len()];
+        for index in 0..self.macros.len() {
+            if macro_depth(index, &graph, &mut depths) > 16 {
+                return Err(format!(
+                    "macro nesting exceeds 16 starting from step {:?}",
+                    self.macros[index].step
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn visit(
+        &self,
+        index: usize,
+        graph: &[Vec<usize>],
+        visited: &mut [bool],
+        visiting: &mut [bool],
+        path: &mut Vec<usize>,
+    ) -> Result<(), String> {
+        if visiting[index] {
+            let start = path.iter().position(|item| *item == index).unwrap_or(0);
+            let mut cycle: Vec<&str> = path[start..]
+                .iter()
+                .map(|item| self.macros[*item].step.as_str())
+                .collect();
+            cycle.push(self.macros[index].step.as_str());
+            return Err(format!("cycle in macros: {}", cycle.join(" → ")));
+        }
+        if visited[index] {
+            return Ok(());
+        }
+        visiting[index] = true;
+        path.push(index);
+        for child in &graph[index] {
+            self.visit(*child, graph, visited, visiting, path)?;
+        }
+        path.pop();
+        visiting[index] = false;
+        visited[index] = true;
+        Ok(())
+    }
+}
+
+fn macro_depth(index: usize, graph: &[Vec<usize>], memo: &mut [Option<usize>]) -> usize {
+    if let Some(depth) = memo[index] {
+        return depth;
+    }
+    let depth = 1 + graph[index]
+        .iter()
+        .map(|child| macro_depth(*child, graph, memo))
+        .max()
+        .unwrap_or(0);
+    memo[index] = Some(depth);
+    depth
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CharClass {
+    Any,
+    NonQuote,
+    Digit,
+    Exact(char),
+}
+
+static DIGIT_CHAR: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\d$").expect("constant digit regex"));
+
+#[derive(Clone, Copy, Debug)]
+enum PatternToken {
+    One(CharClass),
+    Star(CharClass),
+}
+
+static MACRO_PARAM: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\{[A-Za-z_][A-Za-z0-9_]*\}").expect("constant macro parameter regex")
+});
+
+fn macro_pattern(template: &str) -> Vec<PatternToken> {
+    let mut tokens = Vec::new();
+    let mut last = 0;
+    for parameter in MACRO_PARAM.find_iter(template) {
+        tokens.extend(
+            template[last..parameter.start()]
+                .chars()
+                .map(|char_| PatternToken::One(CharClass::Exact(char_))),
+        );
+        tokens.push(PatternToken::Star(CharClass::Any));
+        last = parameter.end();
+    }
+    tokens.extend(
+        template[last..]
+            .chars()
+            .map(|char_| PatternToken::One(CharClass::Exact(char_))),
+    );
+    tokens
+}
+
+fn builtin_patterns(pattern: &str) -> Vec<Vec<PatternToken>> {
+    const METHODS: &str = "(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)";
+    let variants: Vec<String> = if pattern.contains(METHODS) {
+        ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]
+            .iter()
+            .map(|method| pattern.replace(METHODS, method))
+            .collect()
+    } else {
+        vec![pattern.to_string()]
+    };
+    variants
+        .iter()
+        .map(|variant| {
+            let source = variant.trim_start_matches('^').trim_end_matches('$');
+            let mut tokens = Vec::new();
+            let mut rest = source;
+            while !rest.is_empty() {
+                if let Some(tail) = rest.strip_prefix(r#"([^"]*)"#) {
+                    tokens.push(PatternToken::Star(CharClass::NonQuote));
+                    rest = tail;
+                } else if let Some(tail) = rest.strip_prefix(r"(\d+)") {
+                    tokens.push(PatternToken::One(CharClass::Digit));
+                    tokens.push(PatternToken::Star(CharClass::Digit));
+                    rest = tail;
+                } else {
+                    let char_ = rest.chars().next().expect("string is non-empty");
+                    tokens.push(PatternToken::One(CharClass::Exact(char_)));
+                    rest = &rest[char_.len_utf8()..];
+                }
+            }
+            tokens
+        })
+        .collect()
+}
+
+fn patterns_overlap(left: &[PatternToken], right: &[PatternToken]) -> bool {
+    let mut queue = VecDeque::from([(0usize, 0usize)]);
+    let mut visited = HashSet::new();
+    while let Some((left_pos, right_pos)) = queue.pop_front() {
+        if !visited.insert((left_pos, right_pos)) {
+            continue;
+        }
+        if left_pos == left.len() && right_pos == right.len() {
+            return true;
+        }
+        if matches!(left.get(left_pos), Some(PatternToken::Star(_))) {
+            queue.push_back((left_pos + 1, right_pos));
+        }
+        if matches!(right.get(right_pos), Some(PatternToken::Star(_))) {
+            queue.push_back((left_pos, right_pos + 1));
+        }
+        let Some(left_token) = left.get(left_pos) else {
+            continue;
+        };
+        let Some(right_token) = right.get(right_pos) else {
+            continue;
+        };
+        let (left_class, left_next) = consumed(*left_token, left_pos);
+        let (right_class, right_next) = consumed(*right_token, right_pos);
+        if classes_overlap(left_class, right_class) {
+            queue.push_back((left_next, right_next));
+        }
+    }
+    false
+}
+
+fn consumed(token: PatternToken, position: usize) -> (CharClass, usize) {
+    match token {
+        PatternToken::One(class) => (class, position + 1),
+        PatternToken::Star(class) => (class, position),
+    }
+}
+
+fn classes_overlap(left: CharClass, right: CharClass) -> bool {
+    use CharClass::{Any, Digit, Exact, NonQuote};
+    match (left, right) {
+        (Any, _)
+        | (_, Any)
+        | (NonQuote, NonQuote)
+        | (NonQuote, Digit)
+        | (Digit, NonQuote)
+        | (Digit, Digit) => true,
+        (NonQuote, Exact(char_)) | (Exact(char_), NonQuote) => char_ != '"',
+        (Digit, Exact(char_)) | (Exact(char_), Digit) => DIGIT_CHAR.is_match(&char_.to_string()),
+        (Exact(left), Exact(right)) => left == right,
     }
 }
 

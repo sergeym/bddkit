@@ -37,6 +37,7 @@ impl VarStack {
         self.globals.insert(name.to_string(), value);
     }
 
+    #[cfg(test)]
     pub fn remove(&mut self, name: &str) {
         for frame in self.frames.iter_mut() {
             frame.remove(name);

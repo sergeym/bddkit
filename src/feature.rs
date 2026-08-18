@@ -39,16 +39,16 @@ static PLACEHOLDER: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new
 /// `replace("<key>", v)` would eat the inner `<key>` inside the runtime token `<<key>>`
 /// (in `<<userId>>` the substring `<userId>` starts at position 1) — and `<<…>>` must
 /// survive untouched until execution. Double brackets match the first alternative
-/// and are returned as-is; single brackets are replaced by the column value.
+/// and are returned as-is; single ones are replaced with the column value.
 fn substitute(text: &str, keys: &[String], row: &[String]) -> String {
     PLACEHOLDER
         .replace_all(text, |caps: &regex::Captures| {
             if let Some(m) = caps.get(1) {
-                return format!("<<{}>>", m.as_str()); // runtime token, leave untouched
+                return format!("<<{}>>", m.as_str()); // runtime token, leave it alone
             }
             let key = caps
                 .get(2)
-                .expect("second group when the first is absent")
+                .expect("second group is present when the first is absent")
                 .as_str();
             match keys.iter().position(|k| k == key) {
                 Some(i) => row[i].clone(),
@@ -62,8 +62,8 @@ fn substitute(text: &str, keys: &[String], row: &[String]) -> String {
         .into_owned()
 }
 
-/// Expands a `Scenario Outline` into individual scenarios. A scenario without
-/// `Examples` is returned as-is.
+/// Expands a `Scenario Outline` into separate scenarios. A scenario without `Examples`
+/// is returned as-is.
 pub fn expand_outlines(sc: &gherkin::Scenario) -> Vec<ExpandedScenario> {
     let base: Vec<ExpandedStep> = sc.steps.iter().map(to_step).collect();
     if sc.examples.is_empty() {
@@ -145,6 +145,7 @@ fn collect(p: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
 }
 
 /// Parses Gherkin from a string. Used by tests; `parse_path` reads files.
+#[cfg(test)]
 pub fn parse_str(src: &str) -> Result<Feature> {
     Feature::parse(src, GherkinEnv::default()).context("failed to parse Gherkin")
 }

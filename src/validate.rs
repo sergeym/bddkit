@@ -1,5 +1,5 @@
 use crate::feature::{LoadedFeature, expand_outlines};
-use crate::steps::Registry;
+use crate::steps::{Registry, StepTarget};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
@@ -22,26 +22,48 @@ impl std::fmt::Display for Problem {
 }
 
 /// Matches every step of every file before the first request. Returns ALL
-/// problems at once — a run that fails mid-way over a typo costs more
+/// problems at once — a run that fails midway due to a typo costs more
 /// than a full check that takes milliseconds.
 pub fn check(features: &[LoadedFeature], reg: &Registry) -> Vec<Problem> {
     let mut problems = Vec::new();
     for lf in features {
-        let mut all_steps: Vec<(String, usize)> = Vec::new();
+        let mut all_steps: Vec<(String, usize, bool, bool)> = Vec::new();
         if let Some(bg) = &lf.feature.background {
             for s in &bg.steps {
-                all_steps.push((s.value.clone(), s.position.line));
+                all_steps.push((
+                    s.value.clone(),
+                    s.position.line,
+                    s.docstring.is_some(),
+                    s.table.is_some(),
+                ));
             }
         }
         for sc in &lf.feature.scenarios {
             for ex in expand_outlines(sc) {
                 for st in ex.steps {
-                    all_steps.push((st.text, st.line));
+                    all_steps.push((
+                        st.text,
+                        st.line,
+                        st.docstring.is_some(),
+                        st.table.is_some(),
+                    ));
                 }
             }
         }
-        for (text, line) in all_steps {
+        for (text, line, has_docstring, has_table) in all_steps {
             match reg.find(&text) {
+                Ok(Some((StepTarget::Macro(_), _))) if has_docstring => {
+                    problems.push(Problem {
+                        file: lf.path.clone(),
+                        line,
+                        message: "macro call does not support a doc string".into(),
+                    });
+                }
+                Ok(Some((StepTarget::Macro(_), _))) if has_table => problems.push(Problem {
+                    file: lf.path.clone(),
+                    line,
+                    message: "macro call does not support a table".into(),
+                }),
                 Ok(Some(_)) => {}
                 Ok(None) => problems.push(Problem {
                     file: lf.path.clone(),
@@ -63,12 +85,26 @@ pub fn check(features: &[LoadedFeature], reg: &Registry) -> Vec<Problem> {
 mod tests {
     use super::*;
     use crate::feature::{LoadedFeature, parse_str};
+    use crate::macros::MacroCatalog;
 
     fn loaded(src: &str) -> LoadedFeature {
         LoadedFeature {
             path: PathBuf::from("t.feature"),
             feature: parse_str(src).unwrap(),
         }
+    }
+
+    fn macro_registry(name: &str) -> Registry {
+        let path = std::env::temp_dir().join(format!(
+            "bddkit-validate-macro-{}-{name}.yaml",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            "- step: I do business\n  do: [the response code is 200]\n",
+        )
+        .unwrap();
+        Registry::with_macros(MacroCatalog::load(&[path]).unwrap()).unwrap()
     }
 
     #[test]
@@ -137,16 +173,40 @@ Feature: f
 ",
         );
         let p = check(&[lf], &Registry::new().unwrap());
-        assert_eq!(p.len(), 1, "a typo in the method must surface before the run");
+        assert_eq!(p.len(), 1, "a typo in the method must surface before the run starts");
     }
 
     #[test]
     fn steps_with_variables_validate_without_values() {
-        // Substitution happens in arguments, so matching does not require values.
+        // Substitution happens in the arguments, so matching does not require values.
         let lf = loaded(
             "Feature: f\n  Scenario: s\n    When I request \"/users/<<userId>>\" using HTTP GET\n",
         );
         let p = check(&[lf], &Registry::new().unwrap());
         assert!(p.is_empty(), "{p:?}");
+    }
+
+    #[test]
+    fn macro_call_with_docstring_is_rejected_before_running() {
+        let lf = loaded(
+            "Feature: f\n  Scenario: s\n    When I do business\n      \"\"\"\n      x\n      \"\"\"\n",
+        );
+
+        let problems = check(&[lf], &macro_registry("docstring"));
+
+        assert_eq!(problems.len(), 1);
+        assert!(problems[0].message.contains("docstring"), "{problems:?}");
+    }
+
+    #[test]
+    fn macro_call_with_table_is_rejected_before_running() {
+        let lf = loaded(
+            "Feature: f\n  Scenario: s\n    When I do business\n      | value |\n      | x     |\n",
+        );
+
+        let problems = check(&[lf], &macro_registry("table"));
+
+        assert_eq!(problems.len(), 1);
+        assert!(problems[0].message.contains("table"), "{problems:?}");
     }
 }
