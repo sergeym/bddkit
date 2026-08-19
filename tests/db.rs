@@ -7,9 +7,9 @@ use common::db::{combined, run_feature, setup};
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn insert_identity_and_uuid_pk() {
     let _g = setup().await;
-    // companies: the identity PK is omitted; users: the uuid PK is client-generated,
-    // created_at NOT NULL with no default gets filled with now(). Both rows are read
-    // back by the generated PK — so last_insert_id_* were set correctly.
+    // companies: identity PK is omitted; users: uuid PK is generated client-side,
+    // created_at NOT NULL without a default is filled with now(). Both rows are read
+    // back by the generated PK — meaning last_insert_id_* are set.
     let src = "\
 Feature: insert
   Scenario: identity and uuid
@@ -18,21 +18,21 @@ Feature: insert
     Given I have \"users\" with \"email: a@b.net\"
     Then I should have \"users\" with \"id: <<last_insert_id_users>>\"
 ";
-    let out = run_feature(src);
+    let out = run_feature(src, &_g);
     assert!(out.status.success(), "{}", combined(&out));
-    assert!(combined(&out).contains("failures: 0"), "{}", combined(&out));
+    assert!(combined(&out).contains("failed: 0"), "{}", combined(&out));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn missing_not_null_without_default_fails_naming_column() {
     let _g = setup().await;
-    // companies.slug is NOT NULL with no default and no value → error names the column.
+    // companies.slug NOT NULL without a default and without a value → error naming the column.
     let src = "\
 Feature: insert
   Scenario: missing slug
     Given I have \"companies\" with \"name: no-slug\"
 ";
-    let out = run_feature(src);
+    let out = run_feature(src, &_g);
     assert!(!out.status.success(), "must fail: {}", combined(&out));
     assert!(combined(&out).contains("slug"), "{}", combined(&out));
 }
@@ -50,14 +50,14 @@ Feature: insert
     Then I should have \"companies\" with \"id: <<last_insert_id_companies_0>>\"
     And I should have \"companies\" with \"id: <<last_insert_id_companies_1>>\"
 ";
-    let out = run_feature(src);
+    let out = run_feature(src, &_g);
     assert!(out.status.success(), "{}", combined(&out));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn update_sets_updated_counter() {
     let _g = setup().await;
-    // updated_companies == 1 after UPDATE; the last step looks for the now-deleted
+    // updated_companies == 1 after UPDATE; the last step looks for the already-deleted
     // row and must fail (I should not have arrives in Task 10).
     let src = "\
 Feature: mutate
@@ -68,8 +68,8 @@ Feature: mutate
     When I delete \"companies\" where \"id: <<last_insert_id_companies>>\"
     Then I should have \"companies\" with \"slug: acme\"
 ";
-    let out = run_feature(src);
-    assert!(!out.status.success(), "a deleted row must not be found: {}", combined(&out));
+    let out = run_feature(src, &_g);
+    assert!(!out.status.success(), "a deleted record must not be found: {}", combined(&out));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -83,58 +83,58 @@ Feature: mutate
     When I delete all \"companies\"
     Then I should have \"companies\" with \"slug: one\"
 ";
-    // after DELETE ALL the table is empty — the row lookup must fail.
-    let out = run_feature(src);
-    assert!(!out.status.success(), "the table must be empty: {}", combined(&out));
+    // after DELETE ALL the table is empty — looking up a row must fail.
+    let out = run_feature(src, &_g);
+    assert!(!out.status.success(), "table must be empty: {}", combined(&out));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn should_not_have_passes_for_absent_row() {
     let _g = setup().await;
-    // A row with slug: acme exists; negating the existence of a missing slug passes.
+    // A row with slug: acme exists; negating the presence of a nonexistent slug passes.
     let src = "\
 Feature: absence
   Scenario: negative existence ok
     Given I have \"companies\" with \"slug: acme\"
     Then I should not have \"companies\" with \"slug: ghost\"
 ";
-    let out = run_feature(src);
+    let out = run_feature(src, &_g);
     assert!(out.status.success(), "{}", combined(&out));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn should_not_have_fails_for_present_row() {
     let _g = setup().await;
-    // Negating the existence of a row that's actually present must fail.
+    // Negating the presence of an existing row must fail.
     let src = "\
 Feature: absence
   Scenario: negative existence violated
     Given I have \"companies\" with \"slug: acme\"
     Then I should not have \"companies\" with \"slug: acme\"
 ";
-    let out = run_feature(src);
-    assert!(!out.status.success(), "an existing row must violate the negation: {}", combined(&out));
+    let out = run_feature(src, &_g);
+    assert!(!out.status.success(), "an existing record must violate the negation: {}", combined(&out));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn null_sentinel_insert_matches_is_null() {
     let _g = setup().await;
-    // deleted_at is inserted as <<null>> (SQL NULL); looking it up by <<null>> goes through IS NULL.
+    // deleted_at is inserted as <<null>> (SQL NULL); looking up by <<null>> uses IS NULL.
     let src = "\
 Feature: null
   Scenario: insert null and match is null
     Given I have \"users\" with \"email: a@b.net, deleted_at: <<null>>\"
     Then I should have \"users\" with \"deleted_at: <<null>>\"
 ";
-    let out = run_feature(src);
+    let out = run_feature(src, &_g);
     assert!(out.status.success(), "{}", combined(&out));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn composite_pk_insert_reads_back_via_last_insert_vars() {
     let _g = setup().await;
-    // pair(a, b) has a composite PK; RETURNING sets last_insert_pair_a / _b,
-    // which are then used to read the row back.
+    // pair(a, b) is a composite PK; RETURNING stores last_insert_pair_a / _b,
+    // which are used to read the row back.
     let src = "\
 Feature: composite pk
   Scenario: insert and read back pair
@@ -142,14 +142,14 @@ Feature: composite pk
     Then I should have \"pair\" with \"a: <<last_insert_pair_a>>\"
     And I should have \"pair\" with \"b: <<last_insert_pair_b>>\"
 ";
-    let out = run_feature(src);
+    let out = run_feature(src, &_g);
     assert!(out.status.success(), "{}", combined(&out));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn delete_all_sets_deleted_counter() {
     let _g = setup().await;
-    // deleted_companies == 2 after DELETE ALL over two rows.
+    // deleted_companies == 2 after DELETE ALL on two rows.
     let src = "\
 Feature: mutate
   Scenario: delete all counter
@@ -158,15 +158,15 @@ Feature: mutate
     When I delete all \"companies\"
     Then variable \"deleted_companies\" should be equal to \"2\"
 ";
-    let out = run_feature(src);
+    let out = run_feature(src, &_g);
     assert!(out.status.success(), "{}", combined(&out));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn extract_from_table_binds_variable() {
     let _g = setup().await;
-    // extract stores the column value in a variable; the following step checks
-    // it via <<cid>> — a match confirms extract bound the variable correctly.
+    // extract stores the column value in a variable; the next step checks
+    // it via <<cid>> — a match confirms extract bound the variable.
     let src = "\
 Feature: extract
   Scenario: pull id into var
@@ -174,14 +174,14 @@ Feature: extract
     When I extract \"id\" from \"companies\" with \"slug: acme\" as \"cid\"
     Then I should have \"companies\" with \"id: <<cid>>\"
 ";
-    let out = run_feature(src);
+    let out = run_feature(src, &_g);
     assert!(out.status.success(), "{}", combined(&out));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sequence_and_builtin_function() {
     let _g = setup().await;
-    // nextval increases; upper() is a built-in function with a text argument.
+    // nextval increases; upper() is a builtin function with a text argument.
     let src = "\
 Feature: routines
   Scenario: sequence and function
@@ -191,6 +191,6 @@ Feature: routines
     When I call function \"upper\" with \"s: abc\" as \"up\"
     Then variable \"up\" should be equal to \"ABC\"
 ";
-    let out = run_feature(src);
+    let out = run_feature(src, &_g);
     assert!(out.status.success(), "{}", combined(&out));
 }
