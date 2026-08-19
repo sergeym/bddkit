@@ -1,4 +1,6 @@
-suites:
-  jsonplaceholder:
-    base_url: https://jsonplaceholder.typicode.com/
-    paths: [examples/features]
+paths: [examples/features]
+
+resources:
+  api:
+    jsonplaceholder:
+      base_url: https://jsonplaceholder.typicode.com/

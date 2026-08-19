@@ -94,8 +94,8 @@ pub fn run_feature(feature_src: &str, setup: &Setup) -> Output {
 
     let features_path = dir.join("features").display().to_string().replace('\\', "/");
     let cfg = format!(
-        "suites:\n  s:\n    base_url: http://127.0.0.1:1\n    paths: [{features_path}]\n    \
-         connections:\n      default:\n        dsn: {}\n        search_path: [apibdd_it]\n",
+        "paths: [{features_path}]\nresources:\n  api:\n    stub:\n      base_url: http://127.0.0.1:1\n  \
+         db:\n    default:\n      dsn: {}\n      search_path: [apibdd_it]\n",
         test_dsn()
     );
     let cfg_path = dir.join("cfg.yaml");

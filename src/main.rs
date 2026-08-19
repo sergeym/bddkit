@@ -23,9 +23,6 @@ struct Cli {
     /// Path to the YAML config
     #[arg(long)]
     config: PathBuf,
-    /// Run only one suite
-    #[arg(long)]
-    suite: Option<String>,
 }
 
 #[tokio::main]
@@ -44,16 +41,8 @@ async fn main() -> Result<()> {
     let generator = Arc::new(unique::Generator::new());
 
     let mut loaded = Vec::new();
-    let mut plan = Vec::new();
-    for (name, suite) in &cfg.suites {
-        if cli.suite.as_ref().is_some_and(|s| s != name) {
-            continue;
-        }
-        for path in feature::discover(&suite.paths)? {
-            let lf = feature::load(&path)?;
-            plan.push((name.clone(), loaded.len()));
-            loaded.push(lf);
-        }
+    for path in feature::discover(&cfg.paths)? {
+        loaded.push(feature::load(&path)?);
     }
 
     let problems = validate::check(&loaded, &reg);
@@ -65,53 +54,41 @@ async fn main() -> Result<()> {
         std::process::exit(2);
     }
 
-    // Pools are created once per suite, only for suites with connections.
-    // The M2 runner is sequential; max_connections is set with headroom for M4.
-    let mut db_by_suite: std::collections::HashMap<String, std::sync::Arc<db::SuiteDb>> =
-        std::collections::HashMap::new();
-    for (name, suite) in &cfg.suites {
-        if cli.suite.as_ref().is_some_and(|s| s != name) {
-            continue;
-        }
-        if suite.connections.is_empty() {
-            continue;
-        }
-        let max = cfg.suite_concurrency(name) as u32;
-        let sdb = db::SuiteDb::connect(&suite.connections, max)
-            .await
-            .map_err(anyhow::Error::msg)?;
-        db_by_suite.insert(name.clone(), std::sync::Arc::new(sdb));
+    let mut by_name = std::collections::HashMap::new();
+    for (name, api) in &cfg.resources.api {
+        let headers = api
+            .default_headers
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        by_name.insert(
+            name.clone(),
+            http::ApiResource::new(&api.base_url, api.timeout_secs, headers)?,
+        );
     }
+    let apis = Arc::new(http::Apis::new(by_name, cfg.resolve_default_api()?)?);
+
+    // Pools are created once per run. The runner is sequential;
+    // max_connections is set with headroom for M5.
+    let db = if cfg.resources.db.is_empty() {
+        None
+    } else {
+        Some(Arc::new(
+            db::Db::connect(&cfg.resources.db, cfg.concurrency as u32)
+                .await
+                .map_err(anyhow::Error::msg)?,
+        ))
+    };
+    let default_db = cfg.resolve_default_db()?.unwrap_or_default();
 
     println!("run {}", generator.run_id());
     let mut results = Vec::new();
-    let mut infra_failed = false;
-    for (suite_name, idx) in plan {
-        let suite = &cfg.suites[&suite_name];
-        let db = db::DbHandle::new(db_by_suite.get(&suite_name).cloned());
-        match runner::run_file(
-            &loaded[idx],
-            &reg,
-            &suite.base_url,
-            suite.timeout_secs,
-            generator.clone(),
-            db,
-        )
-        .await
-        {
-            Ok(r) => {
-                report::print_file(&r);
-                results.push(r);
-            }
-            // A file-level infra error (e.g. an invalid base_url)
-            // must not abort the whole run: print it and move to the next file.
-            Err(e) => {
-                eprintln!("ERROR  {}: {e:#}", loaded[idx].path.display());
-                infra_failed = true;
-            }
-        }
+    for lf in &loaded {
+        let handle = db::DbHandle::new(db.clone(), default_db.clone());
+        let r = runner::run_file(lf, &reg, apis.clone(), generator.clone(), handle).await;
+        report::print_file(&r);
+        results.push(r);
     }
 
-    let code = report::print_summary(&results, generator.run_id());
-    std::process::exit(if infra_failed { code.max(1) } else { code });
+    std::process::exit(report::print_summary(&results, generator.run_id()));
 }

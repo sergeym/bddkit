@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
 use serde_json::Value;
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 #[derive(Debug, Clone)]
@@ -58,9 +60,70 @@ impl std::fmt::Display for Exchange {
     }
 }
 
-pub struct HttpState {
+/// A single API resource: its own client (hence its own timeout and connection
+/// pool), base address, and the headers every scenario starts with.
+pub struct ApiResource {
     client: reqwest::Client,
     base_url: url::Url,
+    default_headers: Vec<(String, String)>,
+}
+
+impl ApiResource {
+    pub fn new(
+        base_url: &str,
+        timeout_secs: u64,
+        default_headers: Vec<(String, String)>,
+    ) -> Result<Self> {
+        Ok(Self {
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(timeout_secs))
+                .build()
+                .context("failed to create HTTP client")?,
+            base_url: url::Url::parse(base_url)
+                .with_context(|| format!("invalid base_url {base_url:?}"))?,
+            default_headers,
+        })
+    }
+}
+
+/// All API resources for the run. Built once and shared via `Arc`: the client
+/// holds a connection pool, and recreating it per scenario would waste it.
+pub struct Apis {
+    by_name: HashMap<String, ApiResource>,
+    default: String,
+}
+
+impl Apis {
+    /// An error if `default` is not among the named resources: the rest of the code
+    /// relies on the default being resolvable and doesn't need to recheck it.
+    pub fn new(by_name: HashMap<String, ApiResource>, default: String) -> Result<Self> {
+        if !by_name.contains_key(&default) {
+            anyhow::bail!("default API resource {default:?} is not declared in resources.api");
+        }
+        Ok(Self { by_name, default })
+    }
+
+    pub fn get(&self, name: &str) -> Result<&ApiResource, String> {
+        self.by_name
+            .get(name)
+            .ok_or_else(|| format!("API resource {name:?} is not declared in resources.api"))
+    }
+
+    pub fn default_name(&self) -> &str {
+        &self.default
+    }
+
+    fn default_headers(&self) -> Vec<(String, String)> {
+        self.by_name
+            .get(&self.default)
+            .map(|r| r.default_headers.clone())
+            .unwrap_or_default()
+    }
+}
+
+pub struct HttpState {
+    apis: Arc<Apis>,
+    current: String,
     headers: Vec<(String, String)>,
     query: Vec<(String, String)>,
     body: Option<String>,
@@ -69,20 +132,50 @@ pub struct HttpState {
 }
 
 impl HttpState {
-    pub fn new(base_url: &str, timeout_secs: u64) -> Result<Self> {
-        Ok(Self {
-            client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(timeout_secs))
-                .build()
-                .context("failed to create HTTP client")?,
-            base_url: url::Url::parse(base_url)
-                .with_context(|| format!("invalid base_url {base_url:?}"))?,
+    pub fn new(apis: Arc<Apis>) -> Self {
+        let mut state = Self {
+            apis,
+            current: String::new(),
             headers: Vec::new(),
             query: Vec::new(),
             body: None,
             form: None,
             last: None,
-        })
+        };
+        state.reset();
+        state
+    }
+
+    /// Scenario boundary: the current resource, headers, and accumulated request
+    /// return to their initial state, the last exchange is forgotten.
+    pub fn reset(&mut self) {
+        let default = self.apis.default_name().to_string();
+        let headers = self.apis.default_headers();
+        self.switch_to(default, headers);
+        self.last = None;
+    }
+
+    /// Switches to a different API. Headers are replaced with the new resource's
+    /// default headers, and the accumulated request is cleared: authorization set
+    /// for one host must not leak to another. `last` is kept — it is a response,
+    /// not a request, and assertions on it must still work after switching.
+    pub fn use_api(&mut self, name: &str) -> Result<(), String> {
+        let headers = self.apis.get(name)?.default_headers.clone();
+        self.switch_to(name.to_string(), headers);
+        Ok(())
+    }
+
+    fn switch_to(&mut self, name: String, headers: Vec<(String, String)>) {
+        self.current = name;
+        self.headers = headers;
+        self.query.clear();
+        self.body = None;
+        self.form = None;
+    }
+
+    #[allow(dead_code)] // only read by tests, to assert the api switch
+    pub fn current(&self) -> &str {
+        &self.current
     }
 
     /// Replace: removes all values with this name, then sets one.
@@ -121,11 +214,12 @@ impl HttpState {
     }
 
     pub async fn send(&mut self, path: &str, method: &str) -> Result<(), String> {
-        // Reset the previous exchange BEFORE sending: on a network failure (connection
-        // refused, timeout) no successful exchange is recorded, and a failure dump would
-        // otherwise show a stale response from a previous step as the failed one's.
+        // Reset the last exchange BEFORE sending: on a network failure (connection
+        // refused, timeout) no successful exchange gets recorded, and a failure dump
+        // would otherwise show the previous step's stale response as the failed one's.
         self.last = None;
-        let mut url = self
+        let api = self.apis.get(&self.current)?;
+        let mut url = api
             .base_url
             .join(path)
             .map_err(|e| format!("invalid path {path:?}: {e}"))?;
@@ -138,7 +232,7 @@ impl HttpState {
         let m = reqwest::Method::from_bytes(method.as_bytes())
             .map_err(|e| format!("invalid HTTP method {method:?}: {e}"))?;
 
-        let mut req = self.client.request(m.clone(), url.clone());
+        let mut req = api.client.request(m.clone(), url.clone());
         for (k, v) in &self.headers {
             req = req.header(k, v);
         }
@@ -188,9 +282,134 @@ impl HttpState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+
+    fn apis_with(name: &str, base: &str, default_headers: Vec<(String, String)>) -> Arc<Apis> {
+        let mut by_name = HashMap::new();
+        by_name.insert(
+            name.to_string(),
+            ApiResource::new(base, 5, default_headers).expect("valid base_url"),
+        );
+        Arc::new(Apis::new(by_name, name.to_string()).expect("default is declared"))
+    }
 
     fn state() -> HttpState {
-        HttpState::new("http://localhost:1/", 5).unwrap()
+        HttpState::new(apis_with("main", "http://localhost:1/", Vec::new()))
+    }
+
+    fn two_apis() -> Arc<Apis> {
+        let mut by_name = HashMap::new();
+        by_name.insert(
+            "first".to_string(),
+            ApiResource::new(
+                "http://first.local/",
+                5,
+                vec![("x-source".to_string(), "first".to_string())],
+            )
+            .expect("valid base_url"),
+        );
+        by_name.insert(
+            "second".to_string(),
+            ApiResource::new(
+                "http://second.local/",
+                5,
+                vec![("x-source".to_string(), "second".to_string())],
+            )
+            .expect("valid base_url"),
+        );
+        Arc::new(Apis::new(by_name, "first".to_string()).expect("default is declared"))
+    }
+
+    #[test]
+    fn use_api_switches_the_current_resource() {
+        let mut s = HttpState::new(two_apis());
+        s.use_api("second").expect("resource is declared");
+        assert_eq!(s.current(), "second");
+    }
+
+    #[test]
+    fn use_api_replaces_headers_with_the_new_resource_defaults() {
+        let mut s = HttpState::new(two_apis());
+        s.set_header("authorization", "Bearer first-host");
+        s.use_api("second").expect("resource is declared");
+        assert_eq!(s.headers, vec![("x-source".to_string(), "second".to_string())]);
+    }
+
+    #[test]
+    fn use_api_clears_the_pending_body() {
+        let mut s = HttpState::new(two_apis());
+        s.set_body("{\"a\":1}".to_string());
+        s.use_api("second").expect("resource is declared");
+        assert!(s.body.is_none());
+    }
+
+    #[test]
+    fn use_api_clears_the_pending_query() {
+        let mut s = HttpState::new(two_apis());
+        s.set_query("page", "2");
+        s.use_api("second").expect("resource is declared");
+        assert!(s.query.is_empty());
+    }
+
+    #[test]
+    fn use_api_keeps_the_last_exchange() {
+        let mut s = HttpState::new(two_apis());
+        s.last = Some(Exchange {
+            method: "GET".into(),
+            url: "http://first.local/x".into(),
+            req_headers: vec![],
+            req_body: None,
+            status: 200,
+            resp_headers: vec![],
+            body: "{}".into(),
+        });
+        s.use_api("second").expect("resource is declared");
+        assert!(
+            s.last().is_some(),
+            "the previous response must survive switching APIs"
+        );
+    }
+
+    #[test]
+    fn use_api_with_an_undeclared_name_is_an_error() {
+        let mut s = HttpState::new(two_apis());
+        assert!(s.use_api("third").is_err());
+    }
+
+    #[test]
+    fn reset_returns_to_the_default_resource() {
+        let mut s = HttpState::new(two_apis());
+        s.use_api("second").expect("resource is declared");
+        s.reset();
+        assert_eq!(s.current(), "first");
+    }
+
+    #[test]
+    fn api_resource_rejects_an_invalid_base_url() {
+        assert!(ApiResource::new("not-a-url", 5, Vec::new()).is_err());
+    }
+
+    #[test]
+    fn apis_reject_a_default_naming_an_undeclared_resource() {
+        let mut by_name = HashMap::new();
+        by_name.insert(
+            "a".to_string(),
+            ApiResource::new("http://a.local/", 5, Vec::new()).expect("valid base_url"),
+        );
+        assert!(Apis::new(by_name, "b".to_string()).is_err());
+    }
+
+    #[test]
+    fn new_state_starts_on_the_default_resource() {
+        let s = HttpState::new(apis_with("main", "http://localhost:1/", Vec::new()));
+        assert_eq!(s.current(), "main");
+    }
+
+    #[test]
+    fn new_state_seeds_headers_from_the_resource_defaults() {
+        let defaults = vec![("accept".to_string(), "application/json".to_string())];
+        let s = HttpState::new(apis_with("main", "http://localhost:1/", defaults));
+        assert_eq!(s.headers, vec![("accept".to_string(), "application/json".to_string())]);
     }
 
     #[test]
@@ -212,11 +431,11 @@ mod tests {
 
     #[tokio::test]
     async fn failed_send_leaves_no_stale_exchange() {
-        // Port 1 is unreachable: send fails at the transport level. `last` must stay
+        // Port 1 is unreachable: send fails at the transport layer. `last` must remain
         // None, or a failure dump would show a stale exchange.
         let mut s = state();
         assert!(s.send("/x", "GET").await.is_err());
-        assert!(s.last().is_none(), "a failed send must not leave a stale exchange");
+        assert!(s.last().is_none(), "a failed send must not leave an exchange behind");
     }
 
     #[test]
@@ -266,10 +485,5 @@ mod tests {
         assert!(s.contains("POST http://x/login"));
         assert!(s.contains("Content-Type: application/json"));
         assert!(s.contains("← 422"));
-    }
-
-    #[test]
-    fn invalid_base_url_is_rejected() {
-        assert!(HttpState::new("not-a-url", 5).is_err());
     }
 }

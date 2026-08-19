@@ -45,3 +45,8 @@ pub fn set_form(w: &mut World, table: Option<&Vec<Vec<String>>>) -> Result<(), S
 pub async fn request(w: &mut World, path: &str, method: &str) -> Result<(), String> {
     w.http.send(path, method).await
 }
+
+/// Switches the scenario's current API. An error if the name is not declared.
+pub fn use_api(w: &mut World, name: &str) -> Result<(), String> {
+    w.http.use_api(name)
+}

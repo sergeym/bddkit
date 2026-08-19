@@ -11,16 +11,15 @@ use sqlx::postgres::PgPoolOptions;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
-/// The DB resources for one suite: pools keyed by connection name + an introspection cache.
-/// Shared across all files in the suite; the cache stays valid for the whole run (schema doesn't change).
-pub struct SuiteDb {
+/// Pools for all declared connections + an introspection cache. One per run:
+/// a connection belongs to the system under test, not to a test set.
+pub struct Db {
     pools: HashMap<String, PgPool>,
-    default: String,
     cache: Mutex<HashMap<(String, String), Arc<TableSchema>>>,
 }
 
-impl SuiteDb {
-    pub async fn connect(conns: &BTreeMap<String, Connection>, max: u32) -> Result<SuiteDb, String> {
+impl Db {
+    pub async fn connect(conns: &BTreeMap<String, Connection>, max: u32) -> Result<Db, String> {
         let mut pools = HashMap::new();
         for (name, c) in conns {
             let opts = PgPoolOptions::new().max_connections(max.max(1));
@@ -40,17 +39,16 @@ impl SuiteDb {
             let pool = pool.map_err(|e| format!("connection {name}: {e}"))?;
             pools.insert(name.clone(), pool);
         }
-        let default = conns.keys().next().cloned().unwrap_or_default();
-        Ok(SuiteDb { pools, default, cache: Mutex::new(HashMap::new()) })
+        Ok(Db { pools, cache: Mutex::new(HashMap::new()) })
     }
 
     pub fn pool(&self, name: &str) -> Result<&PgPool, String> {
         self.pools
             .get(name)
-            .ok_or_else(|| format!("connection {name:?} is not configured in the suite"))
+            .ok_or_else(|| format!("connection {name:?} is not declared in resources.db"))
     }
 
-    /// Introspection with caching. The std::Mutex is NOT held across an await.
+    /// Introspection with caching. std::Mutex is NOT held across an await.
     pub async fn schema(&self, conn: &str, sql_name: &str) -> Result<Arc<TableSchema>, String> {
         let key = (conn.to_string(), sql_name.to_string());
         if let Some(s) = self.cache.lock().expect("cache mutex").get(&key) {
@@ -63,37 +61,35 @@ impl SuiteDb {
     }
 }
 
-/// A DB handle for one file run: a reference to the suite's resources + the current connection.
+/// A DB handle for a single file run: a reference to the shared pools + the current connection.
 /// `current` resets at the scenario boundary (§8: connection scope is the scenario).
 pub struct DbHandle {
-    suite: Option<Arc<SuiteDb>>,
+    db: Option<Arc<Db>>,
+    default: String,
     current: String,
 }
 
 impl DbHandle {
-    pub fn new(suite: Option<Arc<SuiteDb>>) -> Self {
-        let current = suite.as_ref().map(|s| s.default.clone()).unwrap_or_default();
-        Self { suite, current }
+    pub fn new(db: Option<Arc<Db>>, default: String) -> Self {
+        Self { db, current: default.clone(), default }
     }
 
     pub fn reset(&mut self) {
-        if let Some(s) = &self.suite {
-            self.current = s.default.clone();
-        }
+        self.current = self.default.clone();
     }
 
     pub fn current(&self) -> &str {
         &self.current
     }
 
-    pub fn suite(&self) -> Result<&Arc<SuiteDb>, String> {
-        self.suite
-            .as_ref()
-            .ok_or_else(|| "this suite has no database connections configured".to_string())
+    pub fn resources(&self) -> Result<&Arc<Db>, String> {
+        self.db.as_ref().ok_or_else(|| {
+            "no database connection declared in the config (resources.db)".to_string()
+        })
     }
 
     pub fn set_current(&mut self, name: &str) -> Result<(), String> {
-        self.suite()?.pool(name)?; // check that the connection exists
+        self.resources()?.pool(name)?; // check that the connection exists
         self.current = name.to_string();
         Ok(())
     }
@@ -104,11 +100,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn handle_without_suite_reports_no_db() {
-        let mut h = DbHandle::new(None);
-        assert!(h.suite().is_err(), "suite() is an error with no connections");
-        assert!(h.set_current("x").is_err(), "switching with no suite is an error");
-        assert_eq!(h.current(), "", "the default connection is empty");
-        h.reset(); // must not panic
+    fn a_handle_without_connections_reports_no_database() {
+        let h = DbHandle::new(None, String::new());
+        assert!(h.resources().is_err(), "without connections resources() is an error");
+    }
+
+    #[test]
+    fn a_handle_without_connections_cannot_switch() {
+        let mut h = DbHandle::new(None, String::new());
+        assert!(h.set_current("x").is_err(), "switching without connections is an error");
+    }
+
+    #[test]
+    fn reset_returns_to_the_default_connection() {
+        let mut h = DbHandle::new(None, "main".to_string());
+        h.current = "audit".to_string();
+        h.reset();
+        assert_eq!(h.current(), "main");
     }
 }

@@ -20,6 +20,7 @@ pub enum StepId {
     SetFormParams,
     RequestPath,
     RequestPathWithMethod,
+    UseApi,
     // response checks
     ResponseCode,
     ResponseBodyContainsJson,
@@ -152,6 +153,10 @@ pub const BUILTIN_STEPS: &[StepDef] = &[
     StepDef {
         id: StepId::VariableEquals,
         pattern: r#"^variable "([^"]*)" should be equal to "([^"]*)"$"#,
+    },
+    StepDef {
+        id: StepId::UseApi,
+        pattern: r#"^I use "([^"]*)" api$"#,
     },
     StepDef {
         id: StepId::UseConnection,
@@ -601,6 +606,7 @@ pub async fn dispatch(w: &mut World, id: StepId, a: &Args) -> Result<(), String>
         StepId::ExtractFromCookiesGlobal => vars::extract_from_cookies(w, a.cap(0), a.cap(1), true),
         StepId::VariableEquals => vars::variable_equals(w, a.cap(0), a.cap(1), false),
         StepId::VariableNotEquals => vars::variable_equals(w, a.cap(0), a.cap(1), true),
+        StepId::UseApi => api::use_api(w, a.cap(0)),
         StepId::UseConnection => db::use_connection(w, a.cap(0)),
         StepId::DebugOn => db::debug_on(w),
         StepId::DebugOff => db::debug_off(w),
@@ -689,6 +695,7 @@ mod tests {
             r#"variable "a" should be equal to "1""#,
             r#"variable "a" should not be equal to "1""#,
             r#"I use "main" connection"#,
+            r#"I use "billing" api"#,
             "I am in debug mode",
             "I am not in debug mode",
             r#"I have "users" where:"#,
@@ -713,6 +720,16 @@ mod tests {
                 Err(e) => panic!("ambiguity: {e}"),
             }
         }
+    }
+
+    #[test]
+    fn the_use_api_step_resolves_to_its_builtin() {
+        let (target, caps) = reg()
+            .find(r#"I use "billing" api"#)
+            .expect("pattern is not ambiguous")
+            .expect("step is declared");
+        assert!(target == StepId::UseApi, "the step must resolve to UseApi");
+        assert_eq!(caps, vec!["billing".to_string()]);
     }
 
     #[test]

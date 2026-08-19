@@ -41,7 +41,7 @@ async fn unknown_step_fails_before_running() {
     std::fs::write(
         dir.join("cfg.yaml"),
         format!(
-            "suites:\n  s:\n    base_url: {base}\n    paths: [{}]\n",
+            "paths: [{}]\nresources:\n  api:\n    stub:\n      base_url: {base}\n",
             dir.join("features")
                 .display()
                 .to_string()
@@ -82,7 +82,7 @@ fn macro_cycle_fails_validation_with_exit_code_two() {
     std::fs::write(
         dir.join("cfg.yaml"),
         format!(
-            "macro_paths: [{}]\nsuites:\n  s:\n    base_url: http://example.test\n    paths: [{}]\n",
+            "macro_paths: [{}]\npaths: [{}]\nresources:\n  api:\n    stub:\n      base_url: http://example.test\n",
             dir.join("macros.yaml")
                 .display()
                 .to_string()

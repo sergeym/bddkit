@@ -105,12 +105,11 @@ fn execute_step<'a>(
 pub async fn run_file(
     lf: &LoadedFeature,
     reg: &Registry,
-    base_url: &str,
-    timeout_secs: u64,
+    apis: Arc<crate::http::Apis>,
     generator: Arc<Generator>,
     db: crate::db::DbHandle,
-) -> Result<FileResult> {
-    let mut world = World::new(base_url, timeout_secs, generator, db)?;
+) -> FileResult {
+    let mut world = World::new(apis, generator, db);
     let mut scenarios = Vec::new();
 
     let background: Vec<ExpandedStep> = lf
@@ -136,7 +135,7 @@ pub async fn run_file(
 
     for sc in &lf.feature.scenarios {
         for ex in expand_outlines(sc) {
-            world.reset_scenario(base_url, timeout_secs)?;
+            world.reset_scenario();
             let mut failure = None;
 
             for step in background.iter().chain(ex.steps.iter()) {
@@ -156,10 +155,10 @@ pub async fn run_file(
             });
         }
     }
-    Ok(FileResult {
+    FileResult {
         path: lf.path.clone(),
         scenarios,
-    })
+    }
 }
 
 #[cfg(test)]
@@ -184,16 +183,20 @@ mod tests {
             path: PathBuf::from("macro.feature"),
             feature: parse_str(feature).unwrap(),
         };
+        let mut by_name = std::collections::HashMap::new();
+        by_name.insert(
+            "default".to_string(),
+            crate::http::ApiResource::new("http://example.test", 1, Vec::new()).unwrap(),
+        );
+        let apis = Arc::new(crate::http::Apis::new(by_name, "default".to_string()).unwrap());
         run_file(
             &loaded,
             registry,
-            "http://example.test",
-            1,
+            apis,
             Arc::new(Generator::new()),
-            DbHandle::new(None),
+            DbHandle::new(None, String::new()),
         )
         .await
-        .unwrap()
     }
 
     #[tokio::test]
