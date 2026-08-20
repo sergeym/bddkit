@@ -1,5 +1,5 @@
-//! Reference HTTP service for the acceptance tests. Spun up in-process
-//! on a random port; docker-compose arrives in M2 alongside Postgres.
+//! Reference HTTP service for the acceptance tests. Started in-process
+//! on a random port: docker-compose arrives in M2 together with Postgres.
 
 #![allow(dead_code)]
 
@@ -20,6 +20,24 @@ pub async fn spawn() -> String {
         .route("/users", get(users))
         .route("/login", post(login))
         .route("/headers", get(headers));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+    format!("http://{addr}/")
+}
+
+/// A second reference service. Answers the same `/ping`, but with a different body:
+/// the API-switch test must see that the request landed here.
+pub async fn spawn_secondary() -> String {
+    let app = Router::new().route(
+        "/ping",
+        get(|| async { Json(json!({"status": "ok", "source": "secondary"})) }),
+    );
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await

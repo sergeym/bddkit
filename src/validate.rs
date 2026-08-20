@@ -1,4 +1,4 @@
-use crate::feature::{LoadedFeature, expand_outlines};
+use crate::feature::{LoadedFeature, TagFilter, expand_outlines};
 use crate::steps::{Registry, StepTarget};
 use std::path::PathBuf;
 
@@ -24,7 +24,7 @@ impl std::fmt::Display for Problem {
 /// Matches every step of every file before the first request. Returns ALL
 /// problems at once — a run that fails midway due to a typo costs more
 /// than a full check that takes milliseconds.
-pub fn check(features: &[LoadedFeature], reg: &Registry) -> Vec<Problem> {
+pub fn check(features: &[LoadedFeature], reg: &Registry, filter: &TagFilter) -> Vec<Problem> {
     let mut problems = Vec::new();
     for lf in features {
         let mut all_steps: Vec<(String, usize, bool, bool)> = Vec::new();
@@ -38,7 +38,13 @@ pub fn check(features: &[LoadedFeature], reg: &Registry) -> Vec<Problem> {
                 ));
             }
         }
+        // Background is always checked: it runs before every selected
+        // scenario. Filtered-out scenarios are not checked — a typo in something
+        // that never runs must not fail the run.
         for sc in &lf.feature.scenarios {
+            if !filter.matches(&sc.tags) {
+                continue;
+            }
             for ex in expand_outlines(sc) {
                 for st in ex.steps {
                     all_steps.push((
@@ -119,14 +125,14 @@ Feature: f
     Then the response code is 200
 ",
         );
-        let p = check(&[lf], &Registry::new().unwrap());
+        let p = check(&[lf], &Registry::new().unwrap(), &TagFilter::new(&[]));
         assert!(p.is_empty(), "{p:?}");
     }
 
     #[test]
     fn reports_unknown_step_with_file_and_line() {
         let lf = loaded("Feature: f\n  Scenario: s\n    When I refund the order\n");
-        let p = check(&[lf], &Registry::new().unwrap());
+        let p = check(&[lf], &Registry::new().unwrap(), &TagFilter::new(&[]));
         assert_eq!(p.len(), 1);
         assert_eq!(p[0].line, 3);
         assert!(
@@ -146,7 +152,7 @@ Feature: f
     Then I ship the order
 ",
         );
-        let p = check(&[lf], &Registry::new().unwrap());
+        let p = check(&[lf], &Registry::new().unwrap(), &TagFilter::new(&[]));
         assert_eq!(p.len(), 2, "all problems must be reported at once");
     }
 
@@ -155,9 +161,35 @@ Feature: f
         let lf = loaded(
             "Feature: f\n  Background:\n    Given I refund the order\n  Scenario: s\n    Then the response code is 200\n",
         );
-        let p = check(&[lf], &Registry::new().unwrap());
+        let p = check(&[lf], &Registry::new().unwrap(), &TagFilter::new(&[]));
         assert_eq!(p.len(), 1);
         assert_eq!(p[0].line, 3);
+    }
+
+    #[test]
+    fn a_filtered_out_scenario_with_a_bad_step_does_not_fail_validation() {
+        let lf = loaded(
+            "\
+Feature: f
+  @smoke
+  Scenario: selected
+    Then the response code is 200
+  @slow
+  Scenario: filtered out
+    When I refund the order
+",
+        );
+
+        let p = check(
+            &[lf],
+            &Registry::new().unwrap(),
+            &TagFilter::new(&["smoke".to_string()]),
+        );
+
+        assert!(
+            p.is_empty(),
+            "a typo in an unselected scenario must not fail the run: {p:?}"
+        );
     }
 
     #[test]
@@ -172,7 +204,7 @@ Feature: f
       | POSTT  |
 ",
         );
-        let p = check(&[lf], &Registry::new().unwrap());
+        let p = check(&[lf], &Registry::new().unwrap(), &TagFilter::new(&[]));
         assert_eq!(p.len(), 1, "a typo in the method must surface before the run starts");
     }
 
@@ -182,7 +214,7 @@ Feature: f
         let lf = loaded(
             "Feature: f\n  Scenario: s\n    When I request \"/users/<<userId>>\" using HTTP GET\n",
         );
-        let p = check(&[lf], &Registry::new().unwrap());
+        let p = check(&[lf], &Registry::new().unwrap(), &TagFilter::new(&[]));
         assert!(p.is_empty(), "{p:?}");
     }
 
@@ -192,7 +224,7 @@ Feature: f
             "Feature: f\n  Scenario: s\n    When I do business\n      \"\"\"\n      x\n      \"\"\"\n",
         );
 
-        let problems = check(&[lf], &macro_registry("docstring"));
+        let problems = check(&[lf], &macro_registry("docstring"), &TagFilter::new(&[]));
 
         assert_eq!(problems.len(), 1);
         assert!(problems[0].message.contains("docstring"), "{problems:?}");
@@ -204,7 +236,7 @@ Feature: f
             "Feature: f\n  Scenario: s\n    When I do business\n      | value |\n      | x     |\n",
         );
 
-        let problems = check(&[lf], &macro_registry("table"));
+        let problems = check(&[lf], &macro_registry("table"), &TagFilter::new(&[]));
 
         assert_eq!(problems.len(), 1);
         assert!(problems[0].message.contains("table"), "{problems:?}");

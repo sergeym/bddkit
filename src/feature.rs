@@ -22,6 +22,38 @@ pub struct LoadedFeature {
     pub feature: Feature,
 }
 
+/// Selecting scenarios by tags. An empty filter passes everything.
+pub struct TagFilter {
+    wanted: Vec<String>,
+}
+
+impl TagFilter {
+    pub fn new(tags: &[String]) -> Self {
+        Self {
+            wanted: tags.iter().map(|t| strip_at(t).to_string()).collect(),
+        }
+    }
+
+    /// A scenario is selected if it carries at least one of the requested tags.
+    pub fn matches(&self, tags: &[String]) -> bool {
+        self.wanted.is_empty() || tags.iter().any(|t| self.wanted.iter().any(|w| w == strip_at(t)))
+    }
+}
+
+/// A leading `@` is optional on both sides: `--tag smoke` and `--tag @smoke`
+/// both select `@smoke` in the feature file the same way.
+fn strip_at(tag: &str) -> &str {
+    tag.strip_prefix('@').unwrap_or(tag)
+}
+
+impl LoadedFeature {
+    /// Whether the file has at least one scenario that passes the filter. Expanding
+    /// a Scenario Outline does not change tags, so this can be checked before that.
+    pub fn has_selected_scenario(&self, filter: &TagFilter) -> bool {
+        self.feature.scenarios.iter().any(|sc| filter.matches(&sc.tags))
+    }
+}
+
 fn to_step(s: &gherkin::Step) -> ExpandedStep {
     ExpandedStep {
         text: s.value.clone(),
@@ -104,8 +136,15 @@ pub fn expand_outlines(sc: &gherkin::Scenario) -> Vec<ExpandedScenario> {
 }
 
 pub fn load(path: &Path) -> Result<LoadedFeature> {
-    let feature = Feature::parse_path(path, GherkinEnv::default())
+    let mut feature = Feature::parse_path(path, GherkinEnv::default())
         .with_context(|| format!("failed to parse {}", path.display()))?;
+    // Tags above `Feature:` apply to all of its scenarios. gherkin keeps them
+    // separate, but a tester writing @billing above the feature expects the filter
+    // to select the whole file.
+    let feature_tags = feature.tags.clone();
+    for sc in &mut feature.scenarios {
+        sc.tags.extend(feature_tags.iter().cloned());
+    }
     Ok(LoadedFeature {
         path: path.to_path_buf(),
         feature,
@@ -290,5 +329,78 @@ Feature: f
         assert_eq!(e.len(), 1);
         let t = e[0].steps[0].table.as_ref().unwrap();
         assert_eq!(t[1], vec!["email".to_string(), "a@b.net".to_string()]);
+    }
+
+    mod tag_filter {
+        use super::super::TagFilter;
+
+        #[test]
+        fn an_empty_filter_matches_every_scenario() {
+            let f = TagFilter::new(&[]);
+            assert!(f.matches(&[]));
+        }
+
+        #[test]
+        fn matches_when_one_of_the_wanted_tags_is_present() {
+            let f = TagFilter::new(&["smoke".to_string(), "slow".to_string()]);
+            assert!(f.matches(&["slow".to_string()]));
+        }
+
+        #[test]
+        fn a_leading_at_sign_is_optional_on_the_argument() {
+            let f = TagFilter::new(&["@smoke".to_string()]);
+            assert!(f.matches(&["smoke".to_string()]));
+        }
+
+        #[test]
+        fn a_leading_at_sign_is_optional_on_the_gherkin_tag() {
+            let f = TagFilter::new(&["smoke".to_string()]);
+            assert!(f.matches(&["@smoke".to_string()]));
+        }
+
+        #[test]
+        fn matches_a_scenario_that_carries_several_tags() {
+            let f = TagFilter::new(&["slow".to_string()]);
+            assert!(f.matches(&[
+                "@billing".to_string(),
+                "@slow".to_string(),
+                "@wip".to_string(),
+            ]));
+        }
+
+        #[test]
+        fn an_untagged_scenario_is_rejected_by_a_non_empty_filter() {
+            let f = TagFilter::new(&["smoke".to_string()]);
+            assert!(!f.matches(&[]));
+        }
+
+        #[test]
+        fn an_unrelated_tag_does_not_match() {
+            let f = TagFilter::new(&["smoke".to_string()]);
+            assert!(!f.matches(&["wip".to_string()]));
+        }
+    }
+
+    #[test]
+    fn feature_tags_are_inherited_by_every_scenario() {
+        let path = std::env::temp_dir().join("bddkit_feature_tags_inherited.feature");
+        std::fs::write(
+            &path,
+            "@billing\nFeature: f\n  @smoke\n  Scenario: s\n    When I request \"/x\"\n",
+        )
+        .expect("writing the feature file");
+        let lf = load(&path).expect("file parses");
+        assert!(
+            lf.feature.scenarios[0].tags.contains(&"billing".to_string()),
+            "the feature's tag must reach the scenario: {:?}",
+            lf.feature.scenarios[0].tags
+        );
+        // Merging must ADD, not replace: swapping `extend` for
+        // assigning the feature's tag list would silently eat the scenario's own tag.
+        assert!(
+            lf.feature.scenarios[0].tags.contains(&"smoke".to_string()),
+            "the scenario's own tag must survive: {:?}",
+            lf.feature.scenarios[0].tags
+        );
     }
 }

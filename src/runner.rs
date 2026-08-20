@@ -108,6 +108,7 @@ pub async fn run_file(
     apis: Arc<crate::http::Apis>,
     generator: Arc<Generator>,
     db: crate::db::DbHandle,
+    filter: &crate::feature::TagFilter,
 ) -> FileResult {
     let mut world = World::new(apis, generator, db);
     let mut scenarios = Vec::new();
@@ -134,6 +135,9 @@ pub async fn run_file(
     let generator = world.generator.clone();
 
     for sc in &lf.feature.scenarios {
+        if !filter.matches(&sc.tags) {
+            continue;
+        }
         for ex in expand_outlines(sc) {
             world.reset_scenario();
             let mut failure = None;
@@ -195,6 +199,7 @@ mod tests {
             apis,
             Arc::new(Generator::new()),
             DbHandle::new(None, String::new()),
+            &crate::feature::TagFilter::new(&[]),
         )
         .await
     }

@@ -23,6 +23,11 @@ struct Cli {
     /// Path to the YAML config
     #[arg(long)]
     config: PathBuf,
+    /// Run only these directories or .feature files instead of the config's `paths`
+    paths: Vec<PathBuf>,
+    /// Run only scenarios with one of these tags (repeatable)
+    #[arg(long = "tag")]
+    tags: Vec<String>,
 }
 
 #[tokio::main]
@@ -40,12 +45,26 @@ async fn main() -> Result<()> {
     };
     let generator = Arc::new(unique::Generator::new());
 
+    let filter = feature::TagFilter::new(&cli.tags);
+    let paths = if cli.paths.is_empty() {
+        cfg.paths.as_slice()
+    } else {
+        cli.paths.as_slice()
+    };
+
     let mut loaded = Vec::new();
-    for path in feature::discover(&cfg.paths)? {
-        loaded.push(feature::load(&path)?);
+    for path in feature::discover(paths)? {
+        let lf = feature::load(&path)?;
+        if lf.has_selected_scenario(&filter) {
+            loaded.push(lf);
+        }
+    }
+    if loaded.is_empty() {
+        eprintln!("error: no scenario selected, run not started");
+        std::process::exit(2);
     }
 
-    let problems = validate::check(&loaded, &reg);
+    let problems = validate::check(&loaded, &reg, &filter);
     if !problems.is_empty() {
         eprintln!("error: {} problems, run not started\n", problems.len());
         for p in &problems {
@@ -85,7 +104,8 @@ async fn main() -> Result<()> {
     let mut results = Vec::new();
     for lf in &loaded {
         let handle = db::DbHandle::new(db.clone(), default_db.clone());
-        let r = runner::run_file(lf, &reg, apis.clone(), generator.clone(), handle).await;
+        let r =
+            runner::run_file(lf, &reg, apis.clone(), generator.clone(), handle, &filter).await;
         report::print_file(&r);
         results.push(r);
     }

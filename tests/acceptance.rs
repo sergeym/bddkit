@@ -65,6 +65,167 @@ async fn unknown_step_fails_before_running() {
     assert!(stderr.contains("I refund the order"), "{stderr}");
 }
 
+/// Shared helper: writes two tagged feature files and a config pointing at the
+/// stub into a temp directory, returns the config path.
+fn write_tagged_project(base: &str, name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("bddkit-{name}-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("features")).expect("mkdir");
+    std::fs::write(
+        dir.join("features/smoke.feature"),
+        "Feature: smoke\n  @smoke\n  Scenario: ping\n    When I request \"/ping\"\n    Then the response code is 200\n",
+    )
+    .expect("write smoke feature");
+    std::fs::write(
+        dir.join("features/slow.feature"),
+        "Feature: slow\n  @slow\n  Scenario: ping slowly\n    When I request \"/ping\"\n    Then the response code is 200\n",
+    )
+    .expect("write slow feature");
+    let cfg = dir.join("cfg.yaml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "paths: [{}]\nresources:\n  api:\n    stub:\n      base_url: {base}\n",
+            dir.join("features").display().to_string().replace('\\', "/")
+        ),
+    )
+    .expect("write config");
+    cfg
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tag_filter_runs_only_the_matching_scenarios() {
+    let base = common::spawn().await;
+    let cfg = write_tagged_project(&base, "tagfilter");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
+        .args(["--config", cfg.to_str().expect("path is UTF-8"), "--tag", "smoke"])
+        .output()
+        .expect("failed to run bddkit");
+
+    // Scenario names are only printed on failure, so the selection is visible via
+    // file names and the final counters.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("smoke.feature"),
+        "the selected scenario must run:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("slow.feature"),
+        "a scenario without the tag must not run:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("files: 1, scenarios: 1, failed: 0"),
+        "exactly one scenario must pass:\n{stdout}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tag_matching_nothing_fails_with_exit_code_two() {
+    let base = common::spawn().await;
+    let cfg = write_tagged_project(&base, "tagempty");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
+        .args(["--config", cfg.to_str().expect("path is UTF-8"), "--tag", "missing"])
+        .output()
+        .expect("failed to run bddkit");
+
+    assert_eq!(out.status.code(), Some(2), "an empty selection is not a green run");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("no scenario selected"), "{stderr}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_positional_path_overrides_the_config_paths() {
+    let base = common::spawn().await;
+    let cfg = write_tagged_project(&base, "positional");
+    let only = cfg
+        .parent()
+        .expect("parent directory")
+        .join("features/smoke.feature");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
+        .args([
+            "--config",
+            cfg.to_str().expect("path is UTF-8"),
+            only.to_str().expect("path is UTF-8"),
+        ])
+        .output()
+        .expect("failed to run bddkit");
+
+    // The counter is essential: without it the assertion would pass even if the
+    // positional path were fully ignored (`paths` from the config give two files).
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("slow.feature"),
+        "a file outside the given path must not run:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("files: 1, scenarios: 1, failed: 0"),
+        "exactly one file from the given path must pass:\n{stdout}"
+    );
+}
+
+/// M4 gate: one scenario calls two different APIs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_scenario_can_call_two_different_apis() {
+    let primary = common::spawn().await;
+    let secondary = common::spawn_secondary().await;
+
+    let dir = std::env::temp_dir().join(format!("bddkit-two-apis-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("features")).expect("mkdir");
+    std::fs::write(
+        dir.join("features/switch.feature"),
+        r#"Feature: switching between APIs
+  Scenario: the request goes to the selected API, the last response survives the switch
+    When I request "/ping"
+    Then the response body contains JSON:
+      """
+      {"version": 3}
+      """
+    When I use "secondary" api
+    Then the response body contains JSON:
+      """
+      {"version": 3}
+      """
+    When I request "/ping"
+    Then the response body contains JSON:
+      """
+      {"source": "secondary"}
+      """
+"#,
+    )
+    .expect("write feature");
+    std::fs::write(
+        dir.join("cfg.yaml"),
+        format!(
+            "paths: [{}]\ndefault_api: primary\nresources:\n  api:\n    primary:\n      base_url: {primary}\n    secondary:\n      base_url: {secondary}\n",
+            dir.join("features").display().to_string().replace('\\', "/")
+        ),
+    )
+    .expect("write config");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
+        .args([
+            "--config",
+            dir.join("cfg.yaml").to_str().expect("path is UTF-8"),
+        ])
+        .output()
+        .expect("failed to run bddkit");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "the two-API scenario must be green\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+    );
+    // Scenario names are only printed on failure, so the counters are the
+    // only proof that the gate actually ran something.
+    assert!(
+        stdout.contains("files: 1, scenarios: 1, failed: 0"),
+        "exactly one scenario must pass:\n{stdout}"
+    );
+}
+
 #[test]
 fn macro_cycle_fails_validation_with_exit_code_two() {
     let dir = std::env::temp_dir().join(format!("bddkit-cycle-test-{}", std::process::id()));
