@@ -1,13 +1,13 @@
 //! DB integration test helpers: recreating the fixture schema and running
-//! the compiled binary against a temporary config (like the M1 acceptance tests).
+//! the compiled binary against a temp config (like the M1 acceptance tests).
 
 use sqlx::PgPool;
 use std::process::Output;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, MutexGuard};
 
-/// The `apibdd_it` schema is shared by all tests; serialize them so
-/// one test's fixture recreation doesn't collide with another's.
+/// Schema `apibdd_it` is shared by all tests; we serialize them so that
+/// one test recreating the fixture does not collide with another.
 static DB_LOCK: Mutex<()> = Mutex::const_new(());
 
 #[derive(Clone, Copy, Default)]
@@ -44,10 +44,10 @@ pub struct Setup {
 
 pub fn test_dsn() -> String {
     std::env::var("BDDKIT_TEST_DSN")
-        .unwrap_or_else(|_| "postgres://postgres:postgres@127.0.0.1:5432/postgres".to_string())
+        .unwrap_or_else(|_| "postgres://postgres:postgres@127.0.0.1:5433/postgres".to_string())
 }
 
-/// Recreates the `apibdd_it` schema with tables for every PK case.
+/// Recreates the `apibdd_it` schema with tables covering every PK case.
 /// Returns a guard: hold it until the end of the test for isolation.
 pub async fn setup() -> Setup {
     let started = Instant::now();
@@ -82,8 +82,8 @@ pub async fn setup() -> Setup {
     }
 }
 
-/// Writes a temporary config (`default` connection → test DB, search_path
-/// `apibdd_it`) and one feature file, runs the binary, returns its output.
+/// Writes a temp config (connection `default` → test DB, search_path
+/// `apibdd_it`) and one feature file, runs the binary, returns the output.
 #[track_caller]
 pub fn run_feature(feature_src: &str, setup: &Setup) -> Output {
     let phase = Instant::now();
@@ -106,7 +106,7 @@ pub fn run_feature(feature_src: &str, setup: &Setup) -> Output {
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_bddkit"))
         .args(["--config", cfg_path.to_str().expect("path is UTF-8")])
         .output()
-        .expect("failed to run bddkit");
+        .expect("failed to launch bddkit");
     let timings = TimingRow {
         files,
         bddkit: phase.elapsed(),

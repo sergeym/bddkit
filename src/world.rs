@@ -5,7 +5,7 @@ use crate::vars::VarStack;
 use std::sync::Arc;
 
 /// Variables live for the feature file; HTTP state, the current DB connection, and
-/// debug mode live for the scenario. The asymmetry comes from Behat's behavior (§3 of the spec).
+/// debug mode live for the scenario. The asymmetry comes from Behat's behavior (spec §3).
 pub struct World {
     pub vars: VarStack,
     pub http: HttpState,
@@ -25,7 +25,7 @@ impl World {
         }
     }
 
-    /// At the scenario boundary: the request, connection, and debug flag reset; variables remain.
+    /// At the scenario boundary: request, connection, and debug reset; variables remain.
     pub fn reset_scenario(&mut self) {
         self.http.reset();
         self.db.reset();
@@ -48,7 +48,7 @@ mod tests {
             "main".to_string(),
             ApiResource::new("http://x.local", 5, Vec::new()).expect("valid base_url"),
         );
-        Arc::new(Apis::new(by_name, "main".to_string()).expect("default is declared"))
+        Arc::new(Apis::new(by_name, Some("main".to_string())).expect("default is declared"))
     }
 
     #[test]

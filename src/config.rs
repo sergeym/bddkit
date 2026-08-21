@@ -24,7 +24,7 @@ pub struct Config {
     pub default_db: Option<String>,
 }
 
-/// Resources under test. Not tied to a test set: any scenario can
+/// Resources under test. Not tied to a test suite: any scenario can
 /// reach any of them by name.
 #[derive(Debug, Deserialize)]
 pub struct Resources {
@@ -50,21 +50,19 @@ pub struct Connection {
 }
 
 impl Config {
-    /// Default API name: the explicit `default_api`, or the sole resource.
-    pub fn resolve_default_api(&self) -> Result<String> {
+    /// Default API name. `None` if no APIs are declared at all — this is
+    /// legal, HTTP steps then fail on first use (see `resolve_default_db`).
+    pub fn resolve_default_api(&self) -> Result<Option<String>> {
         resolve_default(
             "default_api",
             "resources.api",
             &self.default_api,
             self.resources.api.keys(),
-        )?
-        .ok_or_else(|| {
-            anyhow::anyhow!("no API resource declared in the config (resources.api)")
-        })
+        )
     }
 
     /// Default connection name. `None` if no DBs are declared at all —
-    /// that's legal, DB steps then fail on the first reference.
+    /// this is legal, DB steps then fail on first use.
     pub fn resolve_default_db(&self) -> Result<Option<String>> {
         resolve_default(
             "default_db",
@@ -76,7 +74,7 @@ impl Config {
 }
 
 /// Shared logic for api and db: an explicit name is checked for existence,
-/// a sole resource becomes the default itself, several without an explicit one is an error.
+/// a single resource becomes the default on its own, several without an explicit one is an error.
 fn resolve_default<'a>(
     field: &str,
     section: &str,
@@ -87,7 +85,7 @@ fn resolve_default<'a>(
         if names.clone().any(|n| n == name) {
             return Ok(Some(name.clone()));
         }
-        bail!("{field} refers to an undeclared resource {name:?} (missing from {section})");
+        bail!("{field} refers to an undeclared resource {name:?} (not in {section})");
     }
     let first = names.next();
     match (first, names.next()) {
@@ -125,12 +123,12 @@ pub fn load(path: &Path) -> Result<Config> {
     let expanded = expand_env(&raw)?;
     let cfg: Config = serde_yaml_ng::from_str(&expanded).with_context(|| {
         format!(
-            "failed to parse config {}. Format changed: suites was replaced by \
+            "failed to parse config {}. Format changed: suites replaced by \
              paths + resources, see docs/writing-tests.md",
             path.display()
         )
     })?;
-    // Resolve defaults right away: an ambiguous config must fail at startup,
+    // Resolve the defaults right away: an ambiguous config must fail at startup,
     // not at the first step that reaches for them.
     cfg.resolve_default_api()?;
     cfg.resolve_default_db()?;
@@ -208,13 +206,13 @@ resources:
         fn a_single_resource_needs_no_explicit_default() {
             let c = parse("paths: [f]\nresources:\n  api:\n    only:\n      base_url: http://a.local\n")
                 .expect("config parses");
-            assert_eq!(c.resolve_default_api().expect("default is inferred"), "only");
+            assert_eq!(c.resolve_default_api().expect("default is inferred"), Some("only".to_string()));
         }
 
         #[test]
         fn an_explicit_default_wins() {
             let c = parse(SAMPLE).expect("config parses");
-            assert_eq!(c.resolve_default_api().expect("default is set"), "review");
+            assert_eq!(c.resolve_default_api().expect("default is set"), Some("review".to_string()));
         }
 
         #[test]
@@ -235,10 +233,11 @@ resources:
         }
 
         #[test]
-        fn an_empty_api_map_is_an_error() {
+        fn no_apis_resolves_to_none() {
+            // Legal: a config may describe only a DB. HTTP steps then
+            // fail on first use — symmetric with resolve_default_db.
             let c = parse("paths: [f]\nresources:\n  api: {}\n").expect("config parses");
-            let err = c.resolve_default_api().expect_err("no resources");
-            assert!(err.to_string().contains("resources.api"), "{err}");
+            assert_eq!(c.resolve_default_api().expect("no APIs are declared"), None);
         }
     }
 
@@ -248,7 +247,7 @@ resources:
         #[test]
         fn no_databases_resolves_to_none() {
             let c = parse(SAMPLE).expect("config parses");
-            assert_eq!(c.resolve_default_db().expect("no DBs declared"), None);
+            assert_eq!(c.resolve_default_db().expect("no DBs are declared"), None);
         }
 
         #[test]
@@ -295,7 +294,7 @@ resources:
             &path,
             "paths: [features]\nresources:\n  api:\n    review:\n      base_url: http://review.local\n",
         )
-        .expect("writing the config");
+        .expect("write config");
         let c = load(&path).expect("config loads");
         assert_eq!(c.paths, vec![PathBuf::from("features")]);
     }
@@ -307,7 +306,7 @@ resources:
             &path,
             "paths: [f]\nresources:\n  api:\n    a:\n      base_url: http://a.local\n    b:\n      base_url: http://b.local\n",
         )
-        .expect("writing the config");
+        .expect("write config");
         let err = load(&path).expect_err("default is ambiguous");
         assert!(err.to_string().contains("default_api"), "{err}");
     }

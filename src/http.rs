@@ -60,7 +60,7 @@ impl std::fmt::Display for Exchange {
     }
 }
 
-/// A single API resource: its own client (hence its own timeout and connection
+/// One API resource: its own client (hence its own timeout and connection
 /// pool), base address, and the headers every scenario starts with.
 pub struct ApiResource {
     client: reqwest::Client,
@@ -86,27 +86,37 @@ impl ApiResource {
     }
 }
 
-/// All API resources for the run. Built once and shared via `Arc`: the client
-/// holds a connection pool, and recreating it per scenario would waste it.
+/// All API resources of the run. Built once and shared via `Arc`: the client
+/// holds a connection pool, and recreating it per scenario would waste the pool.
 pub struct Apis {
     by_name: HashMap<String, ApiResource>,
     default: String,
 }
 
 impl Apis {
-    /// An error if `default` is not among the named resources: the rest of the code
-    /// relies on the default being resolvable and doesn't need to recheck it.
-    pub fn new(by_name: HashMap<String, ApiResource>, default: String) -> Result<Self> {
-        if !by_name.contains_key(&default) {
-            anyhow::bail!("default API resource {default:?} is not declared in resources.api");
-        }
+    /// `default: None` means "no APIs are declared at all" (see `Config::resolve_default_api`) —
+    /// legal for a pure DB config. An explicit `Some(default)` not named among
+    /// the resources is an error: all the rest of the code relies on the default
+    /// being resolvable and does not need to recheck this.
+    pub fn new(by_name: HashMap<String, ApiResource>, default: Option<String>) -> Result<Self> {
+        let default = match default {
+            Some(d) if by_name.contains_key(&d) => d,
+            Some(d) => anyhow::bail!("default API resource {d:?} is not declared in resources.api"),
+            None => String::new(),
+        };
         Ok(Self { by_name, default })
     }
 
     pub fn get(&self, name: &str) -> Result<&ApiResource, String> {
-        self.by_name
-            .get(name)
-            .ok_or_else(|| format!("API resource {name:?} is not declared in resources.api"))
+        self.by_name.get(name).ok_or_else(|| {
+            if self.by_name.is_empty() {
+                "no API resource is declared in the config (resources.api), \
+                 but the scenario refers to an API"
+                    .to_string()
+            } else {
+                format!("API resource {name:?} is not declared in resources.api")
+            }
+        })
     }
 
     pub fn default_name(&self) -> &str {
@@ -147,7 +157,7 @@ impl HttpState {
     }
 
     /// Scenario boundary: the current resource, headers, and accumulated request
-    /// return to their initial state, the last exchange is forgotten.
+    /// return to their initial state, the previous exchange is forgotten.
     pub fn reset(&mut self) {
         let default = self.apis.default_name().to_string();
         let headers = self.apis.default_headers();
@@ -155,10 +165,10 @@ impl HttpState {
         self.last = None;
     }
 
-    /// Switches to a different API. Headers are replaced with the new resource's
+    /// Switch to another API. Headers are replaced with the new resource's
     /// default headers, and the accumulated request is cleared: authorization set
-    /// for one host must not leak to another. `last` is kept — it is a response,
-    /// not a request, and assertions on it must still work after switching.
+    /// for one host must not carry over to another. `last` is preserved — it is
+    /// a response, not a request, and assertions against it must keep working after the switch.
     pub fn use_api(&mut self, name: &str) -> Result<(), String> {
         let headers = self.apis.get(name)?.default_headers.clone();
         self.switch_to(name.to_string(), headers);
@@ -214,8 +224,8 @@ impl HttpState {
     }
 
     pub async fn send(&mut self, path: &str, method: &str) -> Result<(), String> {
-        // Reset the last exchange BEFORE sending: on a network failure (connection
-        // refused, timeout) no successful exchange gets recorded, and a failure dump
+        // Reset the previous exchange BEFORE sending: on a network failure (connection
+        // refused, timeout) a successful exchange is never recorded, and a failure dump
         // would otherwise show the previous step's stale response as the failed one's.
         self.last = None;
         let api = self.apis.get(&self.current)?;
@@ -290,7 +300,7 @@ mod tests {
             name.to_string(),
             ApiResource::new(base, 5, default_headers).expect("valid base_url"),
         );
-        Arc::new(Apis::new(by_name, name.to_string()).expect("default is declared"))
+        Arc::new(Apis::new(by_name, Some(name.to_string())).expect("default is declared"))
     }
 
     fn state() -> HttpState {
@@ -317,7 +327,7 @@ mod tests {
             )
             .expect("valid base_url"),
         );
-        Arc::new(Apis::new(by_name, "first".to_string()).expect("default is declared"))
+        Arc::new(Apis::new(by_name, Some("first".to_string())).expect("default is declared"))
     }
 
     #[test]
@@ -330,7 +340,7 @@ mod tests {
     #[test]
     fn use_api_replaces_headers_with_the_new_resource_defaults() {
         let mut s = HttpState::new(two_apis());
-        s.set_header("authorization", "Bearer first-host");
+        s.set_header("authorization", "Bearer first-host-token");
         s.use_api("second").expect("resource is declared");
         assert_eq!(s.headers, vec![("x-source".to_string(), "second".to_string())]);
     }
@@ -366,7 +376,7 @@ mod tests {
         s.use_api("second").expect("resource is declared");
         assert!(
             s.last().is_some(),
-            "the previous response must survive switching APIs"
+            "the previous response must survive the API switch"
         );
     }
 
@@ -396,7 +406,23 @@ mod tests {
             "a".to_string(),
             ApiResource::new("http://a.local/", 5, Vec::new()).expect("valid base_url"),
         );
-        assert!(Apis::new(by_name, "b".to_string()).is_err());
+        assert!(Apis::new(by_name, Some("b".to_string())).is_err());
+    }
+
+    #[test]
+    fn apis_with_no_resources_and_no_default_construct_fine() {
+        // Legal: a pure DB config without a single API resource (see resolve_default_api).
+        assert!(Apis::new(HashMap::new(), None).is_ok());
+    }
+
+    #[test]
+    fn getting_a_resource_when_none_are_declared_names_the_missing_section() {
+        let apis = Apis::new(HashMap::new(), None).expect("empty set is not an error");
+        let err = match apis.get("stub") {
+            Ok(_) => panic!("there are no resources at all"),
+            Err(e) => e,
+        };
+        assert!(err.contains("resources.api"), "{err}");
     }
 
     #[test]
@@ -431,7 +457,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_send_leaves_no_stale_exchange() {
-        // Port 1 is unreachable: send fails at the transport layer. `last` must remain
+        // Port 1 is unreachable: send fails at the transport layer. `last` must stay
         // None, or a failure dump would show a stale exchange.
         let mut s = state();
         assert!(s.send("/x", "GET").await.is_err());

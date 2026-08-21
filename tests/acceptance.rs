@@ -65,6 +65,74 @@ async fn unknown_step_fails_before_running() {
     assert!(stderr.contains("I refund the order"), "{stderr}");
 }
 
+/// `resources.api` may be absent entirely — legal for a scenario that
+/// makes no HTTP requests (symmetric with `resources.db`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_config_without_any_api_resource_runs_a_non_http_scenario() {
+    let dir = std::env::temp_dir().join("bddkit-no-api-ok-test");
+    std::fs::create_dir_all(dir.join("features")).expect("mkdir");
+    std::fs::write(
+        dir.join("features/vars.feature"),
+        "Feature: f\n  Scenario: s\n    \
+         Given set variable \"x\" to \"1\"\n    Then variable \"x\" should be equal to \"1\"\n",
+    )
+    .expect("write feature");
+    std::fs::write(
+        dir.join("cfg.yaml"),
+        format!(
+            "paths: [{}]\nresources:\n  api: {{}}\n",
+            dir.join("features").display().to_string().replace('\\', "/")
+        ),
+    )
+    .expect("write config");
+
+    let exe = env!("CARGO_BIN_EXE_bddkit");
+    let out = Command::new(exe)
+        .args(["--config", dir.join("cfg.yaml").to_str().expect("path is UTF-8")])
+        .output()
+        .expect("failed to launch bddkit");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "a config without a single API resource must run if the scenario never touches HTTP\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+    );
+}
+
+/// If no APIs are declared but the scenario sends a request anyway — the
+/// failure happens as an ordinary step failure on first use, not a panic
+/// and not a startup rejection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_config_without_any_api_resource_fails_at_first_http_step() {
+    let dir = std::env::temp_dir().join("bddkit-no-api-fail-test");
+    std::fs::create_dir_all(dir.join("features")).expect("mkdir");
+    std::fs::write(
+        dir.join("features/http.feature"),
+        "Feature: f\n  Scenario: s\n    \
+         When I request \"/ping\"\n    Then the response code is 200\n",
+    )
+    .expect("write feature");
+    std::fs::write(
+        dir.join("cfg.yaml"),
+        format!(
+            "paths: [{}]\nresources:\n  api: {{}}\n",
+            dir.join("features").display().to_string().replace('\\', "/")
+        ),
+    )
+    .expect("write config");
+
+    let exe = env!("CARGO_BIN_EXE_bddkit");
+    let out = Command::new(exe)
+        .args(["--config", dir.join("cfg.yaml").to_str().expect("path is UTF-8")])
+        .output()
+        .expect("failed to launch bddkit");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!out.status.success(), "the scenario must fail\n{stdout}");
+    assert!(stdout.contains("resources.api"), "{stdout}");
+}
+
 /// Shared helper: writes two tagged feature files and a stub config to a
 /// temp directory, returns the config path.
 fn write_tagged_project(base: &str, name: &str) -> std::path::PathBuf {

@@ -1,0 +1,9 @@
+- step: 'I create a post with title "{title}"'
+  exports: [lastPostId]
+  do:
+    - the "Content-Type" request header is "application/json"
+    - the request body is: |
+        {"title": "<<title>>", "body": "demo", "userId": 1}
+    - I request "/posts" using HTTP POST
+    - the response code is 201
+    - extract "id" from JSON as "lastPostId"

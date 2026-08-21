@@ -67,7 +67,7 @@ fn execute_step<'a>(
                     return Err("a macro call does not support a docstring".into());
                 }
                 if step.table.is_some() {
-                    return Err("macro call does not support a table".into());
+                    return Err("macro calls do not support a table".into());
                 }
                 if depth >= 16 {
                     return Err("macro nesting exceeds 16".into());
@@ -101,7 +101,7 @@ fn execute_step<'a>(
 }
 
 /// Runs one feature file. The variable frame is shared for the file; HTTP state
-/// is recreated for each scenario; Background reruns before each one.
+/// is recreated for every scenario; Background reruns before each one.
 pub async fn run_file(
     lf: &LoadedFeature,
     reg: &Registry,
@@ -131,7 +131,7 @@ pub async fn run_file(
         .unwrap_or_default();
 
     // The generator handle is cloned once: inside the loop, `&world.generator` conflicts
-    // with the later `&mut world` used to call dispatch.
+    // with the later `&mut world` at the dispatch call.
     let generator = world.generator.clone();
 
     for sc in &lf.feature.scenarios {
@@ -192,7 +192,7 @@ mod tests {
             "default".to_string(),
             crate::http::ApiResource::new("http://example.test", 1, Vec::new()).unwrap(),
         );
-        let apis = Arc::new(crate::http::Apis::new(by_name, "default".to_string()).unwrap());
+        let apis = Arc::new(crate::http::Apis::new(by_name, Some("default".to_string())).unwrap());
         run_file(
             &loaded,
             registry,
