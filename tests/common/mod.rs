@@ -1,4 +1,4 @@
-//! Reference HTTP service for the acceptance tests. Started in-process
+//! Reference HTTP service for acceptance tests. Spun up in-process
 //! on a random port: docker-compose arrives in M2 together with Postgres.
 
 #![allow(dead_code)]
@@ -19,7 +19,10 @@ pub async fn spawn() -> String {
         .route("/echo", post(echo))
         .route("/users", get(users))
         .route("/login", post(login))
-        .route("/headers", get(headers));
+        .route("/headers", get(headers))
+        .route("/xml", get(xml_doc))
+        .route("/html", get(html_doc))
+        .route("/plain", get(plain_text));
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -32,7 +35,7 @@ pub async fn spawn() -> String {
 }
 
 /// A second reference service. Answers the same `/ping`, but with a different body:
-/// the API-switch test must see that the request landed here.
+/// the API-switch test must see that the request landed here specifically.
 pub async fn spawn_secondary() -> String {
     let app = Router::new().route(
         "/ping",
@@ -102,4 +105,30 @@ async fn headers(h: HeaderMap) -> Json<Value> {
         .map(|v| v.to_str().unwrap_or("").to_string())
         .collect();
     Json(json!({"accept": accept}))
+}
+
+async fn xml_doc() -> impl IntoResponse {
+    let mut h = HeaderMap::new();
+    h.insert("content-type", "application/xml".parse().expect("header"));
+    (
+        StatusCode::OK,
+        h,
+        r#"<?xml version="1.0"?><users><user id="1"><email>a@b.net</email></user><user id="2"><email>c@d.net</email></user></users>"#,
+    )
+}
+
+async fn html_doc() -> impl IntoResponse {
+    let mut h = HeaderMap::new();
+    h.insert("content-type", "text/html".parse().expect("header"));
+    (
+        StatusCode::OK,
+        h,
+        r#"<html><body><h1 id="title">Hello</h1><p class="msg">World</p></body></html>"#,
+    )
+}
+
+async fn plain_text() -> impl IntoResponse {
+    let mut h = HeaderMap::new();
+    h.insert("content-type", "text/plain".parse().expect("header"));
+    (StatusCode::OK, h, "hello")
 }

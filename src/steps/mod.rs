@@ -1,6 +1,7 @@
 pub mod api;
 pub mod assert;
 pub mod db;
+pub mod debug;
 pub mod vars;
 
 use crate::macros::{MacroCatalog, MacroDef};
@@ -58,6 +59,9 @@ pub enum StepId {
     Sleep,
     ShowAllVariables,
     ShowVariable,
+    PrintResponseHeaders,
+    PrintResponseBody,
+    PrintResponseBodyAsPath,
 }
 
 pub struct StepDef {
@@ -238,6 +242,18 @@ pub const BUILTIN_STEPS: &[StepDef] = &[
         id: StepId::ShowVariable,
         pattern: r#"^Show "([^"]*)" variable$"#,
     },
+    StepDef {
+        id: StepId::PrintResponseHeaders,
+        pattern: r#"^Print response headers$"#,
+    },
+    StepDef {
+        id: StepId::PrintResponseBody,
+        pattern: r#"^Print response body$"#,
+    },
+    StepDef {
+        id: StepId::PrintResponseBodyAsPath,
+        pattern: r#"^Print response body as "([^"]*)"$"#,
+    },
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -351,7 +367,7 @@ impl Registry {
                     Some((StepTarget::Builtin(_), _)) => {}
                     Some((StepTarget::Macro(_), _)) if step.docstring.is_some() => {
                         return Err(format!(
-                            "calling macro {:?} with a doc string in macro {:?} from {}:{} is not supported",
+                            "calling macro {:?} with a docstring inside macro {:?} from {}:{} is not supported",
                             step.text,
                             definition.step,
                             definition.source.display(),
@@ -501,7 +517,7 @@ fn builtin_patterns(pattern: &str) -> Vec<Vec<PatternToken>> {
                     tokens.push(PatternToken::Star(CharClass::Digit));
                     rest = tail;
                 } else {
-                    let char_ = rest.chars().next().expect("string is non-empty");
+                    let char_ = rest.chars().next().expect("string is not empty");
                     tokens.push(PatternToken::One(CharClass::Exact(char_)));
                     rest = &rest[char_.len_utf8()..];
                 }
@@ -627,6 +643,9 @@ pub async fn dispatch(w: &mut World, id: StepId, a: &Args) -> Result<(), String>
         StepId::Sleep => sleep(a.cap(0)).await,
         StepId::ShowAllVariables => show_all_variables(w),
         StepId::ShowVariable => show_variable(w, a.cap(0)),
+        StepId::PrintResponseHeaders => debug::print_headers(w),
+        StepId::PrintResponseBody => debug::print_body(w),
+        StepId::PrintResponseBodyAsPath => debug::print_body_as(w, a.cap(0)),
     }
 }
 
@@ -711,6 +730,9 @@ mod tests {
             r#"I sleep "5" seconds"#,
             "Show all variables",
             r#"Show "userId" variable"#,
+            "Print response headers",
+            "Print response body",
+            r#"Print response body as "status""#,
         ];
         let r = reg();
         for s in samples {
@@ -728,7 +750,7 @@ mod tests {
             .find(r#"I use "billing" api"#)
             .expect("pattern is not ambiguous")
             .expect("step is declared");
-        assert!(target == StepId::UseApi, "the step must resolve to UseApi");
+        assert!(target == StepId::UseApi, "step must resolve to UseApi");
         assert_eq!(caps, vec!["billing".to_string()]);
     }
 

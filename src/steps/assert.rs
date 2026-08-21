@@ -1,7 +1,7 @@
 use crate::json::{matcher, path};
 use crate::world::World;
 
-fn last(w: &World) -> Result<&crate::http::Exchange, String> {
+pub(crate) fn last(w: &World) -> Result<&crate::http::Exchange, String> {
     w.http
         .last()
         .ok_or_else(|| "no request has been sent yet".to_string())
