@@ -342,7 +342,10 @@ mod tests {
         let mut s = HttpState::new(two_apis());
         s.set_header("authorization", "Bearer first-host-token");
         s.use_api("second").expect("resource is declared");
-        assert_eq!(s.headers, vec![("x-source".to_string(), "second".to_string())]);
+        assert_eq!(
+            s.headers,
+            vec![("x-source".to_string(), "second".to_string())]
+        );
     }
 
     #[test]
@@ -435,7 +438,10 @@ mod tests {
     fn new_state_seeds_headers_from_the_resource_defaults() {
         let defaults = vec![("accept".to_string(), "application/json".to_string())];
         let s = HttpState::new(apis_with("main", "http://localhost:1/", defaults));
-        assert_eq!(s.headers, vec![("accept".to_string(), "application/json".to_string())]);
+        assert_eq!(
+            s.headers,
+            vec![("accept".to_string(), "application/json".to_string())]
+        );
     }
 
     #[test]
@@ -461,7 +467,10 @@ mod tests {
         // None, or a failure dump would show a stale exchange.
         let mut s = state();
         assert!(s.send("/x", "GET").await.is_err());
-        assert!(s.last().is_none(), "a failed send must not leave an exchange behind");
+        assert!(
+            s.last().is_none(),
+            "a failed send must not leave an exchange behind"
+        );
     }
 
     #[test]

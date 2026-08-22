@@ -12,6 +12,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::Barrier;
 
 pub async fn spawn() -> String {
     let app = Router::new()
@@ -40,6 +42,33 @@ pub async fn spawn_secondary() -> String {
     let app = Router::new().route(
         "/ping",
         get(|| async { Json(json!({"status": "ok", "source": "secondary"})) }),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+    format!("http://{addr}/")
+}
+
+/// A stub with a barrier: `/barrier` does not respond until `n` requests are
+/// in flight at once. A sequential runner hangs on it until timeout,
+/// a parallel one gets through — this proves parallelism without comparing run
+/// times, i.e. without a flaky test.
+pub async fn spawn_barrier(n: usize) -> String {
+    let barrier = Arc::new(Barrier::new(n));
+    let app = Router::new().route(
+        "/barrier",
+        get(move || {
+            let barrier = barrier.clone();
+            async move {
+                barrier.wait().await;
+                Json(json!({"status": "ok"}))
+            }
+        }),
     );
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")

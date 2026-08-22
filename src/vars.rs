@@ -101,8 +101,8 @@ impl Default for VarStack {
     }
 }
 
-/// SQL NULL sentinel. NUL bytes never occur in `.feature` text, so
-/// the value can't be confused with real data. `<<null>>` expands to it,
+/// SQL NULL sentinel. NUL bytes never occur in `.feature` text, so the
+/// value can never be confused with real data. `<<null>>` expands into it,
 /// and the DB layer reads it back as NULL — a single point of substitution is kept.
 pub const NULL_SENTINEL: &str = "\u{0}__bddkit_null__\u{0}";
 
@@ -339,6 +339,9 @@ mod tests {
     #[test]
     fn null_expands_to_sentinel() {
         let s = VarStack::new();
-        assert_eq!(interpolate("<<null>>", &s, &generator()).unwrap(), NULL_SENTINEL);
+        assert_eq!(
+            interpolate("<<null>>", &s, &generator()).unwrap(),
+            NULL_SENTINEL
+        );
     }
 }

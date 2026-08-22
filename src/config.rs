@@ -105,8 +105,8 @@ fn load_env_file(path: &Path, map: &mut BTreeMap<String, String>) -> Result<()> 
     match dotenvy::from_path_iter(path) {
         Ok(iter) => {
             for item in iter {
-                let (k, v) = item
-                    .with_context(|| format!("failed to parse {}", path.display()))?;
+                let (k, v) =
+                    item.with_context(|| format!("failed to parse {}", path.display()))?;
                 map.insert(k, v);
             }
             Ok(())
@@ -160,7 +160,9 @@ fn expand_env(src: &str, env_map: &BTreeMap<String, String>) -> Result<String> {
     .expect("constant regex");
 
     let lookup = |name: &str| -> Option<String> {
-        std::env::var(name).ok().or_else(|| env_map.get(name).cloned())
+        std::env::var(name)
+            .ok()
+            .or_else(|| env_map.get(name).cloned())
     };
 
     let mut out = String::with_capacity(src.len());
@@ -210,7 +212,9 @@ fn expand_env(src: &str, env_map: &BTreeMap<String, String>) -> Result<String> {
                 Some(_) => arg.to_string(),
                 None => String::new(),
             },
-            Some(other) => unreachable!("the regex only captures known operators, got {other:?}"),
+            Some(other) => {
+                unreachable!("the regex only captures known operators, got {other:?}")
+            }
         };
         out.push_str(&resolved);
     }
@@ -316,8 +320,10 @@ resources:
 
     #[test]
     fn missing_environment_variable_is_an_error() {
-        let err = parse("paths: [f]\nresources:\n  api:\n    a:\n      base_url: ${BDDKIT_ABSENT_VAR}\n")
-            .expect_err("variable is missing");
+        let err = parse(
+            "paths: [f]\nresources:\n  api:\n    a:\n      base_url: ${BDDKIT_ABSENT_VAR}\n",
+        )
+        .expect_err("variable is missing");
         assert!(err.to_string().contains("BDDKIT_ABSENT_VAR"), "{err}");
     }
 
@@ -334,7 +340,10 @@ resources:
 
         #[test]
         fn dollar_dollar_is_a_literal_dollar_sign() {
-            assert_eq!(expand("$${NOT_A_VAR}", &[]).expect("parses"), "${NOT_A_VAR}");
+            assert_eq!(
+                expand("$${NOT_A_VAR}", &[]).expect("parses"),
+                "${NOT_A_VAR}"
+            );
         }
 
         #[test]
@@ -351,27 +360,42 @@ resources:
 
         #[test]
         fn colon_dash_uses_default_when_unset() {
-            assert_eq!(expand("${FOO:-fallback}", &[]).expect("parses"), "fallback");
+            assert_eq!(
+                expand("${FOO:-fallback}", &[]).expect("parses"),
+                "fallback"
+            );
         }
 
         #[test]
         fn colon_dash_uses_default_when_set_but_empty() {
-            assert_eq!(expand("${FOO:-fallback}", &[("FOO", "")]).expect("parses"), "fallback");
+            assert_eq!(
+                expand("${FOO:-fallback}", &[("FOO", "")]).expect("parses"),
+                "fallback"
+            );
         }
 
         #[test]
         fn colon_dash_uses_value_when_set_and_nonempty() {
-            assert_eq!(expand("${FOO:-fallback}", &[("FOO", "real")]).expect("parses"), "real");
+            assert_eq!(
+                expand("${FOO:-fallback}", &[("FOO", "real")]).expect("parses"),
+                "real"
+            );
         }
 
         #[test]
         fn dash_uses_default_only_when_unset() {
-            assert_eq!(expand("${FOO-fallback}", &[]).expect("parses"), "fallback");
+            assert_eq!(
+                expand("${FOO-fallback}", &[]).expect("parses"),
+                "fallback"
+            );
         }
 
         #[test]
         fn dash_passes_through_empty_value_unchanged() {
-            assert_eq!(expand("${FOO-fallback}", &[("FOO", "")]).expect("parses"), "");
+            assert_eq!(
+                expand("${FOO-fallback}", &[("FOO", "")]).expect("parses"),
+                ""
+            );
         }
 
         #[test]
@@ -397,7 +421,10 @@ resources:
 
         #[test]
         fn colon_question_passes_through_value_when_set_and_nonempty() {
-            assert_eq!(expand("${FOO:?msg}", &[("FOO", "real")]).expect("parses"), "real");
+            assert_eq!(
+                expand("${FOO:?msg}", &[("FOO", "real")]).expect("parses"),
+                "real"
+            );
         }
 
         #[test]
@@ -408,12 +435,18 @@ resources:
 
         #[test]
         fn question_passes_through_empty_value_without_error() {
-            assert_eq!(expand("${FOO?custom message}", &[("FOO", "")]).expect("FOO is set to empty"), "");
+            assert_eq!(
+                expand("${FOO?custom message}", &[("FOO", "")]).expect("FOO is set to empty"),
+                ""
+            );
         }
 
         #[test]
         fn colon_plus_uses_alt_when_set_and_nonempty() {
-            assert_eq!(expand("${FOO:+alt}", &[("FOO", "real")]).expect("parses"), "alt");
+            assert_eq!(
+                expand("${FOO:+alt}", &[("FOO", "real")]).expect("parses"),
+                "alt"
+            );
         }
 
         #[test]
@@ -428,7 +461,10 @@ resources:
 
         #[test]
         fn plus_uses_alt_when_set_even_if_empty() {
-            assert_eq!(expand("${FOO+alt}", &[("FOO", "")]).expect("parses"), "alt");
+            assert_eq!(
+                expand("${FOO+alt}", &[("FOO", "")]).expect("parses"),
+                "alt"
+            );
         }
 
         #[test]
@@ -452,15 +488,23 @@ resources:
 
         #[test]
         fn a_single_resource_needs_no_explicit_default() {
-            let c = parse("paths: [f]\nresources:\n  api:\n    only:\n      base_url: http://a.local\n")
-                .expect("config parses");
-            assert_eq!(c.resolve_default_api().expect("default is inferred"), Some("only".to_string()));
+            let c = parse(
+                "paths: [f]\nresources:\n  api:\n    only:\n      base_url: http://a.local\n",
+            )
+            .expect("config parses");
+            assert_eq!(
+                c.resolve_default_api().expect("default is inferred"),
+                Some("only".to_string())
+            );
         }
 
         #[test]
         fn an_explicit_default_wins() {
             let c = parse(SAMPLE).expect("config parses");
-            assert_eq!(c.resolve_default_api().expect("default is set"), Some("review".to_string()));
+            assert_eq!(
+                c.resolve_default_api().expect("default is set"),
+                Some("review".to_string())
+            );
         }
 
         #[test]
@@ -590,15 +634,26 @@ resources:
         #[test]
         fn load_env_layers_applies_full_precedence_order() {
             let dir = unique_dir("full_precedence");
-            std::fs::write(dir.join(".env"), "A=base\nB=base\nC=base\nD=base\n").expect("write .env");
-            std::fs::write(dir.join(".env.local"), "B=local\nC=local\nD=local\n").expect("write .env.local");
+            std::fs::write(dir.join(".env"), "A=base\nB=base\nC=base\nD=base\n")
+                .expect("write .env");
+            std::fs::write(dir.join(".env.local"), "B=local\nC=local\nD=local\n")
+                .expect("write .env.local");
             std::fs::write(dir.join(".env.dev"), "C=dev\nD=dev\n").expect("write .env.dev");
-            std::fs::write(dir.join(".env.dev.local"), "D=dev_local\n").expect("write .env.dev.local");
+            std::fs::write(dir.join(".env.dev.local"), "D=dev_local\n")
+                .expect("write .env.dev.local");
 
             let map = load_env_layers(&dir, "dev").expect("layers are read");
             assert_eq!(map.get("A"), Some(&"base".to_string()), "only in .env");
-            assert_eq!(map.get("B"), Some(&"local".to_string()), ".env.local overrides .env");
-            assert_eq!(map.get("C"), Some(&"dev".to_string()), ".env.dev overrides .env.local");
+            assert_eq!(
+                map.get("B"),
+                Some(&"local".to_string()),
+                ".env.local overrides .env"
+            );
+            assert_eq!(
+                map.get("C"),
+                Some(&"dev".to_string()),
+                ".env.dev overrides .env.local"
+            );
             assert_eq!(
                 map.get("D"),
                 Some(&"dev_local".to_string()),
@@ -610,7 +665,8 @@ resources:
         fn load_env_layers_ignores_missing_optional_files() {
             let dir = unique_dir("only_base");
             std::fs::write(dir.join(".env"), "A=base\n").expect("write .env");
-            let map = load_env_layers(&dir, "prod").expect("missing .env.local/.env.prod* is not an error");
+            let map = load_env_layers(&dir, "prod")
+                .expect("missing .env.local/.env.prod* is not an error");
             assert_eq!(map.get("A"), Some(&"base".to_string()));
             assert_eq!(map.len(), 1);
         }
@@ -714,7 +770,8 @@ resources:
         fn cli_env_flag_selects_the_matching_env_specific_file() {
             let dir = unique_dir("cli_env_flag");
             std::fs::write(dir.join(".env"), "DB_PASS=base_secret\n").expect("write .env");
-            std::fs::write(dir.join(".env.prod"), "DB_PASS=prod_secret\n").expect("write .env.prod");
+            std::fs::write(dir.join(".env.prod"), "DB_PASS=prod_secret\n")
+                .expect("write .env.prod");
             let path = write_config(
                 &dir,
                 "paths: [f]\nresources:\n  api:\n    a:\n      base_url: http://a.local\n  \
@@ -744,7 +801,8 @@ resources:
         fn local_file_overrides_base_env_for_same_key() {
             let dir = unique_dir("local_override");
             std::fs::write(dir.join(".env"), "DB_PASS=base_secret\n").expect("write .env");
-            std::fs::write(dir.join(".env.local"), "DB_PASS=local_secret\n").expect("write .env.local");
+            std::fs::write(dir.join(".env.local"), "DB_PASS=local_secret\n")
+                .expect("write .env.local");
             let path = write_config(
                 &dir,
                 "paths: [f]\nresources:\n  api:\n    a:\n      base_url: http://a.local\n  \

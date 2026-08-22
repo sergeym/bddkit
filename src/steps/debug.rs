@@ -31,7 +31,11 @@ pub(crate) fn content_type(headers: &[(String, String)]) -> Option<&str> {
 }
 
 fn headers_table(headers: &[(String, String)]) -> String {
-    let width = headers.iter().map(|(k, _)| k.chars().count()).max().unwrap_or(0);
+    let width = headers
+        .iter()
+        .map(|(k, _)| k.chars().count())
+        .max()
+        .unwrap_or(0);
     headers
         .iter()
         .map(|(k, v)| format!("{k:width$} : {v}"))
@@ -41,7 +45,10 @@ fn headers_table(headers: &[(String, String)]) -> String {
 
 pub fn print_headers(w: &World) -> Result<(), String> {
     let ex = super::assert::last(w)?;
-    eprintln!("=== Response headers ===\n{}", headers_table(&ex.resp_headers));
+    eprintln!(
+        "=== Response headers ===\n{}",
+        headers_table(&ex.resp_headers)
+    );
     Ok(())
 }
 
@@ -107,7 +114,10 @@ fn highlight_inner(code: &str, extension: &str, colorize: bool) -> String {
     let mut out = String::new();
     for line in syntect::util::LinesWithEndings::from(code) {
         match h.highlight_line(line, &SYNTAX_SET) {
-            Ok(ranges) => out.push_str(&syntect::util::as_24_bit_terminal_escaped(&ranges[..], false)),
+            Ok(ranges) => out.push_str(&syntect::util::as_24_bit_terminal_escaped(
+                &ranges[..],
+                false,
+            )),
             Err(_) => out.push_str(line),
         }
     }
@@ -173,7 +183,9 @@ pub fn print_body_as(w: &World, path: &str) -> Result<(), String> {
             eprintln!("{}", xpath_select(&ex.body, path)?);
         }
         BodyKind::Plain => {
-            return Err("path selection is not supported: content-type is not JSON/XML/HTML".to_string());
+            return Err(
+                "path selection is not supported: content-type is not JSON/XML/HTML".to_string(),
+            );
         }
     }
     Ok(())
@@ -185,7 +197,10 @@ mod tests {
 
     #[test]
     fn classifies_json() {
-        assert_eq!(classify(Some("application/json; charset=utf-8")), BodyKind::Json);
+        assert_eq!(
+            classify(Some("application/json; charset=utf-8")),
+            BodyKind::Json
+        );
     }
 
     #[test]
@@ -232,10 +247,7 @@ mod tests {
             ("content-type".to_string(), "application/json".to_string()),
         ];
         let table = headers_table(&headers);
-        assert_eq!(
-            table,
-            "x-trace      : abc\ncontent-type : application/json"
-        );
+        assert_eq!(table, "x-trace      : abc\ncontent-type : application/json");
     }
 
     #[test]
@@ -252,17 +264,20 @@ mod tests {
     #[test]
     fn beautify_markup_handles_self_closing_and_attributes() {
         let out = beautify_markup(r#"<root><br/><img src="x.png"/></root>"#);
-        assert_eq!(
-            out,
-            "<root>\n  <br/>\n  <img src=\"x.png\"/>\n</root>\n"
-        );
+        assert_eq!(out, "<root>\n  <br/>\n  <img src=\"x.png\"/>\n</root>\n");
     }
 
     #[test]
     fn highlight_wraps_code_in_ansi_escapes_when_colorize_is_on() {
         let out = highlight_inner("{\"a\": 1}", "json", true);
-        assert!(out.contains('\u{1b}'), "highlighted output should contain an ANSI escape: {out:?}");
-        assert!(out.len() > "{\"a\": 1}".len(), "highlighting should add escape bytes");
+        assert!(
+            out.contains('\u{1b}'),
+            "highlighted output should contain an ANSI escape: {out:?}"
+        );
+        assert!(
+            out.len() > "{\"a\": 1}".len(),
+            "highlighting should add escape bytes"
+        );
     }
 
     #[test]

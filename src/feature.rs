@@ -17,12 +17,13 @@ pub struct ExpandedScenario {
     pub steps: Vec<ExpandedStep>,
 }
 
+#[derive(Debug)]
 pub struct LoadedFeature {
     pub path: PathBuf,
     pub feature: Feature,
 }
 
-/// Selecting scenarios by tags. An empty filter passes everything.
+/// Selects scenarios by tag. An empty filter lets everything through.
 pub struct TagFilter {
     wanted: Vec<String>,
 }
@@ -36,21 +37,103 @@ impl TagFilter {
 
     /// A scenario is selected if it carries at least one of the requested tags.
     pub fn matches(&self, tags: &[String]) -> bool {
-        self.wanted.is_empty() || tags.iter().any(|t| self.wanted.iter().any(|w| w == strip_at(t)))
+        self.wanted.is_empty()
+            || tags
+                .iter()
+                .any(|t| self.wanted.iter().any(|w| w == strip_at(t)))
     }
 }
 
 /// A leading `@` is optional on both sides: `--tag smoke` and `--tag @smoke`
-/// both select `@smoke` in the feature file the same way.
+/// both select `@smoke` in the feature file.
 fn strip_at(tag: &str) -> &str {
     tag.strip_prefix('@').unwrap_or(tag)
 }
 
+/// All tags of a file: above `Feature:` and above each scenario. `load` mixes
+/// the feature's tags into the scenarios, but a feature with no scenarios must
+/// also be readable, so both sources are listed explicitly.
+fn all_tags(lf: &LoadedFeature) -> impl Iterator<Item = &String> {
+    lf.feature
+        .tags
+        .iter()
+        .chain(lf.feature.scenarios.iter().flat_map(|sc| &sc.tags))
+}
+
+static SERIAL_TAG: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"^serial\((.*)\)$").expect("constant regex")
+});
+
+/// Chain name from the `@serial(name)` tag. Files in the same chain run strictly one
+/// after another; the chain sets ORDER, not shared state — variables live per
+/// file (invariant 2) and never flow between the chain's files.
+///
+/// A file cannot belong to two chains: it runs exactly once.
+pub fn serial_of(lf: &LoadedFeature) -> Result<Option<String>, String> {
+    let mut found: Option<String> = None;
+    for tag in all_tags(lf) {
+        let Some(c) = SERIAL_TAG.captures(strip_at(tag)) else {
+            continue;
+        };
+        let name = c.get(1).expect("group 1 is required").as_str().trim();
+        if name.is_empty() {
+            return Err(format!(
+                "{}: @serial() tag has no chain name",
+                lf.path.display()
+            ));
+        }
+        match &found {
+            Some(first) if first != name => {
+                return Err(format!(
+                    "{}: file is tagged with two chains — @serial({first}) and @serial({name}); \
+                     a file can belong to only one",
+                    lf.path.display()
+                ));
+            }
+            Some(_) => {}
+            None => found = Some(name.to_string()),
+        }
+    }
+    Ok(found)
+}
+
+static PRIORITY_TAG: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"^priority\((.*)\)$").expect("constant regex")
+});
+
+/// A file's priority from the `@priority(N)` tag: higher goes earlier in the queue,
+/// no tag means 0, negatives are allowed. A file takes the MAXIMUM across all its
+/// tags — the file is the scheduling unit, and one urgent scenario lifts the whole thing.
+///
+/// A non-numeric argument is a startup error, not a silent zero: a mistyped tag
+/// that silently does nothing is more expensive to debug than a failed start.
+pub fn priority_of(lf: &LoadedFeature) -> Result<i64, String> {
+    let mut best: Option<i64> = None;
+    for tag in all_tags(lf) {
+        let Some(c) = PRIORITY_TAG.captures(strip_at(tag)) else {
+            continue;
+        };
+        let raw = c.get(1).expect("group 1 is required").as_str();
+        let value = raw.trim().parse::<i64>().map_err(|_| {
+            format!(
+                "{}: tag @priority({raw}) — the argument must be an integer \
+                 (higher goes earlier in the queue, default 0)",
+                lf.path.display()
+            )
+        })?;
+        best = Some(best.map_or(value, |b: i64| b.max(value)));
+    }
+    Ok(best.unwrap_or(0))
+}
+
 impl LoadedFeature {
-    /// Whether the file has at least one scenario that passes the filter. Expanding
+    /// Whether the file has at least one scenario passing the filter. Expanding
     /// a Scenario Outline does not change tags, so this can be checked before that.
     pub fn has_selected_scenario(&self, filter: &TagFilter) -> bool {
-        self.feature.scenarios.iter().any(|sc| filter.matches(&sc.tags))
+        self.feature
+            .scenarios
+            .iter()
+            .any(|sc| filter.matches(&sc.tags))
     }
 }
 
@@ -71,16 +154,16 @@ static PLACEHOLDER: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new
 /// `replace("<key>", v)` would eat the inner `<key>` inside the runtime token `<<key>>`
 /// (in `<<userId>>` the substring `<userId>` starts at position 1) — and `<<…>>` must
 /// survive untouched until execution. Double brackets match the first alternative
-/// and are returned as-is; single ones are replaced with the column value.
+/// and are returned as-is; single brackets are replaced by the column value.
 fn substitute(text: &str, keys: &[String], row: &[String]) -> String {
     PLACEHOLDER
         .replace_all(text, |caps: &regex::Captures| {
             if let Some(m) = caps.get(1) {
-                return format!("<<{}>>", m.as_str()); // runtime token, leave it alone
+                return format!("<<{}>>", m.as_str()); // runtime token, leave untouched
             }
             let key = caps
                 .get(2)
-                .expect("second group is present when the first is absent")
+                .expect("second group when the first is absent")
                 .as_str();
             match keys.iter().position(|k| k == key) {
                 Some(i) => row[i].clone(),
@@ -94,8 +177,8 @@ fn substitute(text: &str, keys: &[String], row: &[String]) -> String {
         .into_owned()
 }
 
-/// Expands a `Scenario Outline` into separate scenarios. A scenario without `Examples`
-/// is returned as-is.
+/// Expands a `Scenario Outline` into individual scenarios. A scenario without
+/// `Examples` is returned as-is.
 pub fn expand_outlines(sc: &gherkin::Scenario) -> Vec<ExpandedScenario> {
     let base: Vec<ExpandedStep> = sc.steps.iter().map(to_step).collect();
     if sc.examples.is_empty() {
@@ -138,9 +221,9 @@ pub fn expand_outlines(sc: &gherkin::Scenario) -> Vec<ExpandedScenario> {
 pub fn load(path: &Path) -> Result<LoadedFeature> {
     let mut feature = Feature::parse_path(path, GherkinEnv::default())
         .with_context(|| format!("failed to parse {}", path.display()))?;
-    // Tags above `Feature:` apply to all of its scenarios. gherkin keeps them
-    // separate, but a tester writing @billing above the feature expects the filter
-    // to select the whole file.
+    // Tags above `Feature:` apply to all of its scenarios. gherkin stores them
+    // separately, but a tester who writes @billing above the feature expects the
+    // filter to select the whole file.
     let feature_tags = feature.tags.clone();
     for sc in &mut feature.scenarios {
         sc.tags.extend(feature_tags.iter().cloned());
@@ -381,6 +464,133 @@ Feature: f
         }
     }
 
+    mod serial_tag {
+        use super::super::*;
+
+        fn loaded(src: &str) -> LoadedFeature {
+            LoadedFeature {
+                path: PathBuf::from("t.feature"),
+                feature: parse_str(src).expect("gherkin parses"),
+            }
+        }
+
+        #[test]
+        fn a_file_without_the_tag_belongs_to_no_chain() {
+            let lf = loaded("Feature: f\n  Scenario: s\n    Then the response code is 200\n");
+            assert_eq!(serial_of(&lf).expect("no tag is not an error"), None);
+        }
+
+        #[test]
+        fn a_feature_level_tag_names_the_chain() {
+            let lf = loaded(
+                "@serial(companies)\nFeature: f\n  Scenario: s\n    Then the response code is 200\n",
+            );
+            assert_eq!(
+                serial_of(&lf).expect("tag is valid"),
+                Some("companies".to_string())
+            );
+        }
+
+        #[test]
+        fn a_scenario_level_tag_names_the_chain_for_the_whole_file() {
+            // The scheduling unit is the file: one tagged scenario pulls the
+            // whole file along, there is nothing to split.
+            let lf = loaded(
+                "Feature: f\n  @serial(companies)\n  Scenario: s\n    Then the response code is 200\n",
+            );
+            assert_eq!(
+                serial_of(&lf).expect("tag is valid"),
+                Some("companies".to_string())
+            );
+        }
+
+        #[test]
+        fn the_same_chain_named_twice_is_not_a_conflict() {
+            let lf = loaded(
+                "@serial(x)\nFeature: f\n  @serial(x)\n  Scenario: s\n    Then the response code is 200\n",
+            );
+            assert_eq!(
+                serial_of(&lf).expect("names match"),
+                Some("x".to_string())
+            );
+        }
+
+        #[test]
+        fn two_different_chains_in_one_file_is_an_error_naming_both() {
+            let lf = loaded(
+                "@serial(a)\nFeature: f\n  @serial(b)\n  Scenario: s\n    Then the response code is 200\n",
+            );
+            let err = serial_of(&lf).expect_err("a file cannot be in two chains");
+            assert!(err.contains('a') && err.contains('b'), "{err}");
+        }
+
+        #[test]
+        fn an_empty_chain_name_is_an_error() {
+            let lf =
+                loaded("@serial()\nFeature: f\n  Scenario: s\n    Then the response code is 200\n");
+            assert!(serial_of(&lf).is_err(), "@serial() without a name must fail");
+        }
+    }
+
+    mod priority_tag {
+        use super::super::*;
+
+        fn loaded(src: &str) -> LoadedFeature {
+            LoadedFeature {
+                path: PathBuf::from("t.feature"),
+                feature: parse_str(src).expect("gherkin parses"),
+            }
+        }
+
+        #[test]
+        fn a_file_without_the_tag_has_priority_zero() {
+            let lf = loaded("Feature: f\n  Scenario: s\n    Then the response code is 200\n");
+            assert_eq!(priority_of(&lf).expect("no tag is not an error"), 0);
+        }
+
+        #[test]
+        fn a_feature_level_tag_sets_the_priority() {
+            let lf = loaded(
+                "@priority(5)\nFeature: f\n  Scenario: s\n    Then the response code is 200\n",
+            );
+            assert_eq!(priority_of(&lf).expect("tag is valid"), 5);
+        }
+
+        #[test]
+        fn a_negative_priority_is_accepted() {
+            let lf = loaded(
+                "@priority(-5)\nFeature: f\n  Scenario: s\n    Then the response code is 200\n",
+            );
+            assert_eq!(priority_of(&lf).expect("tag is valid"), -5);
+        }
+
+        #[test]
+        fn a_file_takes_the_highest_priority_among_its_tags() {
+            // The scheduling unit is the file: one urgent scenario lifts the whole file.
+            let lf = loaded(
+                "@priority(1)\nFeature: f\n  @priority(9)\n  Scenario: s\n    Then the response code is 200\n",
+            );
+            assert_eq!(priority_of(&lf).expect("tag is valid"), 9);
+        }
+
+        #[test]
+        fn a_non_numeric_priority_is_an_error_naming_the_file() {
+            let lf = loaded(
+                "@priority(urgent)\nFeature: f\n  Scenario: s\n    Then the response code is 200\n",
+            );
+            let err = priority_of(&lf).expect_err("argument is not a number");
+            assert!(err.contains("t.feature"), "{err}");
+        }
+
+        #[test]
+        fn an_empty_priority_is_an_error() {
+            let lf = loaded(
+                "@priority()\nFeature: f\n  Scenario: s\n    Then the response code is 200\n",
+            );
+            assert!(priority_of(&lf).is_err(), "@priority() must fail");
+        }
+    }
+
     #[test]
     fn feature_tags_are_inherited_by_every_scenario() {
         let path = std::env::temp_dir().join("bddkit_feature_tags_inherited.feature");
@@ -388,14 +598,16 @@ Feature: f
             &path,
             "@billing\nFeature: f\n  @smoke\n  Scenario: s\n    When I request \"/x\"\n",
         )
-        .expect("writing the feature file");
+        .expect("write feature file");
         let lf = load(&path).expect("file parses");
         assert!(
-            lf.feature.scenarios[0].tags.contains(&"billing".to_string()),
-            "the feature's tag must reach the scenario: {:?}",
+            lf.feature.scenarios[0]
+                .tags
+                .contains(&"billing".to_string()),
+            "the feature tag must land on the scenario: {:?}",
             lf.feature.scenarios[0].tags
         );
-        // Merging must ADD, not replace: swapping `extend` for
+        // The merge must APPEND, not replace: swapping `extend` for
         // assigning the feature's tag list would silently eat the scenario's own tag.
         assert!(
             lf.feature.scenarios[0].tags.contains(&"smoke".to_string()),

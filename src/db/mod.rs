@@ -11,8 +11,8 @@ use sqlx::postgres::PgPoolOptions;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
-/// Pools for all declared connections + an introspection cache. One per run:
-/// a connection belongs to the system under test, not to a test set.
+/// Pools for every declared connection + an introspection cache. One per run:
+/// a connection belongs to the system under test, not to a test suite.
 pub struct Db {
     pools: HashMap<String, PgPool>,
     cache: Mutex<HashMap<(String, String), Arc<TableSchema>>>,
@@ -29,9 +29,7 @@ impl Db {
                 let stmt = format!("SET search_path TO {}", c.search_path.join(", "));
                 opts.after_connect(move |conn, _meta| {
                     let stmt = stmt.clone();
-                    Box::pin(async move {
-                        sqlx::query(&stmt).execute(conn).await.map(|_| ())
-                    })
+                    Box::pin(async move { sqlx::query(&stmt).execute(conn).await.map(|_| ()) })
                 })
                 .connect(&c.dsn)
                 .await
@@ -39,7 +37,10 @@ impl Db {
             let pool = pool.map_err(|e| format!("connection {name}: {e}"))?;
             pools.insert(name.clone(), pool);
         }
-        Ok(Db { pools, cache: Mutex::new(HashMap::new()) })
+        Ok(Db {
+            pools,
+            cache: Mutex::new(HashMap::new()),
+        })
     }
 
     pub fn pool(&self, name: &str) -> Result<&PgPool, String> {
@@ -48,7 +49,7 @@ impl Db {
             .ok_or_else(|| format!("connection {name:?} is not declared in resources.db"))
     }
 
-    /// Introspection with caching. std::Mutex is NOT held across an await.
+    /// Cached introspection. std::Mutex is NEVER held across an await.
     pub async fn schema(&self, conn: &str, sql_name: &str) -> Result<Arc<TableSchema>, String> {
         let key = (conn.to_string(), sql_name.to_string());
         if let Some(s) = self.cache.lock().expect("cache mutex").get(&key) {
@@ -56,13 +57,16 @@ impl Db {
         }
         let pool = self.pool(conn)?;
         let schema = Arc::new(introspect::introspect(pool, sql_name).await?);
-        self.cache.lock().expect("cache mutex").insert(key, schema.clone());
+        self.cache
+            .lock()
+            .expect("cache mutex")
+            .insert(key, schema.clone());
         Ok(schema)
     }
 }
 
-/// A DB handle for a single file run: a reference to the shared pools + the current connection.
-/// `current` resets at the scenario boundary (§8: connection scope is the scenario).
+/// A DB handle for one file run: a reference to the shared pools + the current connection.
+/// `current` resets at the scenario boundary (§8: a connection's scope is the scenario).
 pub struct DbHandle {
     db: Option<Arc<Db>>,
     default: String,
@@ -71,7 +75,11 @@ pub struct DbHandle {
 
 impl DbHandle {
     pub fn new(db: Option<Arc<Db>>, default: String) -> Self {
-        Self { db, current: default.clone(), default }
+        Self {
+            db,
+            current: default.clone(),
+            default,
+        }
     }
 
     pub fn reset(&mut self) {
@@ -84,7 +92,7 @@ impl DbHandle {
 
     pub fn resources(&self) -> Result<&Arc<Db>, String> {
         self.db.as_ref().ok_or_else(|| {
-            "no database connection declared in the config (resources.db)".to_string()
+            "no DB connection is declared in the config (resources.db)".to_string()
         })
     }
 
@@ -102,13 +110,19 @@ mod tests {
     #[test]
     fn a_handle_without_connections_reports_no_database() {
         let h = DbHandle::new(None, String::new());
-        assert!(h.resources().is_err(), "without connections resources() is an error");
+        assert!(
+            h.resources().is_err(),
+            "resources() without connections is an error"
+        );
     }
 
     #[test]
     fn a_handle_without_connections_cannot_switch() {
         let mut h = DbHandle::new(None, String::new());
-        assert!(h.set_current("x").is_err(), "switching without connections is an error");
+        assert!(
+            h.set_current("x").is_err(),
+            "switching without connections is an error"
+        );
     }
 
     #[test]

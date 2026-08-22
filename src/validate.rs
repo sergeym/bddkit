@@ -24,7 +24,7 @@ impl std::fmt::Display for Problem {
 /// Matches every step of every file before the first request. Returns ALL
 /// problems at once — a run that fails midway due to a typo costs more
 /// than a full check that takes milliseconds.
-pub fn check(features: &[LoadedFeature], reg: &Registry, filter: &TagFilter) -> Vec<Problem> {
+pub fn check(features: &[&LoadedFeature], reg: &Registry, filter: &TagFilter) -> Vec<Problem> {
     let mut problems = Vec::new();
     for lf in features {
         let mut all_steps: Vec<(String, usize, bool, bool)> = Vec::new();
@@ -39,20 +39,15 @@ pub fn check(features: &[LoadedFeature], reg: &Registry, filter: &TagFilter) -> 
             }
         }
         // Background is always checked: it runs before every selected
-        // scenario. Filtered-out scenarios are not checked — a typo in something
-        // that never runs must not fail the run.
+        // scenario. Filtered-out scenarios are not checked — a typo in
+        // something that never runs must not fail the run.
         for sc in &lf.feature.scenarios {
             if !filter.matches(&sc.tags) {
                 continue;
             }
             for ex in expand_outlines(sc) {
                 for st in ex.steps {
-                    all_steps.push((
-                        st.text,
-                        st.line,
-                        st.docstring.is_some(),
-                        st.table.is_some(),
-                    ));
+                    all_steps.push((st.text, st.line, st.docstring.is_some(), st.table.is_some()));
                 }
             }
         }
@@ -62,13 +57,13 @@ pub fn check(features: &[LoadedFeature], reg: &Registry, filter: &TagFilter) -> 
                     problems.push(Problem {
                         file: lf.path.clone(),
                         line,
-                        message: "macro call does not support a doc string".into(),
+                        message: "macro calls do not support a docstring".into(),
                     });
                 }
                 Ok(Some((StepTarget::Macro(_), _))) if has_table => problems.push(Problem {
                     file: lf.path.clone(),
                     line,
-                    message: "macro call does not support a table".into(),
+                    message: "macro calls do not support a table".into(),
                 }),
                 Ok(Some(_)) => {}
                 Ok(None) => problems.push(Problem {
@@ -125,14 +120,14 @@ Feature: f
     Then the response code is 200
 ",
         );
-        let p = check(&[lf], &Registry::new().unwrap(), &TagFilter::new(&[]));
+        let p = check(&[&lf], &Registry::new().unwrap(), &TagFilter::new(&[]));
         assert!(p.is_empty(), "{p:?}");
     }
 
     #[test]
     fn reports_unknown_step_with_file_and_line() {
         let lf = loaded("Feature: f\n  Scenario: s\n    When I refund the order\n");
-        let p = check(&[lf], &Registry::new().unwrap(), &TagFilter::new(&[]));
+        let p = check(&[&lf], &Registry::new().unwrap(), &TagFilter::new(&[]));
         assert_eq!(p.len(), 1);
         assert_eq!(p[0].line, 3);
         assert!(
@@ -152,7 +147,7 @@ Feature: f
     Then I ship the order
 ",
         );
-        let p = check(&[lf], &Registry::new().unwrap(), &TagFilter::new(&[]));
+        let p = check(&[&lf], &Registry::new().unwrap(), &TagFilter::new(&[]));
         assert_eq!(p.len(), 2, "all problems must be reported at once");
     }
 
@@ -161,7 +156,7 @@ Feature: f
         let lf = loaded(
             "Feature: f\n  Background:\n    Given I refund the order\n  Scenario: s\n    Then the response code is 200\n",
         );
-        let p = check(&[lf], &Registry::new().unwrap(), &TagFilter::new(&[]));
+        let p = check(&[&lf], &Registry::new().unwrap(), &TagFilter::new(&[]));
         assert_eq!(p.len(), 1);
         assert_eq!(p[0].line, 3);
     }
@@ -175,13 +170,13 @@ Feature: f
   Scenario: selected
     Then the response code is 200
   @slow
-  Scenario: filtered out
+  Scenario: filtered_out
     When I refund the order
 ",
         );
 
         let p = check(
-            &[lf],
+            &[&lf],
             &Registry::new().unwrap(),
             &TagFilter::new(&["smoke".to_string()]),
         );
@@ -204,17 +199,17 @@ Feature: f
       | POSTT  |
 ",
         );
-        let p = check(&[lf], &Registry::new().unwrap(), &TagFilter::new(&[]));
-        assert_eq!(p.len(), 1, "a typo in the method must surface before the run starts");
+        let p = check(&[&lf], &Registry::new().unwrap(), &TagFilter::new(&[]));
+        assert_eq!(p.len(), 1, "a typo in the method must surface before the run");
     }
 
     #[test]
     fn steps_with_variables_validate_without_values() {
-        // Substitution happens in the arguments, so matching does not require values.
+        // Substitution happens in arguments, so matching does not require values.
         let lf = loaded(
             "Feature: f\n  Scenario: s\n    When I request \"/users/<<userId>>\" using HTTP GET\n",
         );
-        let p = check(&[lf], &Registry::new().unwrap(), &TagFilter::new(&[]));
+        let p = check(&[&lf], &Registry::new().unwrap(), &TagFilter::new(&[]));
         assert!(p.is_empty(), "{p:?}");
     }
 
@@ -224,7 +219,7 @@ Feature: f
             "Feature: f\n  Scenario: s\n    When I do business\n      \"\"\"\n      x\n      \"\"\"\n",
         );
 
-        let problems = check(&[lf], &macro_registry("docstring"), &TagFilter::new(&[]));
+        let problems = check(&[&lf], &macro_registry("docstring"), &TagFilter::new(&[]));
 
         assert_eq!(problems.len(), 1);
         assert!(problems[0].message.contains("docstring"), "{problems:?}");
@@ -236,7 +231,7 @@ Feature: f
             "Feature: f\n  Scenario: s\n    When I do business\n      | value |\n      | x     |\n",
         );
 
-        let problems = check(&[lf], &macro_registry("table"), &TagFilter::new(&[]));
+        let problems = check(&[&lf], &macro_registry("table"), &TagFilter::new(&[]));
 
         assert_eq!(problems.len(), 1);
         assert!(problems[0].message.contains("table"), "{problems:?}");

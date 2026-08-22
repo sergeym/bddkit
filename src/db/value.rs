@@ -1,6 +1,6 @@
 use crate::vars::NULL_SENTINEL;
 
-/// A column value: `None` is SQL NULL, `Some` is text (to be cast in SQL).
+/// A column value: `None` is SQL NULL, `Some` is text (for casting in SQL).
 type Pair = (String, Option<String>);
 
 fn make_value(raw: &str) -> Option<String> {
@@ -14,7 +14,7 @@ fn make_value(raw: &str) -> Option<String> {
 
 /// Parses `col:val, col2:val2`. An escaped comma `\,` is a literal.
 /// A value equal to the NULL sentinel yields `None`. An empty string is an empty list.
-/// An ambiguous piece without `:` is an explicit error, not a silent bad split.
+/// An ambiguous piece without `:` is an explicit error, not a silent misparse.
 pub fn parse_oneliner(s: &str) -> Result<Vec<Pair>, String> {
     if s.trim().is_empty() {
         return Ok(Vec::new());
@@ -36,8 +36,8 @@ pub fn parse_oneliner(s: &str) -> Result<Vec<Pair>, String> {
     Ok(out)
 }
 
-/// An argument to a procedure/function call. The type is guessed from the text, since
-/// the signature isn't introspected; this suffices for int/float/bool/text.
+/// A procedure/function call argument. The type is guessed from the text because
+/// we do not introspect the signature; this is enough for int/float/bool/text.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Arg {
     Null,
@@ -47,7 +47,7 @@ pub enum Arg {
     Text(String),
 }
 
-/// Guesses the argument's type from the text (`i64` → `f64` → `bool` → text).
+/// Guesses the argument type from the text (`i64` → `f64` → `bool` → text).
 pub fn infer_arg(raw: &str) -> Arg {
     let v = raw.trim();
     if v == NULL_SENTINEL {
@@ -66,7 +66,7 @@ pub fn infer_arg(raw: &str) -> Arg {
     }
 }
 
-/// Parses positional arguments `a:1,b:2` into value order;
+/// Parses positional arguments `a:1,b:2` into a value order;
 /// names are documentation only, casting follows the `infer_arg` heuristic.
 pub fn parse_args(s: &str) -> Result<Vec<Arg>, String> {
     Ok(parse_oneliner(s)?
@@ -78,8 +78,8 @@ pub fn parse_args(s: &str) -> Result<Vec<Arg>, String> {
         .collect())
 }
 
-/// The "wide" table for `I have "T" where:`: the first row is column names,
-/// each following row is values. The result is one set of pairs per data row.
+/// A "wide" table `I have "T" where:`: the first row is column names,
+/// each following one is values. The result is one set of pairs per data row.
 pub fn pairs_from_wide(rows: &[Vec<String>]) -> Result<Vec<Vec<Pair>>, String> {
     let header = rows.first().ok_or("table is empty")?;
     let mut result = Vec::new();
@@ -94,12 +94,16 @@ pub fn pairs_from_wide(rows: &[Vec<String>]) -> Result<Vec<Vec<Pair>>, String> {
     Ok(result)
 }
 
-/// The "tall" table for `I should have "T" with:`: the first row is a header
-/// (`| column | value |`), each following row is a "column, value" pair.
+/// A "tall" table `I should have "T" with:`: the first row is the header
+/// (`| column | value |`), each following one is a (column, value) pair.
 pub fn pairs_from_tall(rows: &[Vec<String>]) -> Result<Vec<Pair>, String> {
     let mut out = Vec::new();
     for row in rows.iter().skip(1) {
-        let col = row.first().ok_or("table row is empty")?.trim().to_string();
+        let col = row
+            .first()
+            .ok_or("table row is empty")?
+            .trim()
+            .to_string();
         let raw = row.get(1).map(String::as_str).unwrap_or("");
         out.push((col, make_value(raw)));
     }
@@ -113,10 +117,13 @@ mod tests {
     #[test]
     fn oneliner_splits_columns() {
         let p = parse_oneliner("name: Root, company_id: 5").unwrap();
-        assert_eq!(p, vec![
-            ("name".into(), Some("Root".into())),
-            ("company_id".into(), Some("5".into())),
-        ]);
+        assert_eq!(
+            p,
+            vec![
+                ("name".into(), Some("Root".into())),
+                ("company_id".into(), Some("5".into())),
+            ]
+        );
     }
 
     #[test]
@@ -151,10 +158,13 @@ mod tests {
         ];
         let sets = pairs_from_wide(&rows).unwrap();
         assert_eq!(sets.len(), 2);
-        assert_eq!(sets[0], vec![
-            ("company_id".into(), Some("5".into())),
-            ("name".into(), Some("first".into())),
-        ]);
+        assert_eq!(
+            sets[0],
+            vec![
+                ("company_id".into(), Some("5".into())),
+                ("name".into(), Some("first".into())),
+            ]
+        );
         assert_eq!(sets[1][1], ("name".into(), Some("second".into())));
     }
 
@@ -166,10 +176,13 @@ mod tests {
             vec!["id".to_string(), "42".to_string()],
         ];
         let p = pairs_from_tall(&rows).unwrap();
-        assert_eq!(p, vec![
-            ("slug".into(), Some("abc".into())),
-            ("id".into(), Some("42".into())),
-        ]);
+        assert_eq!(
+            p,
+            vec![
+                ("slug".into(), Some("abc".into())),
+                ("id".into(), Some("42".into())),
+            ]
+        );
     }
 
     #[test]
@@ -185,7 +198,10 @@ mod tests {
     #[test]
     fn parse_args_positional_in_write_order() {
         let args = parse_args("a: 1, b: two, c: 3.0").unwrap();
-        assert_eq!(args, vec![Arg::Int(1), Arg::Text("two".into()), Arg::Float(3.0)]);
+        assert_eq!(
+            args,
+            vec![Arg::Int(1), Arg::Text("two".into()), Arg::Float(3.0)]
+        );
         assert!(parse_args("").unwrap().is_empty());
     }
 }

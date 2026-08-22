@@ -26,8 +26,13 @@ impl TimingRow {
         let ms = |d: Duration| d.as_secs_f64() * 1_000.0;
         format!(
             "| test | lock | connect | schema | close | files | bddkit | total |\n| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n| {test} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} |",
-            ms(self.lock), ms(self.connect), ms(self.schema), ms(self.close),
-            ms(self.files), ms(self.bddkit), ms(self.total),
+            ms(self.lock),
+            ms(self.connect),
+            ms(self.schema),
+            ms(self.close),
+            ms(self.files),
+            ms(self.bddkit),
+            ms(self.total),
         )
     }
 }
@@ -60,8 +65,14 @@ pub async fn setup() -> Setup {
         .expect("no connection to the test DB; run `docker compose up -d`");
     let connect = phase.elapsed();
     let phase = Instant::now();
-    sqlx::query("DROP SCHEMA IF EXISTS apibdd_it CASCADE").execute(&pool).await.unwrap();
-    sqlx::query("CREATE SCHEMA apibdd_it").execute(&pool).await.unwrap();
+    sqlx::query("DROP SCHEMA IF EXISTS apibdd_it CASCADE")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("CREATE SCHEMA apibdd_it")
+        .execute(&pool)
+        .await
+        .unwrap();
     for stmt in [
         "CREATE TABLE apibdd_it.companies (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, \
          slug text NOT NULL, name text, created_at timestamptz NOT NULL DEFAULT now())",
@@ -78,7 +89,13 @@ pub async fn setup() -> Setup {
     Setup {
         _guard: guard,
         started,
-        timings: TimingRow { lock, connect, schema, close: phase.elapsed(), ..Default::default() },
+        timings: TimingRow {
+            lock,
+            connect,
+            schema,
+            close: phase.elapsed(),
+            ..Default::default()
+        },
     }
 }
 
@@ -87,12 +104,19 @@ pub async fn setup() -> Setup {
 #[track_caller]
 pub fn run_feature(feature_src: &str, setup: &Setup) -> Output {
     let phase = Instant::now();
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
     let dir = std::env::temp_dir().join(format!("bddkit-db-{nanos}"));
     std::fs::create_dir_all(dir.join("features")).expect("mkdir");
     std::fs::write(dir.join("features/db.feature"), feature_src).expect("write feature");
 
-    let features_path = dir.join("features").display().to_string().replace('\\', "/");
+    let features_path = dir
+        .join("features")
+        .display()
+        .to_string()
+        .replace('\\', "/");
     let cfg = format!(
         "paths: [{features_path}]\nresources:\n  api:\n    stub:\n      base_url: http://127.0.0.1:1\n  \
          db:\n    default:\n      dsn: {}\n      search_path: [apibdd_it]\n",
@@ -115,7 +139,10 @@ pub fn run_feature(feature_src: &str, setup: &Setup) -> Output {
     };
     if timings_enabled(std::env::var("BDDKIT_TEST_TIMINGS").ok().as_deref()) {
         let caller = std::panic::Location::caller();
-        eprintln!("{}", timings.markdown(&format!("{}:{}", caller.file(), caller.line())));
+        eprintln!(
+            "{}",
+            timings.markdown(&format!("{}:{}", caller.file(), caller.line()))
+        );
     }
     out
 }

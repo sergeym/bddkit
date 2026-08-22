@@ -1,5 +1,5 @@
 /// A table reference of the form `[connection:][schema.]table`.
-/// The separators don't overlap: `:` splits off the connection, `.` the schema.
+/// The separators do not overlap: `:` separates the connection, `.` the schema.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableRef {
     pub conn: Option<String>,
@@ -24,10 +24,14 @@ impl TableRef {
         if table.is_empty() {
             return Err(format!("reference {s:?} does not name a table"));
         }
-        Ok(TableRef { conn, schema, table })
+        Ok(TableRef {
+            conn,
+            schema,
+            table,
+        })
     }
 
-    /// The name for SQL and for `to_regclass`. Not quoted: names are plain lowercase.
+    /// Name for SQL and for `to_regclass`. Not quoted: names are plain lowercase.
     pub fn sql_name(&self) -> String {
         match &self.schema {
             Some(sch) => format!("{sch}.{}", self.table),
@@ -43,7 +47,14 @@ mod tests {
     #[test]
     fn bare_table() {
         let r = TableRef::parse("users").unwrap();
-        assert_eq!(r, TableRef { conn: None, schema: None, table: "users".into() });
+        assert_eq!(
+            r,
+            TableRef {
+                conn: None,
+                schema: None,
+                table: "users".into()
+            }
+        );
         assert_eq!(r.sql_name(), "users");
     }
 

@@ -632,11 +632,15 @@ pub async fn dispatch(w: &mut World, id: StepId, a: &Args) -> Result<(), String>
         StepId::Update => db::update(w, a.cap(0), a.cap(1), a.cap(2)).await,
         StepId::DeleteWhere => db::delete_where(w, a.cap(0), a.cap(1)).await,
         StepId::DeleteAll => db::delete_all(w, a.cap(0)).await,
-        StepId::ExtractFromDb => db::extract_from_db(w, a.cap(0), a.cap(1), a.cap(2), a.cap(3)).await,
+        StepId::ExtractFromDb => {
+            db::extract_from_db(w, a.cap(0), a.cap(1), a.cap(2), a.cap(3)).await
+        }
         StepId::ShouldHaveWith => db::should_have(w, a.cap(0), a.cap(1)).await,
         StepId::ShouldHaveTable => db::should_have_table(w, a.cap(0), a.table.as_ref()).await,
         StepId::ShouldNotHaveWith => db::should_not_have(w, a.cap(0), a.cap(1)).await,
-        StepId::ShouldNotHaveTable => db::should_not_have_table(w, a.cap(0), a.table.as_ref()).await,
+        StepId::ShouldNotHaveTable => {
+            db::should_not_have_table(w, a.cap(0), a.table.as_ref()).await
+        }
         StepId::CallProcedure => db::call_procedure(w, a.cap(0), a.cap(1)).await,
         StepId::CallFunction => db::call_function(w, a.cap(0), a.cap(1), a.cap(2)).await,
         StepId::GetSequence => db::get_sequence(w, a.cap(0), a.cap(1)).await,
@@ -650,7 +654,8 @@ pub async fn dispatch(w: &mut World, id: StepId, a: &Args) -> Result<(), String>
 }
 
 async fn sleep(secs: &str) -> Result<(), String> {
-    let n = secs.parse::<u64>()
+    let n = secs
+        .parse::<u64>()
         .map_err(|_| format!("not a number: {secs}"))?;
     tokio::time::sleep(std::time::Duration::from_secs(n)).await;
     Ok(())

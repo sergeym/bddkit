@@ -31,21 +31,37 @@ struct Cli {
     /// Override APP_ENV: selects .env.<name> / .env.<name>.local
     #[arg(long = "env")]
     env: Option<String>,
+    /// Stop handing out new files after the first failure
+    #[arg(long = "fail-fast")]
+    fail_fast: bool,
 }
 
+/// Anything that fails before the first request must exit with code 2 (invariant 6):
+/// config loading, path traversal, building API resources and DB pools, parsing
+/// scheduling tags — this is a "nothing ever ran" failure, and 1 is reserved for
+/// a failed scenario.
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
     let cli = Cli::parse();
-    let cfg = config::load(&cli.config, cli.env.as_deref())?;
-    let reg = match macros::MacroCatalog::load(&cfg.macro_paths)
-        .and_then(steps::Registry::with_macros)
-    {
-        Ok(registry) => registry,
+    match run(cli).await {
+        Ok(code) => std::process::exit(code),
         Err(error) => {
-            eprintln!("error: 1 problem, run not started\n\n  {error}");
+            eprintln!("error: {error:#}\n\nrun not started");
             std::process::exit(2);
         }
-    };
+    }
+}
+
+async fn run(cli: Cli) -> Result<i32> {
+    let cfg = config::load(&cli.config, cli.env.as_deref())?;
+    let reg =
+        match macros::MacroCatalog::load(&cfg.macro_paths).and_then(steps::Registry::with_macros) {
+            Ok(registry) => registry,
+            Err(error) => {
+                eprintln!("error: 1 problem, run not started\n\n  {error}");
+                std::process::exit(2);
+            }
+        };
     let generator = Arc::new(unique::Generator::new());
 
     let filter = feature::TagFilter::new(&cli.tags);
@@ -59,7 +75,7 @@ async fn main() -> Result<()> {
     for path in feature::discover(paths)? {
         let lf = feature::load(&path)?;
         if lf.has_selected_scenario(&filter) {
-            loaded.push(lf);
+            loaded.push(Arc::new(lf));
         }
     }
     if loaded.is_empty() {
@@ -67,7 +83,8 @@ async fn main() -> Result<()> {
         std::process::exit(2);
     }
 
-    let problems = validate::check(&loaded, &reg, &filter);
+    let for_check: Vec<&feature::LoadedFeature> = loaded.iter().map(Arc::as_ref).collect();
+    let problems = validate::check(&for_check, &reg, &filter);
     if !problems.is_empty() {
         eprintln!("error: {} problem(s), run not started\n", problems.len());
         for p in &problems {
@@ -75,6 +92,8 @@ async fn main() -> Result<()> {
         }
         std::process::exit(2);
     }
+
+    let chains = runner::build_chains(loaded).map_err(anyhow::Error::msg)?;
 
     let mut by_name = std::collections::HashMap::new();
     for (name, api) in &cfg.resources.api {
@@ -104,14 +123,17 @@ async fn main() -> Result<()> {
     let default_db = cfg.resolve_default_db()?.unwrap_or_default();
 
     println!("run {}", generator.run_id());
-    let mut results = Vec::new();
-    for lf in &loaded {
-        let handle = db::DbHandle::new(db.clone(), default_db.clone());
-        let r =
-            runner::run_file(lf, &reg, apis.clone(), generator.clone(), handle, &filter).await;
-        report::print_file(&r);
-        results.push(r);
-    }
+    let ctx = Arc::new(runner::RunContext::new(
+        reg,
+        apis,
+        generator.clone(),
+        filter,
+        db,
+        default_db,
+        cli.fail_fast,
+    ));
 
-    std::process::exit(report::print_summary(&results, generator.run_id()));
+    let results = runner::run_all(chains, ctx, cfg.concurrency).await;
+
+    Ok(report::print_summary(&results, generator.run_id()))
 }

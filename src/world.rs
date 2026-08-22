@@ -53,7 +53,11 @@ mod tests {
 
     #[test]
     fn reset_scenario_clears_debug() {
-        let mut w = World::new(apis(), Arc::new(Generator::new()), DbHandle::new(None, String::new()));
+        let mut w = World::new(
+            apis(),
+            Arc::new(Generator::new()),
+            DbHandle::new(None, String::new()),
+        );
         w.debug = true;
         w.reset_scenario();
         assert!(!w.debug, "debug resets at the scenario boundary");

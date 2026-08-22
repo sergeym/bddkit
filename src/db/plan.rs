@@ -23,7 +23,7 @@ impl TableSchema {
     }
 }
 
-/// Types that, for a NOT NULL column with no value, get filled with `now()`.
+/// Types that get filled with `now()` for NOT NULL columns with no value.
 pub fn is_timestamplike(type_name: &str) -> bool {
     matches!(type_name, "timestamp" | "timestamptz" | "date")
 }
@@ -36,7 +36,7 @@ pub struct InsertPlan {
     pub logs: Vec<String>,
 }
 
-/// Builds an INSERT: applies the PK and NOT NULL-filling rules from spec §8.
+/// Builds an INSERT: applies the PK and NOT NULL fill rules from spec §8.
 /// `values` are the pairs given in the step (`None` = SQL NULL). `index` is the
 /// variable-name suffix for the table form (`Some(0)` → `_0`).
 pub fn build_insert(
@@ -49,7 +49,7 @@ pub fn build_insert(
     // Given columns must exist.
     for (col, _) in values {
         if schema.col(col).is_none() {
-            return Err(format!("column {col:?} does not exist in table {sql_name}"));
+            return Err(format!("column {col:?} is missing from table {sql_name}"));
         }
     }
     let given: std::collections::HashSet<&str> = values.iter().map(|(c, _)| c.as_str()).collect();
@@ -86,7 +86,7 @@ pub fn build_insert(
             param += 1;
         } else {
             return Err(format!(
-                "primary key {} ({}) has no value and cannot be generated (no default, not uuid)",
+                "primary key {} ({}) has no value and is not generated (no default, not uuid)",
                 pk.name, pk.type_name
             ));
         }
@@ -111,11 +111,18 @@ pub fn build_insert(
 
     // 4. Assemble the SQL.
     let pk_cols = schema.pk_columns();
-    let returning: Vec<String> = pk_cols.iter().map(|c| format!("({})::text", c.name)).collect();
+    let returning: Vec<String> = pk_cols
+        .iter()
+        .map(|c| format!("({})::text", c.name))
+        .collect();
     let body = if cols.is_empty() {
         format!("INSERT INTO {sql_name} DEFAULT VALUES")
     } else {
-        format!("INSERT INTO {sql_name} ({}) VALUES ({})", cols.join(", "), exprs.join(", "))
+        format!(
+            "INSERT INTO {sql_name} ({}) VALUES ({})",
+            cols.join(", "),
+            exprs.join(", ")
+        )
     };
     let sql = if returning.is_empty() {
         body
@@ -123,15 +130,23 @@ pub fn build_insert(
         format!("{body} RETURNING {}", returning.join(", "))
     };
 
-    // 5. Variable names for the RETURNING clause.
+    // 5. Variable names for RETURNING.
     let suffix = index.map(|i| format!("_{i}")).unwrap_or_default();
     let var_names: Vec<String> = if pk_cols.len() == 1 {
         vec![format!("last_insert_id_{bare}{suffix}")]
     } else {
-        pk_cols.iter().map(|c| format!("last_insert_{bare}_{}{suffix}", c.name)).collect()
+        pk_cols
+            .iter()
+            .map(|c| format!("last_insert_{bare}_{}{suffix}", c.name))
+            .collect()
     };
 
-    Ok(InsertPlan { sql, binds, var_names, logs })
+    Ok(InsertPlan {
+        sql,
+        binds,
+        var_names,
+        logs,
+    })
 }
 
 /// Builds `col = $N::type AND …`. NULL → `col IS NULL` with no bind. Parameter
@@ -145,7 +160,9 @@ pub fn build_where(
     let mut binds = Vec::new();
     let mut param = start;
     for (col, val) in pairs {
-        let c = schema.col(col).ok_or_else(|| format!("column {col:?} does not exist in the table"))?;
+        let c = schema
+            .col(col)
+            .ok_or_else(|| format!("column {col:?} is missing from the table"))?;
         match val {
             None => parts.push(format!("{col} IS NULL")),
             Some(_) => {
@@ -171,14 +188,22 @@ pub fn build_update(
     let mut binds = Vec::new();
     let mut param = 1usize;
     for (col, val) in set {
-        let c = schema.col(col).ok_or_else(|| format!("column {col:?} does not exist in the table"))?;
+        let c = schema
+            .col(col)
+            .ok_or_else(|| format!("column {col:?} is missing from the table"))?;
         sets.push(format!("{col} = ${param}::{}", c.type_name));
         binds.push(val.clone());
         param += 1;
     }
     let (where_sql, where_binds) = build_where(schema, where_, param)?;
     binds.extend(where_binds);
-    Ok((format!("UPDATE {sql_name} SET {} WHERE {where_sql}", sets.join(", ")), binds))
+    Ok((
+        format!(
+            "UPDATE {sql_name} SET {} WHERE {where_sql}",
+            sets.join(", ")
+        ),
+        binds,
+    ))
 }
 
 pub fn build_delete(
@@ -187,7 +212,7 @@ pub fn build_delete(
     where_: &[(String, Option<String>)],
 ) -> Result<(String, Vec<Option<String>>), String> {
     if where_.is_empty() {
-        return Err("DELETE without WHERE is forbidden; use the \"I delete all\" step to clear the table".into());
+        return Err("DELETE without WHERE is forbidden; use the \"I delete all\" step for a full wipe".into());
     }
     let (where_sql, binds) = build_where(schema, where_, 1)?;
     Ok((format!("DELETE FROM {sql_name} WHERE {where_sql}"), binds))
@@ -206,32 +231,63 @@ pub fn build_exists(
         return Err("an existence check requires a condition".into());
     }
     let (where_sql, binds) = build_where(schema, where_, 1)?;
-    Ok((format!("SELECT 1 FROM {sql_name} WHERE {where_sql} LIMIT 1"), binds))
+    Ok((
+        format!("SELECT 1 FROM {sql_name} WHERE {where_sql} LIMIT 1"),
+        binds,
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn col(name: &str, ty: &str, not_null: bool, has_default: bool, is_identity: bool, is_pk: bool) -> Column {
-        Column { name: name.into(), type_name: ty.into(), not_null, has_default, is_identity, is_pk }
+    fn col(
+        name: &str,
+        ty: &str,
+        not_null: bool,
+        has_default: bool,
+        is_identity: bool,
+        is_pk: bool,
+    ) -> Column {
+        Column {
+            name: name.into(),
+            type_name: ty.into(),
+            not_null,
+            has_default,
+            is_identity,
+            is_pk,
+        }
     }
 
     // users(id uuid pk with no default, email text not null, created_at timestamptz not null)
     fn users_uuid() -> TableSchema {
-        TableSchema { columns: vec![
-            col("id", "uuid", true, false, false, true),
-            col("email", "text", true, false, false, false),
-            col("created_at", "timestamptz", true, false, false, false),
-        ] }
+        TableSchema {
+            columns: vec![
+                col("id", "uuid", true, false, false, true),
+                col("email", "text", true, false, false, false),
+                col("created_at", "timestamptz", true, false, false, false),
+            ],
+        }
     }
 
     #[test]
     fn generates_uuid_pk_and_fills_timestamp() {
-        let p = build_insert(&users_uuid(), "users", "users",
-            &[("email".into(), Some("a@b.net".into()))], None).unwrap();
+        let p = build_insert(
+            &users_uuid(),
+            "users",
+            "users",
+            &[("email".into(), Some("a@b.net".into()))],
+            None,
+        )
+        .unwrap();
         // email is given ($1), id is generated ($2::uuid), created_at → now()
-        assert!(p.sql.starts_with("INSERT INTO users (email, id, created_at) VALUES ($1::text, $2::uuid, now())"), "{}", p.sql);
+        assert!(
+            p.sql.starts_with(
+                "INSERT INTO users (email, id, created_at) VALUES ($1::text, $2::uuid, now())"
+            ),
+            "{}",
+            p.sql
+        );
         assert!(p.sql.ends_with("RETURNING (id)::text"), "{}", p.sql);
         assert_eq!(p.binds.len(), 2);
         assert_eq!(p.binds[0], Some("a@b.net".to_string()));
@@ -242,39 +298,60 @@ mod tests {
     #[test]
     fn omits_identity_and_default_pk() {
         // companies(id int identity pk, slug text not null)
-        let s = TableSchema { columns: vec![
-            col("id", "int4", true, true, true, true),
-            col("slug", "text", true, false, false, false),
-        ] };
-        let p = build_insert(&s, "companies", "companies",
-            &[("slug".into(), Some("x".into()))], None).unwrap();
-        assert_eq!(p.sql, "INSERT INTO companies (slug) VALUES ($1::text) RETURNING (id)::text");
+        let s = TableSchema {
+            columns: vec![
+                col("id", "int4", true, true, true, true),
+                col("slug", "text", true, false, false, false),
+            ],
+        };
+        let p = build_insert(
+            &s,
+            "companies",
+            "companies",
+            &[("slug".into(), Some("x".into()))],
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            p.sql,
+            "INSERT INTO companies (slug) VALUES ($1::text) RETURNING (id)::text"
+        );
         assert_eq!(p.var_names, vec!["last_insert_id_companies"]);
     }
 
     #[test]
     fn missing_plain_not_null_is_error() {
-        let s = TableSchema { columns: vec![
-            col("id", "int4", true, true, true, true),
-            col("qty", "int4", true, false, false, false),
-        ] };
+        let s = TableSchema {
+            columns: vec![
+                col("id", "int4", true, true, true, true),
+                col("qty", "int4", true, false, false, false),
+            ],
+        };
         let err = build_insert(&s, "t", "t", &[], None).unwrap_err();
         assert!(err.contains("qty"), "{err}");
     }
 
     #[test]
     fn unknown_column_is_error() {
-        let err = build_insert(&users_uuid(), "users", "users",
-            &[("nope".into(), Some("1".into()))], None).unwrap_err();
+        let err = build_insert(
+            &users_uuid(),
+            "users",
+            "users",
+            &[("nope".into(), Some("1".into()))],
+            None,
+        )
+        .unwrap_err();
         assert!(err.contains("nope"), "{err}");
     }
 
     #[test]
     fn provided_null_binds_none() {
-        let s = TableSchema { columns: vec![
-            col("id", "int4", true, true, true, true),
-            col("deleted_at", "timestamptz", false, false, false, false),
-        ] };
+        let s = TableSchema {
+            columns: vec![
+                col("id", "int4", true, true, true, true),
+                col("deleted_at", "timestamptz", false, false, false, false),
+            ],
+        };
         let p = build_insert(&s, "t", "t", &[("deleted_at".into(), None)], None).unwrap();
         assert_eq!(p.binds, vec![None]);
         assert!(p.sql.contains("$1::timestamptz"), "{}", p.sql);
@@ -282,35 +359,68 @@ mod tests {
 
     #[test]
     fn composite_pk_yields_per_column_vars() {
-        let s = TableSchema { columns: vec![
-            col("a", "int4", true, false, false, true),
-            col("b", "int4", true, false, false, true),
-        ] };
-        let p = build_insert(&s, "pair", "pair",
-            &[("a".into(), Some("1".into())), ("b".into(), Some("2".into()))], None).unwrap();
-        assert_eq!(p.var_names, vec!["last_insert_pair_a", "last_insert_pair_b"]);
-        assert!(p.sql.ends_with("RETURNING (a)::text, (b)::text"), "{}", p.sql);
+        let s = TableSchema {
+            columns: vec![
+                col("a", "int4", true, false, false, true),
+                col("b", "int4", true, false, false, true),
+            ],
+        };
+        let p = build_insert(
+            &s,
+            "pair",
+            "pair",
+            &[
+                ("a".into(), Some("1".into())),
+                ("b".into(), Some("2".into())),
+            ],
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            p.var_names,
+            vec!["last_insert_pair_a", "last_insert_pair_b"]
+        );
+        assert!(
+            p.sql.ends_with("RETURNING (a)::text, (b)::text"),
+            "{}",
+            p.sql
+        );
     }
 
     #[test]
     fn table_index_suffixes_var_name() {
-        let p = build_insert(&users_uuid(), "users", "users",
-            &[("email".into(), Some("a@b.net".into()))], Some(3)).unwrap();
+        let p = build_insert(
+            &users_uuid(),
+            "users",
+            "users",
+            &[("email".into(), Some("a@b.net".into()))],
+            Some(3),
+        )
+        .unwrap();
         assert_eq!(p.var_names, vec!["last_insert_id_users_3"]);
     }
 
     fn companies() -> TableSchema {
-        TableSchema { columns: vec![
-            col("id", "int4", true, true, true, true),
-            col("slug", "text", true, false, false, false),
-            col("deleted_at", "timestamptz", false, false, false, false),
-        ] }
+        TableSchema {
+            columns: vec![
+                col("id", "int4", true, true, true, true),
+                col("slug", "text", true, false, false, false),
+                col("deleted_at", "timestamptz", false, false, false, false),
+            ],
+        }
     }
 
     #[test]
     fn where_uses_typed_casts_and_is_null() {
-        let (sql, binds) = build_where(&companies(),
-            &[("slug".into(), Some("x".into())), ("deleted_at".into(), None)], 1).unwrap();
+        let (sql, binds) = build_where(
+            &companies(),
+            &[
+                ("slug".into(), Some("x".into())),
+                ("deleted_at".into(), None),
+            ],
+            1,
+        )
+        .unwrap();
         assert_eq!(sql, "slug = $1::text AND deleted_at IS NULL");
         assert_eq!(binds, vec![Some("x".to_string())]);
     }
@@ -328,17 +438,31 @@ mod tests {
 
     #[test]
     fn update_sets_then_where_numbering() {
-        let (sql, binds) = build_update(&companies(), "companies",
+        let (sql, binds) = build_update(
+            &companies(),
+            "companies",
             &[("slug".into(), Some("new".into()))],
-            &[("id".into(), Some("7".into()))]).unwrap();
-        assert_eq!(sql, "UPDATE companies SET slug = $1::text WHERE id = $2::int4");
+            &[("id".into(), Some("7".into()))],
+        )
+        .unwrap();
+        assert_eq!(
+            sql,
+            "UPDATE companies SET slug = $1::text WHERE id = $2::int4"
+        );
         assert_eq!(binds, vec![Some("new".to_string()), Some("7".to_string())]);
     }
 
     #[test]
     fn update_requires_where() {
-        assert!(build_update(&companies(), "companies",
-            &[("slug".into(), Some("x".into()))], &[]).is_err());
+        assert!(
+            build_update(
+                &companies(),
+                "companies",
+                &[("slug".into(), Some("x".into()))],
+                &[]
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -353,8 +477,12 @@ mod tests {
 
     #[test]
     fn exists_selects_one() {
-        let (sql, _) = build_exists(&companies(), "companies",
-            &[("slug".into(), Some("x".into()))]).unwrap();
+        let (sql, _) = build_exists(
+            &companies(),
+            "companies",
+            &[("slug".into(), Some("x".into()))],
+        )
+        .unwrap();
         assert_eq!(sql, "SELECT 1 FROM companies WHERE slug = $1::text LIMIT 1");
     }
 }

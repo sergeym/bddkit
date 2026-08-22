@@ -171,7 +171,7 @@ fn compile(raw: RawMacro, source: &Path, line: usize) -> Result<MacroDef, String
                 };
                 if values.next().is_some() {
                     return Err(format!(
-                        "step with a doc string in {}:{line} must have exactly one name",
+                        "a step with a docstring in {}:{line} must contain exactly one name",
                         source.display(),
                     ));
                 }
@@ -189,7 +189,7 @@ fn compile(raw: RawMacro, source: &Path, line: usize) -> Result<MacroDef, String
     Ok(MacroDef {
         regex: Regex::new(&pattern).map_err(|error| {
             format!(
-                "invalid macro pattern {:?} in {}:{line}: {error}",
+                "invalid macro template {:?} in {}:{line}: {error}",
                 raw.step,
                 source.display()
             )
@@ -321,10 +321,7 @@ mod tests {
         );
         let registry = Registry::with_macros(MacroCatalog::load(&[path]).unwrap()).unwrap();
 
-        let (target, captures) = registry
-            .find(r#"I login as "a@b.net""#)
-            .unwrap()
-            .unwrap();
+        let (target, captures) = registry.find(r#"I login as "a@b.net""#).unwrap().unwrap();
 
         assert_eq!(target, StepTarget::Macro(0));
         assert_eq!(captures, ["a@b.net"]);
@@ -352,10 +349,8 @@ mod tests {
             "  - step : I do business\n    do: [the response code is 200]\n  - { 'step': I do business, do: [the response code is 201] }\n",
         );
 
-        let error = Registry::with_macros(
-            MacroCatalog::load(std::slice::from_ref(&path)).unwrap(),
-        )
-        .unwrap_err();
+        let error = Registry::with_macros(MacroCatalog::load(std::slice::from_ref(&path)).unwrap())
+            .unwrap_err();
 
         assert!(error.contains(&format!("{}:1", path.display())), "{error}");
         assert!(error.contains(&format!("{}:3", path.display())), "{error}");
@@ -370,7 +365,10 @@ mod tests {
 
         let error = MacroCatalog::load(std::slice::from_ref(&path)).unwrap_err();
 
-        assert!(error.contains("format") && error.contains(&path.display().to_string()), "{error}");
+        assert!(
+            error.contains("format") && error.contains(&path.display().to_string()),
+            "{error}"
+        );
     }
 
     #[test]
@@ -380,8 +378,7 @@ mod tests {
             "- step: 'the response code is {code}'\n  do: [Show all variables]\n",
         );
 
-        let error =
-            Registry::with_macros(MacroCatalog::load(&[path]).unwrap()).unwrap_err();
+        let error = Registry::with_macros(MacroCatalog::load(&[path]).unwrap()).unwrap_err();
 
         assert!(error.contains("the response code is"), "{error}");
     }
@@ -393,8 +390,7 @@ mod tests {
             "- step: 'the response code is 2{tail}'\n  do: [Show all variables]\n",
         );
 
-        let error =
-            Registry::with_macros(MacroCatalog::load(&[path]).unwrap()).unwrap_err();
+        let error = Registry::with_macros(MacroCatalog::load(&[path]).unwrap()).unwrap_err();
 
         assert!(error.contains("the response code is"), "{error}");
     }
@@ -406,8 +402,7 @@ mod tests {
             "- step: 'the response code is ٢{tail}'\n  do: [Show all variables]\n",
         );
 
-        let error =
-            Registry::with_macros(MacroCatalog::load(&[path]).unwrap()).unwrap_err();
+        let error = Registry::with_macros(MacroCatalog::load(&[path]).unwrap()).unwrap_err();
 
         assert!(error.contains("the response code is"), "{error}");
     }
@@ -497,14 +492,11 @@ mod tests {
             } else {
                 format!("I do level {}", index + 1)
             };
-            source.push_str(&format!(
-                "- step: I do level {index}\n  do: [{next}]\n"
-            ));
+            source.push_str(&format!("- step: I do level {index}\n  do: [{next}]\n"));
         }
         let path = fixture("depth", &source);
 
-        let error =
-            Registry::with_macros(MacroCatalog::load(&[path]).unwrap()).unwrap_err();
+        let error = Registry::with_macros(MacroCatalog::load(&[path]).unwrap()).unwrap_err();
 
         assert!(error.contains("16"), "{error}");
     }

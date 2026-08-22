@@ -36,7 +36,7 @@ pub async fn have_where(
 
 pub async fn have_multi(w: &mut World, rows: Option<&Vec<Vec<String>>>) -> Result<(), String> {
     let rows = rows.ok_or("step requires a table")?;
-    // The first row is a header (| table | record |), then (table, kv) pairs follow.
+    // First row is the header (| table | record |), then (table, kv) pairs follow.
     for row in rows.iter().skip(1) {
         let table = row.first().ok_or("empty table row")?;
         let kv = row.get(1).map(String::as_str).unwrap_or("");
@@ -58,7 +58,13 @@ pub async fn delete_all(w: &mut World, table: &str) -> Result<(), String> {
     ops::delete_all(w, table).await
 }
 
-pub async fn extract_from_db(w: &mut World, column: &str, table: &str, where_: &str, var: &str) -> Result<(), String> {
+pub async fn extract_from_db(
+    w: &mut World,
+    column: &str,
+    table: &str,
+    where_: &str,
+    var: &str,
+) -> Result<(), String> {
     ops::extract(w, column, table, where_, var).await
 }
 
