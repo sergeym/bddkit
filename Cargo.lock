@@ -188,6 +188,7 @@ dependencies = [
  "anyhow",
  "axum",
  "clap",
+ "dotenvy",
  "gherkin",
  "regex",
  "reqwest",

@@ -23,17 +23,20 @@ struct Cli {
     /// Path to the YAML config
     #[arg(long)]
     config: PathBuf,
-    /// Run only these directories or .feature files instead of the config's `paths`
+    /// Run only these directories or .feature files instead of `paths` from the config
     paths: Vec<PathBuf>,
     /// Run only scenarios with one of these tags (repeatable)
     #[arg(long = "tag")]
     tags: Vec<String>,
+    /// Override APP_ENV: selects .env.<name> / .env.<name>.local
+    #[arg(long = "env")]
+    env: Option<String>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let cfg = config::load(&cli.config)?;
+    let cfg = config::load(&cli.config, cli.env.as_deref())?;
     let reg = match macros::MacroCatalog::load(&cfg.macro_paths)
         .and_then(steps::Registry::with_macros)
     {
@@ -66,7 +69,7 @@ async fn main() -> Result<()> {
 
     let problems = validate::check(&loaded, &reg, &filter);
     if !problems.is_empty() {
-        eprintln!("error: {} problems, run not started\n", problems.len());
+        eprintln!("error: {} problem(s), run not started\n", problems.len());
         for p in &problems {
             eprintln!("{p}");
         }
@@ -88,7 +91,7 @@ async fn main() -> Result<()> {
     let apis = Arc::new(http::Apis::new(by_name, cfg.resolve_default_api()?)?);
 
     // Pools are created once per run. The runner is sequential;
-    // max_connections is set with headroom for M5.
+    // max_connections is taken with headroom for M5.
     let db = if cfg.resources.db.is_empty() {
         None
     } else {

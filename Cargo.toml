@@ -23,6 +23,7 @@ sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio",
 sxd-document = "0.3.2"
 sxd-xpath = "0.4.2"
 syntect = { version = "5.3.0", default-features = false, features = ["default-fancy"] }
+dotenvy = "0.15"
 
 [dev-dependencies]
 axum = "0.8"

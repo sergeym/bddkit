@@ -2,3 +2,5 @@
 /target
 /.superpowers
 .mcp.json
+.env.local
+.env.*.local
