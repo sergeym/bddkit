@@ -40,6 +40,7 @@ pub enum StepId {
     ExtractFromCookiesGlobal,
     VariableEquals,
     VariableNotEquals,
+    EncryptWithAes,
     // database
     UseConnection,
     DebugOn,
@@ -168,6 +169,10 @@ pub const BUILTIN_STEPS: &[StepDef] = &[
     StepDef {
         id: StepId::VariableEquals,
         pattern: r#"^variable "([^"]*)" should be equal to "([^"]*)"$"#,
+    },
+    StepDef {
+        id: StepId::EncryptWithAes,
+        pattern: r#"^I encrypt "([^"]*)" with AES using key "([^"]*)" as "([^"]*)"$"#,
     },
     StepDef {
         id: StepId::UseApi,
@@ -650,6 +655,7 @@ pub async fn dispatch(w: &mut World, id: StepId, a: &Args) -> Result<(), String>
         StepId::ExtractFromCookiesGlobal => vars::extract_from_cookies(w, a.cap(0), a.cap(1), true),
         StepId::VariableEquals => vars::variable_equals(w, a.cap(0), a.cap(1), false),
         StepId::VariableNotEquals => vars::variable_equals(w, a.cap(0), a.cap(1), true),
+        StepId::EncryptWithAes => vars::encrypt_with_aes(w, a.cap(0), a.cap(1), a.cap(2)),
         StepId::UseApi => api::use_api(w, a.cap(0)),
         StepId::UseConnection => db::use_connection(w, a.cap(0)),
         StepId::DebugOn => db::debug_on(w),
@@ -754,6 +760,7 @@ mod tests {
             r#"extract "jwt" from cookies as "t" global"#,
             r#"variable "a" should be equal to "1""#,
             r#"variable "a" should not be equal to "1""#,
+            r#"I encrypt "555555" with AES using key "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f" as "otp""#,
             r#"I use "main" connection"#,
             r#"I use "billing" api"#,
             "I am in debug mode",
@@ -798,6 +805,26 @@ mod tests {
             .expect("step is declared");
         assert!(target == StepId::UseApi, "the step must resolve to UseApi");
         assert_eq!(caps, vec!["billing".to_string()]);
+    }
+
+    #[test]
+    fn the_aes_encryption_step_resolves_to_its_builtin() {
+        let (target, caps) = reg()
+            .find(
+                r#"I encrypt "555555" with AES using key "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f" as "otp""#,
+            )
+            .expect("pattern is unambiguous")
+            .expect("step is declared");
+
+        assert!(target == StepId::EncryptWithAes);
+        assert_eq!(
+            caps,
+            vec![
+                "555555",
+                "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+                "otp",
+            ]
+        );
     }
 
     #[test]
