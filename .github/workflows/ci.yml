@@ -40,11 +40,14 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: dtolnay/rust-toolchain@stable
+      # The toolchain is pinned on purpose: on a floating `stable` every new clippy
+      # lint reddens PRs that have nothing to do with the change under review.
+      # rustflags is emptied so only the clippy invocation below carries -D warnings.
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
+          toolchain: "1.97.1"
           components: clippy
-
-      - uses: Swatinem/rust-cache@v2
+          rustflags: ""
 
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
