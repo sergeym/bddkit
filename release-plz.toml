@@ -1,0 +1,5 @@
+[workspace]
+# bddkit ships a binary, not a library API, so the cargo-semver-checks pass has
+# nothing to compare and only costs time.
+semver_check = false
+changelog_update = true

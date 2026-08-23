@@ -2,6 +2,23 @@
 name = "bddkit"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.97"
+description = "Gherkin acceptance testing for backend services: one binary drives the HTTP API and the resources behind it"
+license = "Apache-2.0"
+repository = "https://github.com/sergeym/bddkit"
+homepage = "https://github.com/sergeym/bddkit"
+readme = "README.md"
+keywords = ["bdd", "gherkin", "testing", "acceptance", "api"]
+categories = ["development-tools::testing", "command-line-utilities"]
+exclude = [
+    "/.github",
+    "/.idea",
+    "/tests",
+    "/examples",
+    "/docker-compose.yml",
+    "/CLAUDE.md",
+    "/AGENTS.md",
+]
 
 [[bin]]
 name = "bddkit"
@@ -35,3 +52,7 @@ getrandom = "0.3"
 
 [dev-dependencies]
 axum = "0.8"
+
+# Release artifacts ship without debug symbols: smaller downloads, same behavior.
+[profile.release]
+strip = "symbols"

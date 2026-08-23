@@ -1,0 +1,63 @@
+name: CI
+
+# Tests run on pull requests only: `main` is protected and every change reaches
+# it through a PR, so a green PR is the gate. The release workflow deliberately
+# does not re-run them.
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test & clippy
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      # tests/common/db.rs falls back to port 5433 (docker-compose); the service
+      # container above is published on the default port instead.
+      BDDKIT_TEST_DSN: postgres://postgres:postgres@127.0.0.1:5432/postgres
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Unit tests
+        run: cargo test --locked --bin bddkit
+
+      - name: Acceptance tests
+        run: cargo test --locked --test acceptance
+
+      # The apibdd_it fixture schema is shared, so DB tests run single-threaded.
+      - name: Database tests
+        run: cargo test --locked --test db -- --test-threads=1
+
+      - name: Package check
+        run: cargo publish --dry-run --locked
