@@ -20,7 +20,7 @@ fn decode_aes256_key(key_hex: &str) -> Result<[u8; 32], String> {
     }
 
     let mut key = [0; 32];
-    for (byte, pair) in key.iter_mut().zip(key_hex.as_bytes().chunks_exact(2)) {
+    for (byte, pair) in key.iter_mut().zip(key_hex.as_bytes().as_chunks::<2>().0) {
         let high = hex_nibble(pair[0])
             .ok_or_else(|| "AES-256 key must contain only hexadecimal characters".to_string())?;
         let low = hex_nibble(pair[1])
@@ -183,7 +183,9 @@ mod tests {
         );
         let iv: Vec<u8> = iv_hex
             .as_bytes()
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| {
                 u8::from_str_radix(std::str::from_utf8(pair).expect("ASCII hex"), 16)
                     .expect("valid hex")

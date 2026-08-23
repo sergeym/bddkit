@@ -1,0 +1,162 @@
+name: Release
+
+# Every push to `main` runs release-plz twice:
+#   * `release`    — if the version in Cargo.toml is not on crates.io yet, it
+#                    publishes, tags `v<version>` and creates the GitHub Release.
+#                    Normally a no-op; it only fires after the release PR is merged.
+#   * `release-pr` — opens/updates the "chore: release vX.Y.Z" PR that carries the
+#                    version bump and the changelog. Nobody edits Cargo.toml by hand.
+# Binaries are built as a downstream job of `release` instead of a separate
+# tag-triggered workflow: a tag pushed with GITHUB_TOKEN does not trigger workflows.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      rebuild_tag:
+        description: "Rebuild binaries for an existing tag (e.g. v0.1.0). Leave empty for a normal run."
+        required: false
+        default: ""
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: publish & tag
+    if: ${{ inputs.rebuild_tag == '' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write       # push the tag, create the GitHub Release
+      pull-requests: read   # find the release PR the tag comes from
+      id-token: write       # crates.io trusted publishing (OIDC, no registry token)
+    outputs:
+      created: ${{ steps.release-plz.outputs.releases_created }}
+      tag: ${{ steps.release-plz.outputs.releases_created == 'true' && fromJSON(steps.release-plz.outputs.releases)[0].tag || '' }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: "1.97.1"
+          rustflags: ""
+
+      - name: Run release-plz
+        id: release-plz
+        uses: release-plz/action@v0.5
+        with:
+          command: release
+        env:
+          # RELEASE_PLZ_TOKEN (a fine-grained PAT or GitHub App token) makes the
+          # pushed tag and the opened PR trigger other workflows. Without it the
+          # release still happens, but the release PR gets no CI run.
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN || secrets.GITHUB_TOKEN }}
+
+  release-pr:
+    name: release PR
+    if: ${{ inputs.rebuild_tag == '' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: "1.97.1"
+          rustflags: ""
+
+      - name: Run release-plz
+        uses: release-plz/action@v0.5
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN || secrets.GITHUB_TOKEN }}
+
+  binaries:
+    name: ${{ matrix.target }}
+    needs: release
+    if: ${{ always() && (inputs.rebuild_tag != '' || needs.release.outputs.created == 'true') }}
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ubuntu-22.04 keeps the glibc baseline low enough for older distros.
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          - target: x86_64-apple-darwin
+            os: macos-13
+          - target: aarch64-apple-darwin
+            os: macos-14
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+
+    env:
+      TAG: ${{ inputs.rebuild_tag != '' && inputs.rebuild_tag || needs.release.outputs.tag }}
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ env.TAG }}
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: "1.97.1"
+          target: ${{ matrix.target }}
+          cache-key: ${{ matrix.target }}
+          rustflags: ""
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="bddkit-${TAG}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp "target/${{ matrix.target }}/release/bddkit" "dist/$name/"
+          cp README.md LICENSE "dist/$name/"
+          tar -C dist -czf "$name.tar.gz" "$name"
+          if command -v sha256sum >/dev/null; then
+            sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+          else
+            shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+          fi
+          echo "ASSET=$name.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Package
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $name = "bddkit-$env:TAG-${{ matrix.target }}"
+          New-Item -ItemType Directory -Path "dist/$name" -Force | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/bddkit.exe" "dist/$name/"
+          Copy-Item README.md, LICENSE "dist/$name/"
+          Compress-Archive -Path "dist/$name" -DestinationPath "$name.zip"
+          $hash = (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $name.zip" | Out-File -Encoding ascii "$name.zip.sha256"
+          "ASSET=$name.zip" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      - name: Upload to the GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "$TAG" "$ASSET" "$ASSET.sha256" --clobber
