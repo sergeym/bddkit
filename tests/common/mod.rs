@@ -1,5 +1,5 @@
-//! Reference HTTP service for acceptance tests. Spun up in-process
-//! on a random port: docker-compose arrives in M2 together with Postgres.
+//! Reference HTTP service for acceptance tests. Started in-process on a random
+//! port: docker-compose arrives in M2 together with Postgres.
 
 #![allow(dead_code)]
 
@@ -10,9 +10,11 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use num_bigint::BigUint;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
 use tokio::sync::Barrier;
 
 pub async fn spawn() -> String {
@@ -24,7 +26,10 @@ pub async fn spawn() -> String {
         .route("/headers", get(headers))
         .route("/xml", get(xml_doc))
         .route("/html", get(html_doc))
-        .route("/plain", get(plain_text));
+        .route("/plain", get(plain_text))
+        .route("/srp/register", post(srp_register))
+        .route("/srp/step1", post(srp_step1))
+        .route("/srp/step2", post(srp_step2));
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -36,8 +41,8 @@ pub async fn spawn() -> String {
     format!("http://{addr}/")
 }
 
-/// A second reference service. Answers the same `/ping`, but with a different body:
-/// the API-switch test must see that the request landed here specifically.
+/// A second reference service. Answers the same `/ping`, but with a different
+/// body: the API-switch test must see that the request landed here.
 pub async fn spawn_secondary() -> String {
     let app = Router::new().route(
         "/ping",
@@ -55,8 +60,8 @@ pub async fn spawn_secondary() -> String {
 }
 
 /// A stub with a barrier: `/barrier` does not respond until `n` requests are
-/// in flight at once. A sequential runner hangs on it until timeout,
-/// a parallel one gets through — this proves parallelism without comparing run
+/// in flight at once. A sequential runner hangs on it until timeout; a
+/// parallel one passes — this proves parallelism without comparing run
 /// times, i.e. without a flaky test.
 pub async fn spawn_barrier(n: usize) -> String {
     let barrier = Arc::new(Barrier::new(n));
@@ -160,4 +165,140 @@ async fn plain_text() -> impl IntoResponse {
     let mut h = HeaderMap::new();
     h.insert("content-type", "text/plain".parse().expect("header"));
     (StatusCode::OK, h, "hello")
+}
+
+/// RFC 5054 Appendix A, 1024-bit group. Deliberately small: this handshake runs
+/// on every acceptance pass, and 4096-bit exponentiation would dominate the
+/// suite's runtime. The hashing rules under test do not depend on group size.
+const SRP_PRIME_HEX: &str = "\
+EEAF0AB9ADB38DD69C33F80AFA8FC5E86072618775FF3C0B9EA2314C9C256576D674DF7496EA81D3383B4813D692C6E0\
+E0D5D8E250B98BE48E495C1D6089DAD15DC7D7B46154D6B6CE8EF4AD69B15D4982559B297BCF1885C529F566660E57EC\
+68EDBC3C05726CC02FD4CBF4976EAA9AFD5138FE8376435B9FC61D2FC0EB06E3";
+
+/// Fixed server ephemeral, so step2 can recompute B without session state.
+/// A test server gains nothing from being unpredictable.
+const SRP_SERVER_PRIVATE_HEX: &str =
+    "5c2e91a0d7b34f6812ae09d5c73b6e4f2a81d09c5e6b47a3f0982d1c6b5a4e30";
+
+/// identity -> (salt, verifier)
+static SRP_ACCOUNTS: LazyLock<Mutex<HashMap<String, (String, String)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn srp_prime() -> BigUint {
+    BigUint::parse_bytes(SRP_PRIME_HEX.as_bytes(), 16).expect("constant prime parses")
+}
+
+fn srp_generator() -> BigUint {
+    BigUint::from(2u32)
+}
+
+fn srp_hex(value: &BigUint) -> String {
+    format!("{value:x}")
+}
+
+fn srp_hash(text: &str) -> BigUint {
+    BigUint::from_bytes_be(&Sha256::digest(text.as_bytes()))
+}
+
+/// k = H(PAD(N) | PAD(g))
+fn srp_k() -> BigUint {
+    let n = srp_prime();
+    let width = (n.bits() as usize).div_ceil(8);
+    let pad = |value: &BigUint| {
+        let bytes = value.to_bytes_be();
+        let mut out = vec![0u8; width - bytes.len()];
+        out.extend_from_slice(&bytes);
+        out
+    };
+    let mut input = pad(&n);
+    input.extend_from_slice(&pad(&srp_generator()));
+    BigUint::from_bytes_be(&Sha256::digest(&input))
+}
+
+fn srp_b_pub(verifier_hex: &str) -> BigUint {
+    let n = srp_prime();
+    let b_priv =
+        BigUint::parse_bytes(SRP_SERVER_PRIVATE_HEX.as_bytes(), 16).expect("constant parses");
+    let v = BigUint::parse_bytes(verifier_hex.as_bytes(), 16).expect("stored verifier is hex");
+    (srp_k() * v + srp_generator().modpow(&b_priv, &n)) % n
+}
+
+async fn srp_register(body: String) -> impl IntoResponse {
+    let payload: Value = serde_json::from_str(&body).expect("registration body is JSON");
+    let identity = payload["identity"].as_str().expect("identity").to_string();
+    let salt = payload["salt"].as_str().expect("salt").to_string();
+    let verifier = payload["verifier"].as_str().expect("verifier").to_string();
+    SRP_ACCOUNTS
+        .lock()
+        .expect("store is not poisoned")
+        .insert(identity, (salt, verifier));
+    (StatusCode::OK, Json(json!({})))
+}
+
+async fn srp_step1(body: String) -> impl IntoResponse {
+    let payload: Value = serde_json::from_str(&body).expect("step1 body is JSON");
+    let identity = payload["identity"].as_str().expect("identity");
+    let account = SRP_ACCOUNTS
+        .lock()
+        .expect("store is not poisoned")
+        .get(identity)
+        .cloned();
+    match account {
+        Some((salt, verifier)) => (
+            StatusCode::OK,
+            Json(json!({"salt": salt, "b": srp_hex(&srp_b_pub(&verifier))})),
+        ),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "unknown identity"})),
+        ),
+    }
+}
+
+async fn srp_step2(body: String) -> impl IntoResponse {
+    let payload: Value = serde_json::from_str(&body).expect("step2 body is JSON");
+    let identity = payload["identity"].as_str().expect("identity");
+    let a_pub_hex = payload["a"].as_str().expect("a");
+    let m1_hex = payload["m1"].as_str().expect("m1");
+
+    let account = SRP_ACCOUNTS
+        .lock()
+        .expect("store is not poisoned")
+        .get(identity)
+        .cloned();
+    let Some((_, verifier)) = account else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "unknown identity"})),
+        );
+    };
+
+    let n = srp_prime();
+    let b_priv =
+        BigUint::parse_bytes(SRP_SERVER_PRIVATE_HEX.as_bytes(), 16).expect("constant parses");
+    let v = BigUint::parse_bytes(verifier.as_bytes(), 16).expect("stored verifier is hex");
+    let a_pub = BigUint::parse_bytes(a_pub_hex.as_bytes(), 16).expect("client A is hex");
+    let b_pub = srp_b_pub(&verifier);
+    let b_pub_hex = srp_hex(&b_pub);
+
+    // S = (A * v^u)^b mod N — the server's half of the shared secret.
+    let u = srp_hash(&format!("{a_pub_hex}{b_pub_hex}"));
+    let s = (&a_pub * v.modpow(&u, &n)).modpow(&b_priv, &n);
+    let s_hex = srp_hex(&s);
+
+    let expected_m1 = srp_hash(&format!("{a_pub_hex}{b_pub_hex}{s_hex}"));
+    let received_m1 = BigUint::parse_bytes(m1_hex.as_bytes(), 16).expect("client M1 is hex");
+    if expected_m1 != received_m1 {
+        // Loud rejection: without it a broken client would compare two equally
+        // wrong proofs and the scenario would pass.
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "bad client proof"})),
+        );
+    }
+
+    // M1 enters M2 zero-padded to the digest width, and M2 goes on the wire in
+    // the same padded form.
+    let m2 = srp_hash(&format!("{a_pub_hex}{expected_m1:064x}{s_hex}"));
+    (StatusCode::OK, Json(json!({"m2": format!("{m2:064x}")})))
 }

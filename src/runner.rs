@@ -71,7 +71,7 @@ fn execute_step<'a>(
                     return Err("a macro call does not support a docstring".into());
                 }
                 if step.table.is_some() {
-                    return Err("macro calls do not support a table".into());
+                    return Err("a macro call does not support a table".into());
                 }
                 if depth >= 16 {
                     return Err("macro nesting exceeds 16".into());
@@ -104,9 +104,9 @@ fn execute_step<'a>(
     })
 }
 
-/// Everything shared across the whole run, behind one `Arc`: a worker clones one
-/// reference instead of six. The plugin registry (P1) will land here too —
-/// see docs/superpowers/specs/2026-07-30-plugin-system-design.md.
+/// Everything shared across the whole run, behind one `Arc`: a worker clones
+/// a single reference instead of six. This is also where the plugin registry
+/// (P1) will land — see docs/superpowers/specs/2026-07-30-plugin-system-design.md.
 pub struct RunContext {
     pub reg: Registry,
     pub apis: Arc<crate::http::Apis>,
@@ -114,11 +114,15 @@ pub struct RunContext {
     pub filter: crate::feature::TagFilter,
     pub db: Option<Arc<crate::db::Db>>,
     pub default_db: String,
+    pub srp: Option<Arc<crate::srp::SrpParams>>,
     fail_fast: bool,
     stop: std::sync::atomic::AtomicBool,
 }
 
 impl RunContext {
+    // An aggregator for run-wide config: the parameter list grows with each
+    // resource (db, srp, …), a separate builder for a single constructor is overkill.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         reg: Registry,
         apis: Arc<crate::http::Apis>,
@@ -126,6 +130,7 @@ impl RunContext {
         filter: crate::feature::TagFilter,
         db: Option<Arc<crate::db::Db>>,
         default_db: String,
+        srp: Option<Arc<crate::srp::SrpParams>>,
         fail_fast: bool,
     ) -> Self {
         Self {
@@ -135,37 +140,40 @@ impl RunContext {
             filter,
             db,
             default_db,
+            srp,
             fail_fast,
             stop: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
-    /// Arms the stop — only if `--fail-fast` is enabled. Without the flag, a
-    /// file failing stops nothing: the run must go all the way through and show
-    /// every failure at once.
+    /// Arms the stop — only when `--fail-fast` is enabled. Without the flag a
+    /// file's failure stops nothing: the run must reach the end and show all
+    /// failures at once.
     pub fn request_stop(&self) {
         if self.fail_fast {
             self.stop.store(true, Ordering::Relaxed);
         }
     }
 
-    /// The semantics of `--fail-fast` under parallelism is "do not start new work",
-    /// not "abort everything immediately": an in-flight request cannot be recalled, and
-    /// aborting mid-flight would leave the system under test in an unclear state.
+    /// The semantics of `--fail-fast` under parallelism are "don't start new
+    /// work", not "abort everything immediately": an in-flight request is not
+    /// recalled, and cutting it off mid-flight would leave the system under
+    /// test in an unclear state.
     pub fn stopped(&self) -> bool {
         self.stop.load(Ordering::Relaxed)
     }
 }
 
-/// Runs one feature file. The variable frame is shared for the file; HTTP state
-/// is recreated for every scenario; Background reruns before each one.
-/// Arguments are owning (`Arc`), not borrowed: a file is one
-/// `tokio` task, and `tokio::spawn` requires `'static`.
+/// Runs one feature file. The variable frame is shared for the file; HTTP
+/// state is recreated for each scenario; the Background reruns before each
+/// one. Arguments are owned (`Arc`), not borrowed: a file is one `tokio`
+/// task, and `tokio::spawn` requires `'static`.
 pub async fn run_file(lf: Arc<LoadedFeature>, ctx: Arc<RunContext>) -> FileResult {
     let mut world = World::new(
         ctx.apis.clone(),
         ctx.generator.clone(),
         crate::db::DbHandle::new(ctx.db.clone(), ctx.default_db.clone()),
+        ctx.srp.clone(),
     );
     let mut scenarios = Vec::new();
 
@@ -186,8 +194,8 @@ pub async fn run_file(lf: Arc<LoadedFeature>, ctx: Arc<RunContext>) -> FileResul
         })
         .unwrap_or_default();
 
-    // The generator handle is cloned once: inside the loop, `&world.generator` conflicts
-    // with the later `&mut world` at the dispatch call.
+    // The generator handle is cloned once: inside the loop `&world.generator`
+    // would conflict with the later `&mut world` in the dispatch call.
     let generator = world.generator.clone();
 
     for sc in &lf.feature.scenarios {
@@ -227,9 +235,9 @@ fn worker_count(concurrency: usize, units: usize) -> usize {
     concurrency.clamp(1, units.max(1))
 }
 
-/// A panic inside a file does not kill the run: the file runs as a separate task, and its
-/// crash turns into a failure for that file (spec §10). The panic text itself
-/// is printed by the standard panic hook to stderr.
+/// A panic inside a file does not kill the run: the file runs as a separate
+/// task, and its failure turns into that file's failure (spec §10). The
+/// panic text itself is printed to stderr by the standard panic hook.
 fn panicked_file(path: std::path::PathBuf, error: &tokio::task::JoinError) -> FileResult {
     FileResult {
         path,
@@ -241,14 +249,14 @@ fn panicked_file(path: std::path::PathBuf, error: &tokio::task::JoinError) -> Fi
     }
 }
 
-/// A chain is the scheduling unit. Its files run strictly one after another on
-/// one worker; different chains run in parallel. A file without `@serial`
-/// forms a chain of one file, so "parallel by file" is just a special
-/// case of "parallel by chain".
+/// A chain is the unit of scheduling. Its files run strictly one after
+/// another on a single worker; different chains run in parallel. A file
+/// without `@serial` forms a chain of one file, so "parallel by file" is a
+/// special case of "parallel by chain".
 ///
-/// Partitioning instead of a mutex on the group name is a deliberate choice: a worker
-/// stuck on a busy group would sit idle holding a slot, while independent files
-/// wait in the queue.
+/// Partitioning instead of a mutex on the group name is a deliberate choice:
+/// a worker stuck on a busy group would sit idle holding a slot while
+/// independent files wait in the queue.
 #[derive(Debug)]
 pub struct Chain {
     pub priority: i64,
@@ -257,10 +265,10 @@ pub struct Chain {
 
 /// Groups files into chains by the `@serial(name)` tag and orders the queue
 /// by `@priority(N)`: higher goes earlier. Order at equal priority depends
-/// only on paths — `discover` already handed them back sorted — so it is
+/// only on paths — `discover` already returns them sorted — so it is
 /// reproducible from run to run.
 pub fn build_chains(files: Vec<Arc<LoadedFeature>>) -> Result<Vec<Chain>, String> {
-    // (priority, file) — so tags are not re-read on every comparison
+    // (priority, file) — so tags aren't re-read on every comparison
     let mut named: BTreeMap<String, Vec<(i64, Arc<LoadedFeature>)>> = BTreeMap::new();
     let mut chains: Vec<Chain> = Vec::new();
 
@@ -275,8 +283,8 @@ pub fn build_chains(files: Vec<Arc<LoadedFeature>>) -> Result<Vec<Chain>, String
         }
     }
     for (_, mut members) in named {
-        // The sort is stable, and `discover` handed back sorted paths:
-        // at equal priorities, order inside the chain is alphabetical.
+        // The sort is stable, and `discover` returned the paths sorted:
+        // at equal priorities, order within a chain is alphabetical.
         members.sort_by_key(|(p, _)| std::cmp::Reverse(*p));
         let priority = members.iter().map(|(p, _)| *p).max().unwrap_or(0);
         chains.push(Chain {
@@ -285,8 +293,8 @@ pub fn build_chains(files: Vec<Arc<LoadedFeature>>) -> Result<Vec<Chain>, String
         });
     }
     // Priority descending, ties broken by the first file's path. The second
-    // key is required: without it, standalone files and named chains would end up
-    // in container-fill order, i.e. differently from run to run.
+    // key is required: without it, single files and named chains would sort
+    // by container fill order, i.e. differently from run to run.
     chains.sort_by(|a, b| {
         b.priority.cmp(&a.priority).then_with(|| {
             a.files
@@ -298,13 +306,13 @@ pub fn build_chains(files: Vec<Arc<LoadedFeature>>) -> Result<Vec<Chain>, String
     Ok(chains)
 }
 
-/// A worker pool over a shared queue of CHAINS. A chain's files run strictly in
-/// order on one worker; scenarios inside a file are always in order,
-/// because variables live per file (invariant 2).
+/// A worker pool over a shared queue of CHAINS. A chain's files run strictly
+/// in order on one worker; scenarios within a file are always sequential,
+/// because variables live for the file (invariant 2).
 ///
-/// The nested `tokio::spawn` per file is needed for exactly two properties:
-/// it isolates panics (a worker survives a bad file and picks up the next one), and
-/// the immediate `await` keeps tasks from multiplying past the pool size.
+/// The nested `tokio::spawn` per file exists for exactly two properties: it
+/// isolates panics (a worker survives a bad file and picks up the next one),
+/// and the immediate `await` keeps tasks from outrunning the pool size.
 pub async fn run_all(
     chains: Vec<Chain>,
     ctx: Arc<RunContext>,
@@ -342,8 +350,9 @@ pub async fn run_all(
                     if result.failed() > 0 {
                         ctx.request_stop();
                     }
-                    // Printing and collecting under one lock: a file's output lands in
-                    // stdout whole, not interleaved with another worker's dump.
+                    // Printing and collecting under one lock: a file's output
+                    // lands in stdout as a whole, not interleaved with another
+                    // worker's dump.
                     let mut collected = results.lock().expect("results mutex");
                     print!("{}", render_file(&result));
                     collected.push(result);
@@ -352,8 +361,8 @@ pub async fn run_all(
         }));
     }
     for handle in handles {
-        // The worker itself cannot panic — a file crash is already caught above;
-        // but even so it must not bring down the rest of the run.
+        // The worker itself cannot panic — a file's failure is already caught
+        // above; but it still must not bring down the rest of the run.
         let _ = handle.await;
     }
     std::mem::take(&mut *results.lock().expect("results mutex"))
@@ -380,6 +389,7 @@ mod tests {
             crate::feature::TagFilter::new(&[]),
             None,
             String::new(),
+            None,
             false,
         ))
     }
@@ -401,8 +411,8 @@ mod tests {
         run_file(Arc::new(loaded), context(registry)).await
     }
 
-    /// `tokio::spawn` requires `Send + 'static`. This is checked by the compiler:
-    /// if the file-run future ever stops being Send, the test will not compile.
+    /// `tokio::spawn` requires `Send + 'static`. This is checked by the
+    /// compiler: if the file-run future stops being Send, the test won't build.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_file_run_can_be_spawned_onto_another_thread() {
         let loaded = LoadedFeature {
@@ -412,7 +422,7 @@ mod tests {
             )
             .expect("gherkin parses"),
         };
-        let ctx = context(Registry::new().expect("builtin patterns compile"));
+        let ctx = context(Registry::new().expect("built-in patterns compile"));
 
         let result = tokio::spawn(run_file(Arc::new(loaded), ctx))
             .await
@@ -645,7 +655,7 @@ Feature: macro
         #[test]
         fn untagged_files_become_one_chain_each() {
             let chains = build_chains(vec![file("a.feature", ""), file("b.feature", "")])
-                .expect("no tags is not an error");
+                .expect("no tags — no errors");
             assert_eq!(chains.len(), 2);
             assert!(chains.iter().all(|c| c.files.len() == 1));
         }
@@ -658,7 +668,7 @@ Feature: macro
                 file("c.feature", "@serial(x)\n"),
             ])
             .expect("tags are valid");
-            assert_eq!(chains.len(), 2, "two chains: x and standalone b");
+            assert_eq!(chains.len(), 2, "two chains: x and the lone b");
             let x = chains
                 .iter()
                 .find(|c| c.files.len() == 2)
@@ -679,8 +689,8 @@ Feature: macro
 
         #[test]
         fn chain_order_is_reproducible_across_runs() {
-            // Queue order must depend only on paths, not on the order
-            // files happened to land in the HashMap.
+            // Queue order must depend only on paths, not on the order files
+            // landed in a HashMap.
             let build = || {
                 build_chains(vec![
                     file("b.feature", "@serial(zeta)\n"),
@@ -698,7 +708,7 @@ Feature: macro
         #[test]
         fn a_broken_serial_tag_stops_chain_building() {
             let err = build_chains(vec![file("a.feature", "@serial()\n")])
-                .expect_err("empty chain name is an error");
+                .expect_err("an empty chain name is an error");
             assert!(err.contains("a.feature"), "{err}");
         }
 
@@ -756,7 +766,7 @@ Feature: macro
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_panicking_file_becomes_a_failed_result_instead_of_killing_the_run() {
-        let error = tokio::spawn(async { panic!("on purpose") })
+        let error = tokio::spawn(async { panic!("deliberate") })
             .await
             .expect_err("the task must panic");
         let result = panicked_file(PathBuf::from("bad.feature"), &error);

@@ -22,15 +22,19 @@ pub struct Config {
     pub default_api: Option<String>,
     #[serde(default)]
     pub default_db: Option<String>,
+    #[serde(default)]
+    pub default_srp: Option<String>,
 }
 
-/// Resources under test. Not tied to a test suite: any scenario can
-/// reach any of them by name.
+/// Resources under test. Not tied to a test set: any scenario can reach any
+/// of them by name.
 #[derive(Debug, Deserialize)]
 pub struct Resources {
     pub api: BTreeMap<String, ApiConfig>,
     #[serde(default)]
     pub db: BTreeMap<String, Connection>,
+    #[serde(default)]
+    pub srp: BTreeMap<String, SrpConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -49,8 +53,48 @@ pub struct Connection {
     pub search_path: Vec<String>,
 }
 
+/// SRP parameters. Everything except `variant` has a sensible default: the
+/// RFC 5054 4096-bit group, generator 5, SHA-256.
+#[derive(Debug, Deserialize)]
+pub struct SrpConfig {
+    pub variant: String,
+    #[serde(default)]
+    pub prime: Option<String>,
+    #[serde(default)]
+    pub generator: Option<String>,
+    #[serde(default)]
+    pub hash: Option<String>,
+}
+
+impl SrpConfig {
+    pub fn to_params(&self) -> Result<crate::srp::SrpParams> {
+        use crate::srp::{HashAlg, RFC5054_4096_PRIME_HEX, SrpParams, Variant};
+        use num_bigint::BigUint;
+
+        let variant = match self.variant.as_str() {
+            "hex-string" => Variant::HexString,
+            "rfc5054" => Variant::Rfc5054,
+            other => bail!("unknown SRP variant {other:?}: expected hex-string or rfc5054"),
+        };
+        let hash = match self.hash.as_deref().unwrap_or("sha-256") {
+            "sha-1" => HashAlg::Sha1,
+            "sha-256" => HashAlg::Sha256,
+            "sha-512" => HashAlg::Sha512,
+            other => bail!("unknown hash algorithm {other:?}: expected sha-1, sha-256, or sha-512"),
+        };
+        let prime_hex = self.prime.as_deref().unwrap_or(RFC5054_4096_PRIME_HEX);
+        let prime = BigUint::parse_bytes(prime_hex.as_bytes(), 16)
+            .ok_or_else(|| anyhow::anyhow!("prime is not a hexadecimal number"))?;
+        let generator_text = self.generator.as_deref().unwrap_or("5");
+        let generator = BigUint::parse_bytes(generator_text.as_bytes(), 10)
+            .ok_or_else(|| anyhow::anyhow!("generator is not a decimal number: {generator_text:?}"))?;
+
+        Ok(SrpParams { variant, prime, generator, hash })
+    }
+}
+
 impl Config {
-    /// Default API name. `None` if no APIs are declared at all — this is
+    /// The default API name. `None` if no APIs are declared at all — that's
     /// legal, HTTP steps then fail on first use (see `resolve_default_db`).
     pub fn resolve_default_api(&self) -> Result<Option<String>> {
         resolve_default(
@@ -61,8 +105,8 @@ impl Config {
         )
     }
 
-    /// Default connection name. `None` if no DBs are declared at all —
-    /// this is legal, DB steps then fail on first use.
+    /// The default connection name. `None` if no DBs are declared at all —
+    /// that's legal, DB steps then fail on first use.
     pub fn resolve_default_db(&self) -> Result<Option<String>> {
         resolve_default(
             "default_db",
@@ -71,10 +115,22 @@ impl Config {
             self.resources.db.keys(),
         )
     }
+
+    /// The default SRP resource name. `None` if no SRP is declared at all —
+    /// that's legal, SRP steps then fail on first use.
+    pub fn resolve_default_srp(&self) -> Result<Option<String>> {
+        resolve_default(
+            "default_srp",
+            "resources.srp",
+            &self.default_srp,
+            self.resources.srp.keys(),
+        )
+    }
 }
 
 /// Shared logic for api and db: an explicit name is checked for existence,
-/// a single resource becomes the default on its own, several without an explicit one is an error.
+/// a single resource becomes the default on its own, several without an
+/// explicit one is an error.
 fn resolve_default<'a>(
     field: &str,
     section: &str,
@@ -85,7 +141,7 @@ fn resolve_default<'a>(
         if names.clone().any(|n| n == name) {
             return Ok(Some(name.clone()));
         }
-        bail!("{field} refers to an undeclared resource {name:?} (not in {section})");
+        bail!("{field} references an undeclared resource {name:?} (not in {section})");
     }
     let first = names.next();
     match (first, names.next()) {
@@ -97,10 +153,10 @@ fn resolve_default<'a>(
     }
 }
 
-/// Reads one `.env` file into `map`; later keys (from later
-/// layers) overwrite earlier ones. A missing file is not an error:
-/// in the `.env`/`.env.local`/`.env.$APP_ENV`/`.env.$APP_ENV.local` stack,
-/// not all four usually exist.
+/// Reads one `.env` file into `map`; later keys (from later layers)
+/// overwrite earlier ones. A missing file is not an error: in the
+/// `.env`/`.env.local`/`.env.$APP_ENV`/`.env.$APP_ENV.local` stack, usually
+/// not all four exist.
 fn load_env_file(path: &Path, map: &mut BTreeMap<String, String>) -> Result<()> {
     match dotenvy::from_path_iter(path) {
         Ok(iter) => {
@@ -116,9 +172,9 @@ fn load_env_file(path: &Path, map: &mut BTreeMap<String, String>) -> Result<()> 
     }
 }
 
-/// APP_ENV selection priority: an explicit CLI flag > a real process
-/// environment variable > the APP_ENV value from the base `.env` > "dev".
-/// A real APP_ENV takes priority over `.env`, but NOT over the CLI flag —
+/// APP_ENV resolution priority: explicit CLI flag > the process's real
+/// environment variable > APP_ENV value from the base `.env` > "dev".
+/// The real APP_ENV takes priority over `.env`, but NOT over the CLI flag —
 /// `--env` exists specifically to override it.
 fn resolve_app_env(cli_env: Option<&str>, base_map: &BTreeMap<String, String>) -> String {
     cli_env
@@ -128,9 +184,9 @@ fn resolve_app_env(cli_env: Option<&str>, base_map: &BTreeMap<String, String>) -
         .unwrap_or_else(|| "dev".to_string())
 }
 
-/// The full stack of `.env` layers, in ascending priority order: a value
-/// from a later layer overwrites an earlier one. A skipped file simply
-/// adds nothing — see `load_env_file`.
+/// The full `.env` layer stack, in increasing priority order: a value from a
+/// later layer overwrites an earlier one. A skipped file simply contributes
+/// nothing — see `load_env_file`.
 fn load_env_layers(config_dir: &Path, app_env: &str) -> Result<BTreeMap<String, String>> {
     let mut map = BTreeMap::new();
     load_env_file(&config_dir.join(".env"), &mut map)?;
@@ -141,18 +197,17 @@ fn load_env_layers(config_dir: &Path, app_env: &str) -> Result<BTreeMap<String, 
 }
 
 /// Expands environment variables docker-compose style:
-/// `$VAR`/`${VAR}` (error if unset), `${VAR:-def}` (value or
-/// def if unset/empty), `${VAR-def}` (def only if unset),
-/// `${VAR:?msg}`/`${VAR?msg}` (error with message msg, symmetric with `-`),
-/// `${VAR:+alt}`/`${VAR+alt}` (alt if set, symmetric with `-`), `$$`
-/// as a literal `$`. Value lookup: the real process environment variable
-/// first, then `env_map` (the `.env` layers) — the real one always wins.
+/// `$VAR`/`${VAR}` (error if unset), `${VAR:-def}` (value, or def if
+/// unset/empty), `${VAR-def}` (def only if unset), `${VAR:?msg}`/`${VAR?msg}`
+/// (error with message msg, symmetric to `-`), `${VAR:+alt}`/`${VAR+alt}`
+/// (alt if set, symmetric to `-`), `$$` as a literal `$`. Value lookup: the
+/// process's real environment variable, then `env_map` (the `.env` layers) —
+/// the real one always wins.
 ///
 /// ponytail: `arg` (the default/alt/msg text) is taken as-is, without
 /// recursively expanding `${...}` inside it (docker compose can do this,
-/// this project's configs never needed it). Upgrade if
-/// needed by recursively running `expand_env` over the extracted `arg`
-/// before use.
+/// this project's configs never needed it). Upgrade if needed: recursively
+/// run `expand_env` over the extracted `arg` before use.
 fn expand_env(src: &str, env_map: &BTreeMap<String, String>) -> Result<String> {
     let re = regex::Regex::new(
         r"\$\$|\$\{(?P<name>[A-Za-z_][A-Za-z0-9_]*)(?:(?P<op>:-|-|:\?|\?|:\+|\+)(?P<arg>[^}]*))?\}|\$(?P<bare>[A-Za-z_][A-Za-z0-9_]*)",
@@ -222,8 +277,8 @@ fn expand_env(src: &str, env_map: &BTreeMap<String, String>) -> Result<String> {
     Ok(out)
 }
 
-/// Error message for `:?`/`?`: the custom text if given,
-/// otherwise the standard wording (symmetric with the message for a bare `${VAR}`).
+/// Error message for `:?`/`?`: the custom text if given, otherwise the
+/// standard wording (symmetric to the message for bare `${VAR}`).
 fn default_missing_message(name: &str, custom: &str) -> String {
     if custom.is_empty() {
         format!("environment variable {name} is not set but is referenced in the config")
@@ -234,9 +289,9 @@ fn default_missing_message(name: &str, custom: &str) -> String {
 
 pub fn load(path: &Path, cli_env: Option<&str>) -> Result<Config> {
     // path.parent() returns Some("") for a bare file name (not None) —
-    // join() with "" gives a path relative to cwd, which is what works in the common case;
-    // unwrap_or here is a guard for a path with no parent at all (root/prefix),
-    // not the main mechanism.
+    // join() with "" gives a path relative to cwd, which is what the normal
+    // case wants; unwrap_or here guards the case of a path with no parent at
+    // all (root/prefix), not the main mechanism.
     let config_dir = path.parent().unwrap_or_else(|| Path::new("."));
 
     let mut base_map = BTreeMap::new();
@@ -249,15 +304,16 @@ pub fn load(path: &Path, cli_env: Option<&str>) -> Result<Config> {
     let expanded = expand_env(&raw, &env_map)?;
     let cfg: Config = serde_yaml_ng::from_str(&expanded).with_context(|| {
         format!(
-            "failed to parse config {}. Format changed: suites replaced by \
+            "failed to parse config {}. The format changed: suites were replaced by \
              paths + resources, see docs/writing-tests.md",
             path.display()
         )
     })?;
-    // Resolve the defaults right away: an ambiguous config must fail at startup,
-    // not at the first step that reaches for them.
+    // Resolve the defaults right away: an ambiguous config should fail at
+    // startup, not at the first step that reaches for them.
     cfg.resolve_default_api()?;
     cfg.resolve_default_db()?;
+    cfg.resolve_default_srp()?;
     Ok(cfg)
 }
 
@@ -475,8 +531,8 @@ resources:
         #[test]
         fn real_process_env_wins_over_env_map() {
             // PATH is guaranteed to be set in any process — no need to mutate
-            // the real environment to prove priority: if the map won,
-            // the result would match the fake value below.
+            // the real environment to prove precedence: if the map won, the
+            // result would match the fake value below.
             let out = expand("${PATH}", &[("PATH", "definitely_not_the_real_path")])
                 .expect("PATH is set in the real environment");
             assert_ne!(out, "definitely_not_the_real_path");
@@ -526,8 +582,8 @@ resources:
 
         #[test]
         fn no_apis_resolves_to_none() {
-            // Legal: a config may describe only a DB. HTTP steps then
-            // fail on first use — symmetric with resolve_default_db.
+            // Legal: a config may describe only DBs. HTTP steps then fail on
+            // first use — symmetric to resolve_default_db.
             let c = parse("paths: [f]\nresources:\n  api: {}\n").expect("config parses");
             assert_eq!(c.resolve_default_api().expect("no APIs are declared"), None);
         }
@@ -593,7 +649,7 @@ resources:
         fn load_env_file_is_a_noop_when_file_is_missing() {
             let dir = unique_dir("missing_file");
             let mut map = BTreeMap::new();
-            load_env_file(&dir.join(".env"), &mut map).expect("missing file is not an error");
+            load_env_file(&dir.join(".env"), &mut map).expect("a missing file is not an error");
             assert!(map.is_empty());
         }
 
@@ -602,7 +658,7 @@ resources:
             let dir = unique_dir("basic_read");
             std::fs::write(dir.join(".env"), "FOO=bar\nBAZ=qux\n").expect("write .env");
             let mut map = BTreeMap::new();
-            load_env_file(&dir.join(".env"), &mut map).expect(".env is read");
+            load_env_file(&dir.join(".env"), &mut map).expect(".env reads");
             assert_eq!(map.get("FOO"), Some(&"bar".to_string()));
             assert_eq!(map.get("BAZ"), Some(&"qux".to_string()));
         }
@@ -611,9 +667,9 @@ resources:
         fn load_env_file_reports_the_path_on_a_malformed_file() {
             let dir = unique_dir("malformed_file");
             let path = dir.join(".env");
-            std::fs::write(&path, "FOO=\"unterminated\n").expect("write malformed .env");
+            std::fs::write(&path, "FOO=\"unterminated\n").expect("write invalid .env");
             let mut map = BTreeMap::new();
-            let err = load_env_file(&path, &mut map).expect_err("malformed .env is an error");
+            let err = load_env_file(&path, &mut map).expect_err("invalid .env is an error");
             assert!(
                 err.to_string().contains(&path.display().to_string()),
                 "{err}"
@@ -626,8 +682,8 @@ resources:
             let mut map = BTreeMap::new();
             std::fs::write(dir.join("a"), "FOO=from_a\n").expect("write a");
             std::fs::write(dir.join("b"), "FOO=from_b\n").expect("write b");
-            load_env_file(&dir.join("a"), &mut map).expect("a is read");
-            load_env_file(&dir.join("b"), &mut map).expect("b is read");
+            load_env_file(&dir.join("a"), &mut map).expect("a reads");
+            load_env_file(&dir.join("b"), &mut map).expect("b reads");
             assert_eq!(map.get("FOO"), Some(&"from_b".to_string()));
         }
 
@@ -642,7 +698,7 @@ resources:
             std::fs::write(dir.join(".env.dev.local"), "D=dev_local\n")
                 .expect("write .env.dev.local");
 
-            let map = load_env_layers(&dir, "dev").expect("layers are read");
+            let map = load_env_layers(&dir, "dev").expect("layers read");
             assert_eq!(map.get("A"), Some(&"base".to_string()), "only in .env");
             assert_eq!(
                 map.get("B"),
@@ -682,8 +738,8 @@ resources:
         fn resolve_app_env_falls_back_to_base_map_value() {
             let mut base = BTreeMap::new();
             base.insert("APP_ENV".to_string(), "from_dotenv".to_string());
-            // cli_env and the real APP_ENV variable are both absent in this test —
-            // we treat the real APP_ENV as unset in the CI test environment.
+            // cli_env and the real APP_ENV variable are absent in this test —
+            // treat the real APP_ENV as unset in the CI test environment.
             if std::env::var("APP_ENV").is_err() {
                 let resolved = resolve_app_env(None, &base);
                 assert_eq!(resolved, "from_dotenv");
@@ -701,9 +757,10 @@ resources:
 
         #[test]
         fn resolve_app_env_real_env_var_wins_over_base_map() {
-            // The function specifically reads the real APP_ENV — a test variable
-            // will not do, so the test mutates the actual APP_ENV for the duration of its
-            // run and clears it at the end so it does not leak into neighboring tests.
+            // The function specifically reads the real APP_ENV — a test
+            // variable won't do, so this test mutates the real APP_ENV for
+            // the duration of its run and unsets it at the end so it doesn't
+            // leak into neighboring tests.
             unsafe { std::env::set_var("APP_ENV", "from_real_env") };
             let mut base = BTreeMap::new();
             base.insert("APP_ENV".to_string(), "from_base_map".to_string());
@@ -735,6 +792,51 @@ resources:
         .expect("write config");
         let err = load(&path, None).expect_err("default is ambiguous");
         assert!(err.to_string().contains("default_api"), "{err}");
+    }
+
+    #[test]
+    fn srp_defaults_to_the_4096_bit_group_with_sha256() {
+        let cfg = SrpConfig {
+            variant: "hex-string".into(),
+            prime: None,
+            generator: None,
+            hash: None,
+        };
+        let params = cfg.to_params().expect("defaults are valid");
+        assert_eq!(params.variant, crate::srp::Variant::HexString);
+        assert_eq!(params.hash, crate::srp::HashAlg::Sha256);
+        assert_eq!(params.generator, num_bigint::BigUint::from(5u32));
+        assert_eq!(
+            crate::srp::hex(&params.k()),
+            "3509477ea9fca66eadb7cf7b1bd0eb508f54d3989a9c988006a7d0b338374dd2"
+        );
+    }
+
+    #[test]
+    fn srp_accepts_an_explicit_group_and_hash() {
+        let cfg = SrpConfig {
+            variant: "rfc5054".into(),
+            prime: Some(crate::srp::RFC5054_1024_PRIME_HEX.to_string()),
+            generator: Some("2".into()),
+            hash: Some("sha-1".into()),
+        };
+        let params = cfg.to_params().expect("explicit values are valid");
+        assert_eq!(
+            crate::srp::hex(&params.k()),
+            "7556aa045aef2cdd07abaf0f665c3e818913186f"
+        );
+    }
+
+    #[test]
+    fn an_unknown_variant_is_rejected_by_name() {
+        let cfg = SrpConfig {
+            variant: "srp7".into(),
+            prime: None,
+            generator: None,
+            hash: None,
+        };
+        let err = cfg.to_params().unwrap_err().to_string();
+        assert!(err.contains("srp7"), "error must name the value: {err}");
     }
 
     mod load_with_env_files {

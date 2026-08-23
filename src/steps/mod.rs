@@ -2,6 +2,7 @@ pub mod api;
 pub mod assert;
 pub mod db;
 pub mod debug;
+pub mod srp;
 pub mod vars;
 
 use crate::macros::{MacroCatalog, MacroDef};
@@ -62,6 +63,11 @@ pub enum StepId {
     PrintResponseHeaders,
     PrintResponseBody,
     PrintResponseBodyAsPath,
+    // SRP
+    SrpVerifier,
+    SrpVerifierWithSalt,
+    SrpStartLogin,
+    SrpCompleteLogin,
 }
 
 pub struct StepDef {
@@ -254,6 +260,22 @@ pub const BUILTIN_STEPS: &[StepDef] = &[
         id: StepId::PrintResponseBodyAsPath,
         pattern: r#"^Print response body as "([^"]*)"$"#,
     },
+    StepDef {
+        id: StepId::SrpVerifierWithSalt,
+        pattern: r#"^I generate an SRP verifier for "([^"]*)" with password "([^"]*)" and salt "([^"]*)" as "([^"]*)"$"#,
+    },
+    StepDef {
+        id: StepId::SrpVerifier,
+        pattern: r#"^I generate an SRP verifier for "([^"]*)" with password "([^"]*)" as "([^"]*)"$"#,
+    },
+    StepDef {
+        id: StepId::SrpStartLogin,
+        pattern: r#"^I start an SRP login as "([^"]*)"$"#,
+    },
+    StepDef {
+        id: StepId::SrpCompleteLogin,
+        pattern: r#"^I complete SRP login "([^"]*)" for "([^"]*)" with password "([^"]*)" salt "([^"]*)" and "([^"]*)"$"#,
+    },
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -367,7 +389,7 @@ impl Registry {
                     Some((StepTarget::Builtin(_), _)) => {}
                     Some((StepTarget::Macro(_), _)) if step.docstring.is_some() => {
                         return Err(format!(
-                            "calling macro {:?} with a docstring inside macro {:?} from {}:{} is not supported",
+                            "macro call {:?} with a doc string inside macro {:?} from {}:{} is not supported",
                             step.text,
                             definition.step,
                             definition.source.display(),
@@ -650,6 +672,14 @@ pub async fn dispatch(w: &mut World, id: StepId, a: &Args) -> Result<(), String>
         StepId::PrintResponseHeaders => debug::print_headers(w),
         StepId::PrintResponseBody => debug::print_body(w),
         StepId::PrintResponseBodyAsPath => debug::print_body_as(w, a.cap(0)),
+        StepId::SrpVerifier => srp::generate_verifier(w, a.cap(0), a.cap(1), None, a.cap(2)),
+        StepId::SrpVerifierWithSalt => {
+            srp::generate_verifier(w, a.cap(0), a.cap(1), Some(a.cap(2)), a.cap(3))
+        }
+        StepId::SrpStartLogin => srp::start_login(w, a.cap(0)),
+        StepId::SrpCompleteLogin => {
+            srp::complete_login(w, a.cap(0), a.cap(1), a.cap(2), a.cap(3), a.cap(4))
+        }
     }
 }
 
@@ -738,6 +768,10 @@ mod tests {
             "Print response headers",
             "Print response body",
             r#"Print response body as "status""#,
+            r#"I generate an SRP verifier for "u@example.test" with password "p" as "reg""#,
+            r#"I generate an SRP verifier for "u@example.test" with password "p" and salt "ab" as "reg""#,
+            r#"I start an SRP login as "srp""#,
+            r#"I complete SRP login "srp" for "u@example.test" with password "p" salt "ab" and "cd""#,
         ];
         let r = reg();
         for s in samples {
@@ -755,7 +789,7 @@ mod tests {
             .find(r#"I use "billing" api"#)
             .expect("pattern is not ambiguous")
             .expect("step is declared");
-        assert!(target == StepId::UseApi, "step must resolve to UseApi");
+        assert!(target == StepId::UseApi, "the step must resolve to UseApi");
         assert_eq!(caps, vec!["billing".to_string()]);
     }
 

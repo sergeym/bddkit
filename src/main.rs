@@ -6,6 +6,7 @@ mod json;
 mod macros;
 mod report;
 mod runner;
+mod srp;
 mod steps;
 mod unique;
 mod validate;
@@ -23,7 +24,7 @@ struct Cli {
     /// Path to the YAML config
     #[arg(long)]
     config: PathBuf,
-    /// Run only these directories or .feature files instead of `paths` from the config
+    /// Run only these directories or .feature files instead of the config's `paths`
     paths: Vec<PathBuf>,
     /// Run only scenarios with one of these tags (repeatable)
     #[arg(long = "tag")]
@@ -31,14 +32,14 @@ struct Cli {
     /// Override APP_ENV: selects .env.<name> / .env.<name>.local
     #[arg(long = "env")]
     env: Option<String>,
-    /// Stop handing out new files after the first failure
+    /// Stop dispatching new files after the first failure
     #[arg(long = "fail-fast")]
     fail_fast: bool,
 }
 
-/// Anything that fails before the first request must exit with code 2 (invariant 6):
+/// Everything that fails before the first request must exit with code 2 (invariant 6):
 /// config loading, path traversal, building API resources and DB pools, parsing
-/// scheduling tags — this is a "nothing ever ran" failure, and 1 is reserved for
+/// scheduling tags — this is a "nothing ran" failure, while 1 is reserved for
 /// a failed scenario.
 #[tokio::main]
 async fn main() {
@@ -110,7 +111,7 @@ async fn run(cli: Cli) -> Result<i32> {
     let apis = Arc::new(http::Apis::new(by_name, cfg.resolve_default_api()?)?);
 
     // Pools are created once per run. The runner is sequential;
-    // max_connections is taken with headroom for M5.
+    // max_connections is set with headroom for M5.
     let db = if cfg.resources.db.is_empty() {
         None
     } else {
@@ -121,6 +122,10 @@ async fn run(cli: Cli) -> Result<i32> {
         ))
     };
     let default_db = cfg.resolve_default_db()?.unwrap_or_default();
+    let srp = match cfg.resolve_default_srp()? {
+        Some(name) => Some(Arc::new(cfg.resources.srp[&name].to_params()?)),
+        None => None,
+    };
 
     println!("run {}", generator.run_id());
     let ctx = Arc::new(runner::RunContext::new(
@@ -130,6 +135,7 @@ async fn run(cli: Cli) -> Result<i32> {
         filter,
         db,
         default_db,
+        srp,
         cli.fail_fast,
     ));
 
