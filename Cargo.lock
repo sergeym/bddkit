@@ -187,10 +187,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "base64",
  "clap",
  "dotenvy",
  "getrandom 0.3.4",
  "gherkin",
+ "hmac",
  "num-bigint",
  "regex",
  "reqwest",

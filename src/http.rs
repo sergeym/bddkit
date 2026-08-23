@@ -1,8 +1,11 @@
+use crate::hawk;
 use anyhow::{Context, Result};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone)]
 pub struct Exchange {
@@ -60,8 +63,8 @@ impl std::fmt::Display for Exchange {
     }
 }
 
-/// One API resource: its own client (hence its own timeout and connection
-/// pool), base address, and the headers every scenario starts with.
+/// One API resource: its own client (and therefore its own timeout and
+/// connection pool), a base address, and the headers every scenario starts with.
 pub struct ApiResource {
     client: reqwest::Client,
     base_url: url::Url,
@@ -86,18 +89,18 @@ impl ApiResource {
     }
 }
 
-/// All API resources of the run. Built once and shared via `Arc`: the client
-/// holds a connection pool, and recreating it per scenario would waste the pool.
+/// All of the run's API resources. Built once and shared via `Arc`: the
+/// client holds a connection pool, and recreating it per scenario would lose the pool.
 pub struct Apis {
     by_name: HashMap<String, ApiResource>,
     default: String,
 }
 
 impl Apis {
-    /// `default: None` means "no APIs are declared at all" (see `Config::resolve_default_api`) —
-    /// legal for a pure DB config. An explicit `Some(default)` not named among
-    /// the resources is an error: all the rest of the code relies on the default
-    /// being resolvable and does not need to recheck this.
+    /// `default: None` means "no APIs declared at all" (see `Config::resolve_default_api`) —
+    /// legal for a DB-only config. An explicit `Some(default)` not named among
+    /// the resources is an error: the rest of the code relies on the default
+    /// being resolvable and shouldn't have to recheck it.
     pub fn new(by_name: HashMap<String, ApiResource>, default: Option<String>) -> Result<Self> {
         let default = match default {
             Some(d) if by_name.contains_key(&d) => d,
@@ -111,7 +114,7 @@ impl Apis {
         self.by_name.get(name).ok_or_else(|| {
             if self.by_name.is_empty() {
                 "no API resource is declared in the config (resources.api), \
-                 but the scenario refers to an API"
+                 but the scenario reaches for an API"
                     .to_string()
             } else {
                 format!("API resource {name:?} is not declared in resources.api")
@@ -139,6 +142,10 @@ pub struct HttpState {
     body: Option<String>,
     form: Option<Vec<(String, String)>>,
     last: Option<Exchange>,
+    /// One-shot Hawk credentials for the NEXT `send()` call only. Consumed
+    /// (never persisted) inside `send`; cleared by API switch and scenario
+    /// reset via `switch_to`.
+    signer: Option<hawk::Credentials>,
 }
 
 impl HttpState {
@@ -151,13 +158,14 @@ impl HttpState {
             body: None,
             form: None,
             last: None,
+            signer: None,
         };
         state.reset();
         state
     }
 
-    /// Scenario boundary: the current resource, headers, and accumulated request
-    /// return to their initial state, the previous exchange is forgotten.
+    /// Scenario boundary: the current resource, headers, and accumulated
+    /// request return to their initial state; the last exchange is forgotten.
     pub fn reset(&mut self) {
         let default = self.apis.default_name().to_string();
         let headers = self.apis.default_headers();
@@ -165,10 +173,10 @@ impl HttpState {
         self.last = None;
     }
 
-    /// Switch to another API. Headers are replaced with the new resource's
-    /// default headers, and the accumulated request is cleared: authorization set
-    /// for one host must not carry over to another. `last` is preserved — it is
-    /// a response, not a request, and assertions against it must keep working after the switch.
+    /// Switches to another API. Headers are replaced with the new resource's
+    /// default headers, and the accumulated request is cleared: auth set up
+    /// for one host must not leak to another. `last` is preserved — it is a
+    /// response, not a request, and checks against it must still work after switching.
     pub fn use_api(&mut self, name: &str) -> Result<(), String> {
         let headers = self.apis.get(name)?.default_headers.clone();
         self.switch_to(name.to_string(), headers);
@@ -181,6 +189,17 @@ impl HttpState {
         self.query.clear();
         self.body = None;
         self.form = None;
+        self.signer = None;
+    }
+
+    /// Sign the NEXT `send()` call with Hawk, and only that one. `send`
+    /// consumes the signer, so a scenario must call this again before every
+    /// request it wants signed.
+    pub fn sign_next(&mut self, id: &str, key: &str) {
+        self.signer = Some(hawk::Credentials {
+            id: id.to_string(),
+            key: key.to_string(),
+        });
     }
 
     #[allow(dead_code)] // only read by tests, to assert the api switch
@@ -224,9 +243,10 @@ impl HttpState {
     }
 
     pub async fn send(&mut self, path: &str, method: &str) -> Result<(), String> {
-        // Reset the previous exchange BEFORE sending: on a network failure (connection
-        // refused, timeout) a successful exchange is never recorded, and a failure dump
-        // would otherwise show the previous step's stale response as the failed one's.
+        // Clear the last exchange BEFORE sending: on a network failure
+        // (connection refused, timeout) no successful exchange gets recorded,
+        // and a failure dump would otherwise show the previous step's stale
+        // response as the failed one's.
         self.last = None;
         let api = self.apis.get(&self.current)?;
         let mut url = api
@@ -242,24 +262,48 @@ impl HttpState {
         let m = reqwest::Method::from_bytes(method.as_bytes())
             .map_err(|e| format!("invalid HTTP method {method:?}: {e}"))?;
 
-        let mut req = api.client.request(m.clone(), url.clone());
-        for (k, v) in &self.headers {
-            req = req.header(k, v);
-        }
+        // Built before headers: a pending Hawk signer needs the exact bytes
+        // being sent to hash the payload.
         let sent_body = if let Some(form) = &self.form {
-            req = req.form(form);
             Some(
                 form.iter()
                     .map(|(k, v)| format!("{k}={v}"))
                     .collect::<Vec<_>>()
                     .join("&"),
             )
+        } else {
+            self.body.clone()
+        };
+
+        let mut request_headers = self.headers.clone();
+        if let Some(credentials) = self.signer.take() {
+            if self.form.is_some() {
+                return Err(
+                    "Hawk signing supports raw request bodies only, not form bodies".to_string(),
+                );
+            }
+            let nonce = generate_nonce()?;
+            let timestamp = unix_timestamp()?;
+            request_headers = apply_signer(
+                request_headers,
+                &credentials,
+                &url,
+                method,
+                sent_body.as_deref().unwrap_or(""),
+                timestamp,
+                &nonce,
+            )?;
+        }
+
+        let mut req = api.client.request(m.clone(), url.clone());
+        for (k, v) in &request_headers {
+            req = req.header(k, v);
+        }
+        if let Some(form) = &self.form {
+            req = req.form(form);
         } else if let Some(b) = &self.body {
             req = req.body(b.clone());
-            Some(b.clone())
-        } else {
-            None
-        };
+        }
 
         let resp = req
             .send()
@@ -279,7 +323,7 @@ impl HttpState {
         self.last = Some(Exchange {
             method: m.to_string(),
             url: url.to_string(),
-            req_headers: self.headers.clone(),
+            req_headers: request_headers,
             req_body: sent_body,
             status,
             resp_headers,
@@ -287,6 +331,52 @@ impl HttpState {
         });
         Ok(())
     }
+}
+
+/// 16 random bytes, Base64-encoded, as a fresh Hawk nonce.
+fn generate_nonce() -> Result<String, String> {
+    let mut buf = [0u8; 16];
+    getrandom::fill(&mut buf).map_err(|_| "failed to read system entropy".to_string())?;
+    Ok(STANDARD.encode(buf))
+}
+
+/// Current Unix time in seconds, for the Hawk `ts` field.
+fn unix_timestamp() -> Result<u64, String> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .map_err(|_| "system clock is set before the Unix epoch".to_string())
+}
+
+/// Signs a cloned header vector with Hawk: rejects an ambiguous multi-valued
+/// `Content-Type`, then replaces any existing `Authorization` header
+/// (case-insensitively) with the generated one. Takes `headers` by value so
+/// the caller's own vector is never touched — only ever a clone is signed.
+fn apply_signer(
+    mut headers: Vec<(String, String)>,
+    credentials: &hawk::Credentials,
+    url: &url::Url,
+    method: &str,
+    body: &str,
+    timestamp: u64,
+    nonce: &str,
+) -> Result<Vec<(String, String)>, String> {
+    let content_types: Vec<&str> = headers
+        .iter()
+        .filter(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+        .map(|(_, v)| v.as_str())
+        .collect();
+    if content_types.len() > 1 {
+        return Err(
+            "multiple Content-Type headers: Hawk signing needs one unambiguous value".to_string(),
+        );
+    }
+    let content_type = content_types.first().copied();
+
+    let header = hawk::authorization(url, method, body, content_type, credentials, timestamp, nonce)?;
+    headers.retain(|(k, _)| !k.eq_ignore_ascii_case("authorization"));
+    headers.push(("Authorization".to_string(), header));
+    Ok(headers)
 }
 
 #[cfg(test)]
@@ -300,7 +390,7 @@ mod tests {
             name.to_string(),
             ApiResource::new(base, 5, default_headers).expect("valid base_url"),
         );
-        Arc::new(Apis::new(by_name, Some(name.to_string())).expect("default is declared"))
+        Arc::new(Apis::new(by_name, Some(name.to_string())).expect("default declared"))
     }
 
     fn state() -> HttpState {
@@ -327,7 +417,7 @@ mod tests {
             )
             .expect("valid base_url"),
         );
-        Arc::new(Apis::new(by_name, Some("first".to_string())).expect("default is declared"))
+        Arc::new(Apis::new(by_name, Some("first".to_string())).expect("default declared"))
     }
 
     #[test]
@@ -340,7 +430,7 @@ mod tests {
     #[test]
     fn use_api_replaces_headers_with_the_new_resource_defaults() {
         let mut s = HttpState::new(two_apis());
-        s.set_header("authorization", "Bearer first-host-token");
+        s.set_header("authorization", "Bearer first-host");
         s.use_api("second").expect("resource is declared");
         assert_eq!(
             s.headers,
@@ -379,7 +469,7 @@ mod tests {
         s.use_api("second").expect("resource is declared");
         assert!(
             s.last().is_some(),
-            "the previous response must survive the API switch"
+            "the previous response must survive an API switch"
         );
     }
 
@@ -395,6 +485,77 @@ mod tests {
         s.use_api("second").expect("resource is declared");
         s.reset();
         assert_eq!(s.current(), "first");
+    }
+
+    #[test]
+    fn signing_is_cleared_when_an_api_is_switched() {
+        let mut state = HttpState::new(two_apis());
+        state.sign_next("id", "key");
+        state.use_api("second").unwrap();
+        assert!(state.signer.is_none());
+    }
+
+    #[test]
+    fn signing_is_cleared_by_scenario_reset() {
+        let mut state = state();
+        state.sign_next("id", "key");
+        state.reset();
+        assert!(state.signer.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_signed_form_request_fails_before_transport() {
+        let mut state = state();
+        state.set_form(vec![("name".into(), "value".into())]);
+        state.sign_next("id", "key");
+        assert!(state.send("/x", "POST").await.unwrap_err().contains("form"));
+    }
+
+    #[test]
+    fn signer_replaces_only_the_sent_authorization_header() {
+        let mut s = state();
+        s.set_header("authorization", "Bearer stale");
+        let credentials = hawk::Credentials {
+            id: "id".to_string(),
+            key: "key".to_string(),
+        };
+        let url = url::Url::parse("http://localhost/x").unwrap();
+
+        let signed = apply_signer(
+            s.headers.clone(),
+            &credentials,
+            &url,
+            "GET",
+            "",
+            1,
+            "fixed-nonce",
+        )
+        .expect("signing succeeds");
+
+        assert!(
+            !signed
+                .iter()
+                .any(|(k, v)| k.eq_ignore_ascii_case("authorization") && v == "Bearer stale"),
+            "stale Authorization must be replaced, not kept alongside the new one"
+        );
+        assert_eq!(
+            signed
+                .iter()
+                .filter(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+                .count(),
+            1
+        );
+        assert!(
+            signed
+                .iter()
+                .any(|(k, v)| k.eq_ignore_ascii_case("authorization") && v.starts_with("Hawk "))
+        );
+        // The state's own header vector must be untouched — apply_signer only
+        // ever sees a clone.
+        assert_eq!(
+            s.headers,
+            vec![("authorization".to_string(), "Bearer stale".to_string())]
+        );
     }
 
     #[test]
@@ -414,13 +575,13 @@ mod tests {
 
     #[test]
     fn apis_with_no_resources_and_no_default_construct_fine() {
-        // Legal: a pure DB config without a single API resource (see resolve_default_api).
+        // Legal: a DB-only config with not a single API resource (see resolve_default_api).
         assert!(Apis::new(HashMap::new(), None).is_ok());
     }
 
     #[test]
     fn getting_a_resource_when_none_are_declared_names_the_missing_section() {
-        let apis = Apis::new(HashMap::new(), None).expect("empty set is not an error");
+        let apis = Apis::new(HashMap::new(), None).expect("an empty set is not an error");
         let err = match apis.get("stub") {
             Ok(_) => panic!("there are no resources at all"),
             Err(e) => e,
@@ -463,8 +624,8 @@ mod tests {
 
     #[tokio::test]
     async fn failed_send_leaves_no_stale_exchange() {
-        // Port 1 is unreachable: send fails at the transport layer. `last` must stay
-        // None, or a failure dump would show a stale exchange.
+        // Port 1 is unreachable: send fails at the transport layer. `last`
+        // must stay None, or a failure dump would show a stale exchange.
         let mut s = state();
         assert!(s.send("/x", "GET").await.is_err());
         assert!(

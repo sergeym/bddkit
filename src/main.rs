@@ -1,6 +1,7 @@
 mod config;
 mod db;
 mod feature;
+mod hawk;
 mod http;
 mod json;
 mod macros;

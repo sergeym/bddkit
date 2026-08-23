@@ -46,6 +46,13 @@ pub async fn request(w: &mut World, path: &str, method: &str) -> Result<(), Stri
     w.http.send(path, method).await
 }
 
+/// Records Hawk credentials for the next `I request ...` only; it does not
+/// sign anything itself. `HttpState::send` consumes them.
+pub fn sign_next_request_with_hawk(w: &mut World, id: &str, key: &str) -> Result<(), String> {
+    w.http.sign_next(id, key);
+    Ok(())
+}
+
 /// Switches the scenario's current API. An error if the name is not declared.
 pub fn use_api(w: &mut World, name: &str) -> Result<(), String> {
     w.http.use_api(name)

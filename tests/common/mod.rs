@@ -29,7 +29,8 @@ pub async fn spawn() -> String {
         .route("/plain", get(plain_text))
         .route("/srp/register", post(srp_register))
         .route("/srp/step1", post(srp_step1))
-        .route("/srp/step2", post(srp_step2));
+        .route("/srp/step2", post(srp_step2))
+        .route("/hawk", post(hawk));
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -165,6 +166,35 @@ async fn plain_text() -> impl IntoResponse {
     let mut h = HeaderMap::new();
     h.insert("content-type", "text/plain".parse().expect("header"));
     (StatusCode::OK, h, "hello")
+}
+
+/// Checks only the header's shape and the body — it does not verify the Hawk
+/// MAC. Duplicating Hawk cryptography in the stub would test the stub against
+/// itself; the real hashing rules are covered by `src/hawk.rs`'s own tests.
+/// Fixed expectations (`session-1` id, this exact body) match the id/key/body
+/// the acceptance feature sends.
+async fn hawk(h: HeaderMap, body: String) -> impl IntoResponse {
+    let auth = h
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let parsed: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+
+    let well_formed = auth.starts_with(r#"Hawk id="session-1", ts=""#)
+        && auth.contains("nonce=")
+        && auth.contains("hash=")
+        && auth.contains("mac=");
+    if !well_formed || parsed != json!({"code": "555555"}) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "unexpected Hawk header or body", "authorization": auth})),
+        );
+    }
+    (
+        StatusCode::OK,
+        Json(json!({"authorization": auth, "body": parsed})),
+    )
 }
 
 /// RFC 5054 Appendix A, 1024-bit group. Deliberately small: this handshake runs

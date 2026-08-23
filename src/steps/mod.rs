@@ -23,6 +23,7 @@ pub enum StepId {
     RequestPath,
     RequestPathWithMethod,
     UseApi,
+    SignNextRequestWithHawk,
     // response checks
     ResponseCode,
     ResponseBodyContainsJson,
@@ -107,6 +108,10 @@ pub const BUILTIN_STEPS: &[StepDef] = &[
     StepDef {
         id: StepId::RequestPath,
         pattern: r#"^I request "([^"]*)"$"#,
+    },
+    StepDef {
+        id: StepId::SignNextRequestWithHawk,
+        pattern: r#"^I sign the next request with Hawk id "([^"]*)" and key "([^"]*)"$"#,
     },
     StepDef {
         id: StepId::ResponseCode,
@@ -625,6 +630,7 @@ pub async fn dispatch(w: &mut World, id: StepId, a: &Args) -> Result<(), String>
         StepId::SetRequestBody => api::set_body(w, a.docstring.as_ref()),
         StepId::EmptyRequestBody => api::clear_body(w),
         StepId::SetFormParams => api::set_form(w, a.table.as_ref()),
+        StepId::SignNextRequestWithHawk => api::sign_next_request_with_hawk(w, a.cap(0), a.cap(1)),
         StepId::RequestPath => api::request(w, a.cap(0), "GET").await,
         StepId::RequestPathWithMethod => {
             let (p, m) = (a.cap(0).to_string(), a.cap(1).to_string());
@@ -772,6 +778,7 @@ mod tests {
             r#"I generate an SRP verifier for "u@example.test" with password "p" and salt "ab" as "reg""#,
             r#"I start an SRP login as "srp""#,
             r#"I complete SRP login "srp" for "u@example.test" with password "p" salt "ab" and "cd""#,
+            r#"I sign the next request with Hawk id "session-1" and key "abc""#,
         ];
         let r = reg();
         for s in samples {
@@ -791,6 +798,19 @@ mod tests {
             .expect("step is declared");
         assert!(target == StepId::UseApi, "the step must resolve to UseApi");
         assert_eq!(caps, vec!["billing".to_string()]);
+    }
+
+    #[test]
+    fn the_sign_next_request_with_hawk_step_resolves_to_its_builtin() {
+        let (target, caps) = reg()
+            .find(r#"I sign the next request with Hawk id "session-1" and key "abc""#)
+            .expect("pattern is not ambiguous")
+            .expect("step is declared");
+        assert!(
+            target == StepId::SignNextRequestWithHawk,
+            "the step must resolve to SignNextRequestWithHawk"
+        );
+        assert_eq!(caps, vec!["session-1".to_string(), "abc".to_string()]);
     }
 
     #[test]
