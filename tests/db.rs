@@ -1,8 +1,15 @@
 mod common;
 
-use common::db::{combined, run_feature, setup};
+use common::db::{combined, feature_command, run_feature, setup, test_dsn};
+use sqlx::PgPool;
+use std::{
+    io::{BufRead, BufReader, Read},
+    process::{Output, Stdio},
+    time::Duration,
+};
+use tokio::sync::oneshot;
 
-// The fixture schema is shared, so DB tests run on a single thread (--test-threads=1).
+// The fixture schema is shared, so DB tests run in a single thread (--test-threads=1).
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn insert_identity_and_uuid_pk() {
@@ -57,8 +64,8 @@ Feature: insert
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn update_sets_updated_counter() {
     let _g = setup().await;
-    // updated_companies == 1 after UPDATE; the last step looks for the already-deleted
-    // row and must fail (I should not have arrives in Task 10).
+    // updated_companies == 1 after UPDATE; the last step looks for an already
+    // deleted row and must fail (I should not have arrives in Task 10).
     let src = "\
 Feature: mutate
   Scenario: update counter
@@ -87,7 +94,7 @@ Feature: mutate
     When I delete all \"companies\"
     Then I should have \"companies\" with \"slug: one\"
 ";
-    // after DELETE ALL the table is empty — looking for a row must fail.
+    // after DELETE ALL the table is empty — the row lookup must fail.
     let out = run_feature(src, &_g);
     assert!(
         !out.status.success(),
@@ -99,7 +106,7 @@ Feature: mutate
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn should_not_have_passes_for_absent_row() {
     let _g = setup().await;
-    // A row with slug: acme exists; negating the existence of a nonexistent slug passes.
+    // The row with slug: acme exists; negating presence of a nonexistent slug passes.
     let src = "\
 Feature: absence
   Scenario: negative existence ok
@@ -113,7 +120,7 @@ Feature: absence
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn should_not_have_fails_for_present_row() {
     let _g = setup().await;
-    // Negating the existence of an existing row must fail.
+    // Negating presence of an existing row must fail.
     let src = "\
 Feature: absence
   Scenario: negative existence violated
@@ -131,7 +138,7 @@ Feature: absence
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn null_sentinel_insert_matches_is_null() {
     let _g = setup().await;
-    // deleted_at is inserted as <<null>> (SQL NULL); searching by <<null>> goes through IS NULL.
+    // deleted_at is inserted as <<null>> (SQL NULL); a lookup by <<null>> goes through IS NULL.
     let src = "\
 Feature: null
   Scenario: insert null and match is null
@@ -146,7 +153,7 @@ Feature: null
 async fn composite_pk_insert_reads_back_via_last_insert_vars() {
     let _g = setup().await;
     // pair(a, b) is a composite PK; RETURNING stores last_insert_pair_a / _b,
-    // which the row is read back by.
+    // which the row is then read back by.
     let src = "\
 Feature: composite pk
   Scenario: insert and read back pair
@@ -161,7 +168,7 @@ Feature: composite pk
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn delete_all_sets_deleted_counter() {
     let _g = setup().await;
-    // deleted_companies == 2 after DELETE ALL on two rows.
+    // deleted_companies == 2 after DELETE ALL over two rows.
     let src = "\
 Feature: mutate
   Scenario: delete all counter
@@ -177,8 +184,8 @@ Feature: mutate
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn extract_from_table_binds_variable() {
     let _g = setup().await;
-    // extract stores the column value into a variable; the following step checks
-    // it via <<cid>> — the match confirms extract bound the variable.
+    // extract stores the column value in a variable; the next step checks it
+    // via <<cid>> — a match confirms extract bound the variable.
     let src = "\
 Feature: extract
   Scenario: pull id into var
@@ -193,7 +200,7 @@ Feature: extract
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sequence_and_builtin_function() {
     let _g = setup().await;
-    // nextval increases; upper() is a builtin function with a text argument.
+    // nextval increases; upper() is a builtin function taking a text argument.
     let src = "\
 Feature: routines
   Scenario: sequence and function
@@ -205,4 +212,93 @@ Feature: routines
 ";
     let out = run_feature(src, &_g);
     assert!(out.status.success(), "{}", combined(&out));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn eventual_database_assertion_observes_delayed_row() {
+    let _g = setup().await;
+    let without_polling = run_feature(
+        "\
+Feature: eventual database assertion
+  Scenario: row appears asynchronously
+    Then I should have \"companies\" with \"slug: delayed-company\"
+",
+        &_g,
+    );
+    assert!(
+        !without_polling.status.success(),
+        "assertion unexpectedly passed without polling: {}",
+        combined(&without_polling)
+    );
+
+    let delayed = PgPool::connect(&test_dsn())
+        .await
+        .expect("connect delayed inserter");
+    let (first_query, first_query_seen) = oneshot::channel();
+    let inserter = tokio::spawn(async move {
+        first_query_seen
+            .await
+            .expect("first assertion query signal dropped");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        sqlx::query("INSERT INTO apibdd_it.companies (slug) VALUES ('delayed-company')")
+            .execute(&delayed)
+            .await
+            .expect("insert delayed company");
+        delayed.close().await;
+    });
+    let mut child = feature_command(
+        "\
+Feature: eventual database assertion
+  Scenario: row appears asynchronously
+    Given I am in debug mode
+    And I expect the next assertion to pass within \"2\" seconds, checking every \"50\" milliseconds
+    Then I should have \"companies\" with \"slug: delayed-company\"
+",
+    )
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .expect("start bddkit");
+    let stdout = child.stdout.take().expect("capture bddkit stdout");
+    let stderr = child.stderr.take().expect("capture bddkit stderr");
+    let stdout_reader = std::thread::spawn(move || {
+        let mut stdout_bytes = Vec::new();
+        BufReader::new(stdout)
+            .read_to_end(&mut stdout_bytes)
+            .expect("read bddkit stdout");
+        stdout_bytes
+    });
+    let reader = std::thread::spawn(move || {
+        let mut stderr_bytes = Vec::new();
+        let mut first_query = Some(first_query);
+        for line in BufReader::new(stderr).split(b'\n') {
+            let line = line.expect("read bddkit stderr");
+            if line == b"SQL: SELECT 1 FROM companies WHERE slug = $1::text LIMIT 1"
+                && let Some(first_query) = first_query.take()
+            {
+                first_query
+                    .send(())
+                    .expect("delayed inserter stopped early");
+            }
+            stderr_bytes.extend_from_slice(&line);
+            stderr_bytes.push(b'\n');
+        }
+        stderr_bytes
+    });
+    let status = child.wait().expect("wait for bddkit");
+    let with_polling = Output {
+        status,
+        stdout: stdout_reader.join().expect("stdout reader panicked"),
+        stderr: reader.join().expect("stderr reader panicked"),
+    };
+    inserter.await.expect("delayed inserter panicked");
+    let output = combined(&with_polling);
+    assert!(with_polling.status.success(), "{output}");
+    assert!(
+        output
+            .matches("SQL: SELECT 1 FROM companies WHERE slug = $1::text LIMIT 1")
+            .count()
+            >= 2,
+        "polling assertion did not make an initial miss and retry: {output}"
+    );
 }

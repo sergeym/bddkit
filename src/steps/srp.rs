@@ -53,7 +53,8 @@ pub fn complete_login(
     let proof = srp::complete_login(&p, salt, identity, password, &a, b)?;
     w.vars.set(&format!("{prefix}_M1"), proof.m1);
     w.vars.set(&format!("{prefix}_M2"), proof.m2);
-    w.vars.set(&format!("{prefix}_sessionKey"), proof.session_key);
+    w.vars
+        .set(&format!("{prefix}_sessionKey"), proof.session_key);
     Ok(())
 }
 
@@ -67,7 +68,13 @@ mod tests {
         let mut by_name = std::collections::HashMap::new();
         by_name.insert(
             "main".to_string(),
-            crate::http::ApiResource::new("http://x.local", 5, Vec::new()).expect("valid base_url"),
+            crate::http::ApiResource::new(
+                "http://x.local",
+                5,
+                Vec::new(),
+                crate::options::Options::default(),
+            )
+            .expect("valid base_url"),
         );
         let apis = Arc::new(
             crate::http::Apis::new(by_name, Some("main".to_string())).expect("default declared"),
@@ -83,6 +90,7 @@ mod tests {
                 generator: num_bigint::BigUint::from(5u32),
                 hash: HashAlg::Sha256,
             })),
+            crate::options::Options::default(),
         )
     }
 
@@ -130,8 +138,8 @@ mod tests {
         let params = w.srp.clone().expect("params");
         let v = num_bigint::BigUint::parse_bytes(verifier.as_bytes(), 16).expect("valid hex");
         let b_priv = num_bigint::BigUint::from(0x5c2e91a0u32);
-        let b_pub = (params.k() * v + params.generator.modpow(&b_priv, &params.prime))
-            % &params.prime;
+        let b_pub =
+            (params.k() * v + params.generator.modpow(&b_priv, &params.prime)) % &params.prime;
 
         complete_login(
             &mut w,
@@ -153,6 +161,9 @@ mod tests {
         let mut w = world();
         w.srp = None;
         let err = start_login(&mut w, "srp").unwrap_err();
-        assert!(err.contains("resources.srp"), "error must point at config: {err}");
+        assert!(
+            err.contains("resources.srp"),
+            "error must point at config: {err}"
+        );
     }
 }

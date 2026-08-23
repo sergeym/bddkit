@@ -1,12 +1,12 @@
-//! DB integration test helpers: recreating the fixture schema and running
-//! the compiled binary against a temp config (like the M1 acceptance tests).
+//! Helpers for DB integration tests: recreating the fixture schema and running
+//! the compiled binary against a temporary config (like the M1 acceptance tests).
 
 use sqlx::PgPool;
-use std::process::Output;
+use std::process::{Command, Output};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, MutexGuard};
 
-/// Schema `apibdd_it` is shared by all tests; we serialize them so that
+/// The `apibdd_it` schema is shared across all tests; serialize them so that
 /// one test recreating the fixture does not collide with another.
 static DB_LOCK: Mutex<()> = Mutex::const_new(());
 
@@ -52,7 +52,7 @@ pub fn test_dsn() -> String {
         .unwrap_or_else(|_| "postgres://postgres:postgres@127.0.0.1:5433/postgres".to_string())
 }
 
-/// Recreates the `apibdd_it` schema with tables covering every PK case.
+/// Recreates the `apibdd_it` schema with tables for every PK case.
 /// Returns a guard: hold it until the end of the test for isolation.
 pub async fn setup() -> Setup {
     let started = Instant::now();
@@ -99,11 +99,9 @@ pub async fn setup() -> Setup {
     }
 }
 
-/// Writes a temp config (connection `default` → test DB, search_path
-/// `apibdd_it`) and one feature file, runs the binary, returns the output.
-#[track_caller]
-pub fn run_feature(feature_src: &str, setup: &Setup) -> Output {
-    let phase = Instant::now();
+/// Writes a temporary config (connection `default` → test DB, search_path
+/// `apibdd_it`) and returns a configured binary command.
+pub fn feature_command(feature_src: &str) -> Command {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -125,12 +123,19 @@ pub fn run_feature(feature_src: &str, setup: &Setup) -> Output {
     let cfg_path = dir.join("cfg.yaml");
     std::fs::write(&cfg_path, cfg).expect("write config");
 
+    let mut command = Command::new(env!("CARGO_BIN_EXE_bddkit"));
+    command.args(["--config", cfg_path.to_str().expect("path is UTF-8")]);
+    command
+}
+
+/// Runs the feature command and returns the output.
+#[track_caller]
+pub fn run_feature(feature_src: &str, setup: &Setup) -> Output {
+    let phase = Instant::now();
+    let mut command = feature_command(feature_src);
     let files = phase.elapsed();
     let phase = Instant::now();
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_bddkit"))
-        .args(["--config", cfg_path.to_str().expect("path is UTF-8")])
-        .output()
-        .expect("failed to launch bddkit");
+    let out = command.output().expect("failed to run bddkit");
     let timings = TimingRow {
         files,
         bddkit: phase.elapsed(),

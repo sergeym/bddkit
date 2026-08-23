@@ -65,7 +65,8 @@ mod tests {
     fn params() -> SrpParams {
         SrpParams {
             variant: Variant::Rfc5054,
-            prime: BigUint::parse_bytes(RFC5054_1024_PRIME_HEX.as_bytes(), 16).expect("valid prime"),
+            prime: BigUint::parse_bytes(RFC5054_1024_PRIME_HEX.as_bytes(), 16)
+                .expect("valid prime"),
             generator: BigUint::from(2u32),
             hash: HashAlg::Sha1,
         }

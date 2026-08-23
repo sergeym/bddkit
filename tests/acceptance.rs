@@ -1,12 +1,18 @@
 mod common;
 
 use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use axum::routing::post;
+use axum::{Json, Router};
+use serde_json::{Value, json};
 
 /// Gate 1: scenarios against the reference stub must be green.
 // Multi-thread: the stub runs inside `tokio::spawn`, and the test blocks on
-// `Command::output()`. On a single-threaded runtime, blocking prevents polling
-// the server task — the port is bound, but connections are not accepted, and requests hang
-// until timeout. A separate worker thread fixes this.
+// `Command::output()`. On a single-threaded runtime the block prevents polling
+// the server task — the port is bound, but connections aren't accepted, and
+// requests hang until timeout. A separate worker thread fixes this.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn all_feature_files_pass_against_the_stub() {
     let base = common::spawn().await;
@@ -16,18 +22,132 @@ async fn all_feature_files_pass_against_the_stub() {
         .args(["--config", "tests/acceptance.yaml"])
         .env("BDDKIT_STUB_URL", &base)
         .output()
-        .expect("failed to launch bddkit");
+        .expect("failed to run bddkit");
 
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         out.status.success(),
-        "the run must be green\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+        "run must be green\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
     );
     assert!(stdout.contains("failed: 0"), "{stdout}");
 }
 
-/// An unknown step must fail BEFORE the first request, with exit code 2.
+async fn spawn_eventual_post_stub(ready_on: Option<usize>) -> (String, Arc<AtomicUsize>) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let handler_calls = calls.clone();
+    let app = Router::new().route(
+        "/eventual",
+        post(move |body: String| {
+            let handler_calls = handler_calls.clone();
+            async move {
+                let call = handler_calls.fetch_add(1, Ordering::SeqCst) + 1;
+                let state = if ready_on.is_some_and(|ready| call >= ready) {
+                    "ready"
+                } else {
+                    "pending"
+                };
+                let payload: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+                Json(json!({"state": state, "payload": payload}))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind eventual stub");
+    let address = listener.local_addr().expect("eventual stub address");
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serve eventual stub");
+    });
+    (format!("http://{address}/"), calls)
+}
+
+fn write_eventual_post_project(base: &str, name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("bddkit-{name}-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("features")).expect("mkdir");
+    std::fs::write(
+        dir.join("features/eventual.feature"),
+        r#"Feature: eventual POST response
+  Scenario: replay the saved request until the response is ready
+    Given the request body is:
+      """
+      {"request":"saved"}
+      """
+    When I request "/eventual" using HTTP POST
+    And I expect the next assertion to pass within "1" seconds, checking every "25" milliseconds
+    Then the response body equals JSON:
+      """
+      {"state":"ready","payload":{"request":"saved"}}
+      """
+"#,
+    )
+    .expect("write eventual feature");
+    let config = dir.join("cfg.yaml");
+    std::fs::write(
+        &config,
+        format!(
+            "paths: [{}]\nresources:\n  api:\n    stub:\n      base_url: {base}\n",
+            dir.join("features")
+                .display()
+                .to_string()
+                .replace('\\', "/")
+        ),
+    )
+    .expect("write eventual config");
+    config
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn eventual_post_response_replays_the_saved_method_and_body() {
+    let (base, calls) = spawn_eventual_post_stub(Some(2)).await;
+    let config = write_eventual_post_project(&base, "eventual-post-success");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
+        .args(["--config", config.to_str().expect("UTF-8 config path")])
+        .output()
+        .expect("run bddkit");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "eventual POST must pass after one replay\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn eventual_post_timeout_reports_last_mismatch_and_final_exchange() {
+    let (base, _calls) = spawn_eventual_post_stub(None).await;
+    let config = write_eventual_post_project(&base, "eventual-post-timeout");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
+        .args(["--config", config.to_str().expect("UTF-8 config path")])
+        .output()
+        .expect("run bddkit");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "{stdout}");
+    assert!(stdout.contains("did not pass within 1s"), "{stdout}");
+    assert!(
+        stdout.contains("root.state")
+            && stdout.contains("expected: \"ready\"")
+            && stdout.contains("actual:   \"pending\""),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("POST http://")
+            && stdout.contains("/eventual")
+            && stdout.contains("← 200")
+            && stdout.contains(r#"{"request":"saved"}"#)
+            && stdout.contains(r#""state":"pending""#),
+        "{stdout}"
+    );
+}
+
+/// An unknown step must fail BEFORE the first request, with code 2.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unknown_step_fails_before_running() {
     let base = common::spawn().await;
@@ -57,16 +177,16 @@ async fn unknown_step_fails_before_running() {
             dir.join("cfg.yaml").to_str().expect("path is UTF-8"),
         ])
         .output()
-        .expect("failed to launch bddkit");
+        .expect("failed to run bddkit");
 
-    assert_eq!(out.status.code(), Some(2), "exit code of the static check");
+    assert_eq!(out.status.code(), Some(2), "static-check exit code");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("run not started"), "{stderr}");
     assert!(stderr.contains("I refund the order"), "{stderr}");
 }
 
-/// `resources.api` may be absent entirely — legal for a scenario that
-/// makes no HTTP requests (symmetric with `resources.db`).
+/// `resources.api` may be absent entirely — legal for a scenario that makes
+/// no HTTP requests (symmetric to `resources.db`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_config_without_any_api_resource_runs_a_non_http_scenario() {
     let dir = std::env::temp_dir().join("bddkit-no-api-ok-test");
@@ -96,13 +216,13 @@ async fn a_config_without_any_api_resource_runs_a_non_http_scenario() {
             dir.join("cfg.yaml").to_str().expect("path is UTF-8"),
         ])
         .output()
-        .expect("failed to launch bddkit");
+        .expect("failed to run bddkit");
 
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         out.status.success(),
-        "a config without a single API resource must run if the scenario never touches HTTP\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+        "a config with no API resource must still run if the scenario does not touch HTTP\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
     );
 }
 
@@ -138,18 +258,18 @@ async fn a_config_without_any_api_resource_fails_at_first_http_step() {
             dir.join("cfg.yaml").to_str().expect("path is UTF-8"),
         ])
         .output()
-        .expect("failed to launch bddkit");
+        .expect("failed to run bddkit");
 
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         !out.status.success(),
-        "the scenario must fail\n{stdout}"
+        "scenario must fail\n{stdout}"
     );
     assert!(stdout.contains("resources.api"), "{stdout}");
 }
 
-/// Shared helper: writes two tagged feature files and a stub config to a
-/// temp directory, returns the config path.
+/// Shared helper: writes two tagged feature files and a config pointing at
+/// the stub into a temp directory, returns the config path.
 fn write_tagged_project(base: &str, name: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("bddkit-{name}-{}", std::process::id()));
     std::fs::create_dir_all(dir.join("features")).expect("mkdir");
@@ -191,9 +311,9 @@ async fn tag_filter_runs_only_the_matching_scenarios() {
             "smoke",
         ])
         .output()
-        .expect("failed to launch bddkit");
+        .expect("failed to run bddkit");
 
-    // Scenario names are only printed on failure, so selection is visible via
+    // Scenario names print only on failure, so the selection is visible via
     // file names and the final counters.
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
@@ -202,7 +322,7 @@ async fn tag_filter_runs_only_the_matching_scenarios() {
     );
     assert!(
         !stdout.contains("slow.feature"),
-        "the untagged scenario must not run:\n{stdout}"
+        "a scenario without the tag must not run:\n{stdout}"
     );
     assert!(
         stdout.contains("files: 1, scenarios: 1, failed: 0"),
@@ -223,12 +343,12 @@ async fn a_tag_matching_nothing_fails_with_exit_code_two() {
             "absent",
         ])
         .output()
-        .expect("failed to launch bddkit");
+        .expect("failed to run bddkit");
 
     assert_eq!(
         out.status.code(),
         Some(2),
-        "empty selection — not a green run"
+        "an empty selection is not a green run"
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("no scenario selected"), "{stderr}");
@@ -250,10 +370,10 @@ async fn a_positional_path_overrides_the_config_paths() {
             only.to_str().expect("path is UTF-8"),
         ])
         .output()
-        .expect("failed to launch bddkit");
+        .expect("failed to run bddkit");
 
     // The counter is required: without it the assertion would pass even if
-    // the positional path were completely ignored (`paths` from the config yield two files).
+    // the positional path were completely ignored (the config's `paths` gives two files).
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         !stdout.contains("slow.feature"),
@@ -265,7 +385,7 @@ async fn a_positional_path_overrides_the_config_paths() {
     );
 }
 
-/// M4 gate: one scenario talks to two different APIs.
+/// Gate M4: one scenario reaches two different APIs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn one_scenario_can_call_two_different_apis() {
     let primary = common::spawn().await;
@@ -310,16 +430,16 @@ async fn one_scenario_can_call_two_different_apis() {
             dir.join("cfg.yaml").to_str().expect("path is UTF-8"),
         ])
         .output()
-        .expect("failed to launch bddkit");
+        .expect("failed to run bddkit");
 
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         out.status.success(),
-        "the two-API scenario must be green\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+        "a scenario with two APIs must be green\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
     );
-    // Scenario names are only printed on failure, so the counters are the
-    // only proof the gate actually ran something.
+    // Scenario names print only on failure, so the counters are the only
+    // proof that the gate actually ran something.
     assert!(
         stdout.contains("files: 1, scenarios: 1, failed: 0"),
         "exactly one scenario must pass:\n{stdout}"
@@ -362,7 +482,7 @@ fn macro_cycle_fails_validation_with_exit_code_two() {
             dir.join("cfg.yaml").to_str().expect("path is UTF-8"),
         ])
         .output()
-        .expect("failed to launch bddkit");
+        .expect("failed to run bddkit");
 
     assert_eq!(out.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -371,7 +491,7 @@ fn macro_cycle_fails_validation_with_exit_code_two() {
 }
 
 /// `Print response body as "<path>"` cannot work without structure: for
-/// text/plain this is an explicit error, not silent degradation.
+/// text/plain this is an explicit error, not a silent degradation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn print_body_as_path_fails_for_plain_content_type() {
     let base = common::spawn().await;
@@ -400,12 +520,12 @@ async fn print_body_as_path_fails_for_plain_content_type() {
             dir.join("cfg.yaml").to_str().expect("path is UTF-8"),
         ])
         .output()
-        .expect("failed to launch bddkit");
+        .expect("failed to run bddkit");
 
     assert_eq!(
         out.status.code(),
         Some(1),
-        "the scenario must fail, not fail validation"
+        "scenario must fail, not fail validation"
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
@@ -415,9 +535,9 @@ async fn print_body_as_path_fails_for_plain_content_type() {
 }
 
 /// Prepares two feature files that write the same variable with different
-/// values BEFORE the barrier and check it AFTER. The barrier guarantees both
-/// files have written before either reads: a `VarStack` shared across the run
-/// would fail this deterministically, not just sometimes.
+/// values BEFORE the barrier and check it AFTER. The barrier guarantees that
+/// both files have written before either reads: a run-wide `VarStack` would
+/// fail this deterministically, not occasionally.
 fn write_parallel_fixture(
     dir: &std::path::Path,
     base: &str,
@@ -454,7 +574,7 @@ fn write_parallel_fixture(
     cfg
 }
 
-/// M5 gate: two files must run at the same time, or the barrier never opens.
+/// Gate M5: two files must run at the same time, or the barrier never opens.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_feature_files_run_at_the_same_time() {
     let base = common::spawn_barrier(2).await;
@@ -464,7 +584,7 @@ async fn two_feature_files_run_at_the_same_time() {
     let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
         .args(["--config", cfg.to_str().expect("path is UTF-8")])
         .output()
-        .expect("failed to launch bddkit");
+        .expect("failed to run bddkit");
 
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -476,9 +596,9 @@ async fn two_feature_files_run_at_the_same_time() {
     assert!(stdout.contains("files: 2"), "{stdout}");
 }
 
-/// Negative control: with `concurrency: 1` the barrier never opens and the run
-/// fails. Without this test, the previous one could pass green for any reason
-/// other than actual parallelism.
+/// Negative control: with `concurrency: 1` the barrier never opens and the
+/// run fails. Without this test, the first one could pass green for any
+/// reason other than real parallelism.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_single_worker_cannot_release_the_barrier() {
     let base = common::spawn_barrier(2).await;
@@ -488,7 +608,7 @@ async fn a_single_worker_cannot_release_the_barrier() {
     let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
         .args(["--config", cfg.to_str().expect("path is UTF-8")])
         .output()
-        .expect("failed to launch bddkit");
+        .expect("failed to run bddkit");
 
     assert_eq!(
         out.status.code(),
@@ -497,8 +617,8 @@ async fn a_single_worker_cannot_release_the_barrier() {
     );
 }
 
-/// Files in the same chain must never be in flight at the same time —
-/// the two-party barrier never opens, and the run must fail on timeout. This
+/// Files in one chain must never be in flight at the same time — the
+/// two-party barrier never opens, and the run must fail on timeout. This
 /// mirrors the parallelism test: the same pair of files, just tagged.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_files_in_one_serial_chain_never_run_together() {
@@ -509,7 +629,7 @@ async fn two_files_in_one_serial_chain_never_run_together() {
     let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
         .args(["--config", cfg.to_str().expect("path is UTF-8")])
         .output()
-        .expect("failed to launch bddkit");
+        .expect("failed to run bddkit");
 
     assert_eq!(
         out.status.code(),
@@ -519,7 +639,7 @@ async fn two_files_in_one_serial_chain_never_run_together() {
     );
 }
 
-/// A broken scheduling tag — fails before the first request, code 2.
+/// A broken scheduling tag — rejected before the first request, code 2.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_file_in_two_chains_fails_the_startup() {
     let dir = std::env::temp_dir().join(format!("bddkit-two-chains-{}", std::process::id()));
@@ -547,14 +667,14 @@ async fn a_file_in_two_chains_fails_the_startup() {
             dir.join("cfg.yaml").to_str().expect("path is UTF-8"),
         ])
         .output()
-        .expect("failed to launch bddkit");
+        .expect("failed to run bddkit");
 
     assert_eq!(out.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("two chains"), "{stderr}");
 }
 
-/// An unreachable DB — fails BEFORE the first request, so code 2, not 1.
+/// An unreachable DB — rejected BEFORE the first request, so code 2, not 1.
 /// Invariant 6: 1 is reserved for a failed scenario.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unreachable_database_fails_the_startup_with_code_two() {
@@ -584,12 +704,12 @@ async fn an_unreachable_database_fails_the_startup_with_code_two() {
             dir.join("cfg.yaml").to_str().expect("path is UTF-8"),
         ])
         .output()
-        .expect("failed to launch bddkit");
+        .expect("failed to run bddkit");
 
     assert_eq!(
         out.status.code(),
         Some(2),
-        "a failure before the first request must give 2\n{}",
+        "failing before the first request must give 2\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(
@@ -599,13 +719,13 @@ async fn an_unreachable_database_fails_the_startup_with_code_two() {
     );
 }
 
-/// With a single worker, print order is queue order.
-/// This checks that `@priority` sets it: higher runs first.
+/// The order files print in with one worker is the queue order.
+/// Checking that `@priority` sets it: higher goes earlier.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn higher_priority_files_run_first() {
     let dir = std::env::temp_dir().join(format!("bddkit-priority-{}", std::process::id()));
     std::fs::create_dir_all(dir.join("features")).expect("mkdir");
-    // Names are deliberately in alphabetical order, the reverse of what we want:
+    // Names are deliberately alphabetical in the reverse of the desired order:
     // without the tag the queue would be low → mid → high.
     for (name, tag) in [
         ("a_low", "@priority(-1)\n"),
@@ -636,7 +756,7 @@ async fn higher_priority_files_run_first() {
             dir.join("cfg.yaml").to_str().expect("path is UTF-8"),
         ])
         .output()
-        .expect("failed to launch bddkit");
+        .expect("failed to run bddkit");
 
     let stdout = String::from_utf8_lossy(&out.stdout);
     let high = stdout.find("c_high").expect("file c_high in the output");
@@ -644,11 +764,11 @@ async fn higher_priority_files_run_first() {
     let low = stdout.find("a_low").expect("file a_low in the output");
     assert!(
         high < mid && mid < low,
-        "priority queue order:\n{stdout}"
+        "queue order by priority:\n{stdout}"
     );
 }
 
-/// A non-numeric priority — fails before the first request, code 2.
+/// A non-numeric priority — rejected before the first request, code 2.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_non_numeric_priority_fails_the_startup() {
     let dir = std::env::temp_dir().join(format!("bddkit-bad-priority-{}", std::process::id()));
@@ -676,7 +796,7 @@ async fn a_non_numeric_priority_fails_the_startup() {
             dir.join("cfg.yaml").to_str().expect("path is UTF-8"),
         ])
         .output()
-        .expect("failed to launch bddkit");
+        .expect("failed to run bddkit");
 
     assert_eq!(out.status.code(), Some(2));
     assert!(
@@ -686,9 +806,9 @@ async fn a_non_numeric_priority_fails_the_startup() {
     );
 }
 
-/// `--fail-fast` stops handing out NEW work after the first failure.
-/// With a single worker this is deterministic: the first file fails, the
-/// second and third never start at all.
+/// `--fail-fast` stops dispatching NEW work after the first failure.
+/// With one worker this is deterministic: the first file fails, the second
+/// and third never start at all.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fail_fast_stops_starting_new_files() {
     let dir = std::env::temp_dir().join(format!("bddkit-fail-fast-{}", std::process::id()));
@@ -725,13 +845,13 @@ async fn fail_fast_stops_starting_new_files() {
             "--fail-fast",
         ])
         .output()
-        .expect("failed to launch bddkit");
+        .expect("failed to run bddkit");
 
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(out.status.code(), Some(1), "{stdout}");
     assert!(
         stdout.contains("a_broken"),
-        "the failed file must be in the report:\n{stdout}"
+        "the failed file must appear in the report:\n{stdout}"
     );
     assert!(
         !stdout.contains("c_ok"),
@@ -740,9 +860,9 @@ async fn fail_fast_stops_starting_new_files() {
     assert!(stdout.contains("files: 1"), "{stdout}");
 }
 
-/// `--fail-fast` also stops handing out new work WITHIN a chain already
-/// taken: three files sharing one `@serial` name run strictly in order on one
-/// worker, the first fails, the second and third never start at all. This is
+/// `--fail-fast` also stops dispatching new work WITHIN a chain already
+/// picked up: three files sharing one `@serial` name run strictly in order
+/// on one worker, the first fails, the second and third never start. This is
 /// a separate check from `fail_fast_stops_starting_new_files`, which only
 /// exercises the "before the next chain" check — there each file was its own chain.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -783,13 +903,13 @@ async fn fail_fast_stops_a_chain_partway_through() {
             "--fail-fast",
         ])
         .output()
-        .expect("failed to launch bddkit");
+        .expect("failed to run bddkit");
 
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(out.status.code(), Some(1), "{stdout}");
     assert!(
         stdout.contains("a_broken"),
-        "the failed file must be in the report:\n{stdout}"
+        "the failed file must appear in the report:\n{stdout}"
     );
     assert!(
         !stdout.contains("b_ok") && !stdout.contains("c_ok"),
@@ -798,8 +918,8 @@ async fn fail_fast_stops_a_chain_partway_through() {
     assert!(stdout.contains("files: 1"), "{stdout}");
 }
 
-/// Without the flag, one file failing does not block the rest: the run must
-/// reach the end and show all failures at once.
+/// Without the flag, one file's failure does not block the rest: the run
+/// must reach the end and show all failures at once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn without_fail_fast_every_file_still_runs() {
     let dir = std::env::temp_dir().join(format!("bddkit-no-fail-fast-{}", std::process::id()));
@@ -833,7 +953,7 @@ async fn without_fail_fast_every_file_still_runs() {
             dir.join("cfg.yaml").to_str().expect("path is UTF-8"),
         ])
         .output()
-        .expect("failed to launch bddkit");
+        .expect("failed to run bddkit");
 
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(out.status.code(), Some(1), "{stdout}");

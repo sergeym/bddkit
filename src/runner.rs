@@ -1,7 +1,9 @@
 use crate::feature::{ExpandedStep, LoadedFeature, expand_outlines};
+use crate::options::Options;
+use crate::polling::{AttemptError, Polling};
 use crate::report::render_file;
 use crate::report::{FileResult, ScenarioResult};
-use crate::steps::{Args, Registry, StepTarget, dispatch};
+use crate::steps::{Args, OptionsSource, Registry, StepKind, StepTarget, dispatch};
 use crate::unique::Generator;
 use crate::vars::{VarStack, interpolate};
 use crate::world::World;
@@ -62,9 +64,36 @@ fn execute_step<'a>(
             return Err("unknown step".into());
         };
         match target {
-            StepTarget::Builtin(id) => {
+            StepTarget::Builtin { id, kind } => {
                 let args = prepare(step, caps, &world.vars, generator)?;
-                dispatch(world, id, &args).await
+                match kind {
+                    StepKind::Action => {
+                        dispatch(world, id, &args, 0).await.map_err(attempt_message)
+                    }
+                    StepKind::Assertion(source) => {
+                        let Some(layer) = world.take_options() else {
+                            return dispatch(world, id, &args, 0).await.map_err(attempt_message);
+                        };
+                        let base = match source {
+                            OptionsSource::Global => world.options.clone(),
+                            OptionsSource::Http => world.http.options_for_last_response()?.clone(),
+                            OptionsSource::Db => world.db.options()?.clone(),
+                        };
+                        let effective = base.apply(&layer)?;
+                        let mut polling = Polling::new(&step.text, &effective.polling);
+                        let mut attempt = 0;
+                        loop {
+                            match dispatch(world, id, &args, attempt).await {
+                                Ok(()) => return Ok(()),
+                                Err(AttemptError::Fatal(error)) => return Err(error),
+                                Err(AttemptError::NotYet(error)) => {
+                                    polling.after_not_yet(&error).await?;
+                                    attempt += 1;
+                                }
+                            }
+                        }
+                    }
+                }
             }
             StepTarget::Macro(index) => {
                 if step.docstring.is_some() {
@@ -104,6 +133,12 @@ fn execute_step<'a>(
     })
 }
 
+fn attempt_message(error: AttemptError) -> String {
+    match error {
+        AttemptError::NotYet(error) | AttemptError::Fatal(error) => error,
+    }
+}
+
 /// Everything shared across the whole run, behind one `Arc`: a worker clones
 /// a single reference instead of six. This is also where the plugin registry
 /// (P1) will land — see docs/superpowers/specs/2026-07-30-plugin-system-design.md.
@@ -115,6 +150,7 @@ pub struct RunContext {
     pub db: Option<Arc<crate::db::Db>>,
     pub default_db: String,
     pub srp: Option<Arc<crate::srp::SrpParams>>,
+    pub options: Options,
     fail_fast: bool,
     stop: std::sync::atomic::AtomicBool,
 }
@@ -131,6 +167,7 @@ impl RunContext {
         db: Option<Arc<crate::db::Db>>,
         default_db: String,
         srp: Option<Arc<crate::srp::SrpParams>>,
+        options: Options,
         fail_fast: bool,
     ) -> Self {
         Self {
@@ -141,6 +178,7 @@ impl RunContext {
             db,
             default_db,
             srp,
+            options,
             fail_fast,
             stop: std::sync::atomic::AtomicBool::new(false),
         }
@@ -174,6 +212,7 @@ pub async fn run_file(lf: Arc<LoadedFeature>, ctx: Arc<RunContext>) -> FileResul
         ctx.generator.clone(),
         crate::db::DbHandle::new(ctx.db.clone(), ctx.default_db.clone()),
         ctx.srp.clone(),
+        ctx.options.clone(),
     );
     let mut scenarios = Vec::new();
 
@@ -373,25 +412,32 @@ mod tests {
     use super::*;
     use crate::feature::parse_str;
     use crate::macros::MacroCatalog;
+    use crate::unique::UniqueKind;
     use std::path::PathBuf;
 
-    fn context(registry: Registry) -> Arc<RunContext> {
+    fn context_with_generator(registry: Registry, generator: Arc<Generator>) -> Arc<RunContext> {
         let mut by_name = std::collections::HashMap::new();
         by_name.insert(
             "default".to_string(),
-            crate::http::ApiResource::new("http://example.test", 1, Vec::new()).unwrap(),
+            crate::http::ApiResource::new("http://example.test", 1, Vec::new(), Options::default())
+                .unwrap(),
         );
         let apis = Arc::new(crate::http::Apis::new(by_name, Some("default".to_string())).unwrap());
         Arc::new(RunContext::new(
             registry,
             apis,
-            Arc::new(Generator::new()),
+            generator,
             crate::feature::TagFilter::new(&[]),
             None,
             String::new(),
             None,
+            Options::default(),
             false,
         ))
+    }
+
+    fn context(registry: Registry) -> Arc<RunContext> {
+        context_with_generator(registry, Arc::new(Generator::new()))
     }
 
     fn registry(name: &str, source: &str) -> Registry {
@@ -404,11 +450,23 @@ mod tests {
     }
 
     async fn run(feature: &str, registry: Registry) -> FileResult {
+        run_with_generator(feature, registry, Arc::new(Generator::new())).await
+    }
+
+    async fn run_with_generator(
+        feature: &str,
+        registry: Registry,
+        generator: Arc<Generator>,
+    ) -> FileResult {
         let loaded = LoadedFeature {
             path: PathBuf::from("macro.feature"),
             feature: parse_str(feature).unwrap(),
         };
-        run_file(Arc::new(loaded), context(registry)).await
+        run_file(
+            Arc::new(loaded),
+            context_with_generator(registry, generator),
+        )
+        .await
     }
 
     /// `tokio::spawn` requires `Send + 'static`. This is checked by the
@@ -620,6 +678,244 @@ Feature: macro
 
         let failure = result.scenarios[0].failure.as_deref().unwrap();
         assert!(failure.contains("table"), "{failure}");
+    }
+
+    mod eventual {
+        use super::*;
+        use tokio::time::Instant;
+
+        async fn failure(feature: &str, registry: Registry) -> String {
+            run(feature, registry).await.scenarios[0]
+                .failure
+                .clone()
+                .expect("scenario should fail")
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn variable_mismatch_times_out_with_the_last_observation() {
+            let failure = failure(
+                r#"
+Feature: eventual assertion
+  Scenario: timeout
+    Given set variable "state" to "pending"
+    And I expect the next assertion to pass within "1" seconds, checking every "100" milliseconds
+    Then variable "state" should be equal to "ready"
+"#,
+                Registry::new().unwrap(),
+            )
+            .await;
+
+            for expected in [
+                "variable \"state\" should be equal to \"ready\"",
+                "1s",
+                "100ms",
+                "11 attempts",
+                "expected: ready",
+                "actual:   pending",
+            ] {
+                assert!(
+                    failure.contains(expected),
+                    "missing {expected:?} in {failure}"
+                );
+            }
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_retrying_assertion_prepares_unique_capture_once() {
+            let generator = Arc::new(Generator::new());
+            let before = generator.next(UniqueKind::Number).parse::<u64>().unwrap();
+            let result = run_with_generator(
+                r#"
+Feature: eventual assertion
+  Scenario: stable preparation
+    Given set variable "state" to "pending"
+    And I expect the next assertion to pass within "1" seconds, checking every "100" milliseconds
+    Then variable "state" should be equal to "<<unique(number)>>"
+"#,
+                Registry::new().unwrap(),
+                generator.clone(),
+            )
+            .await;
+            let failure = result.scenarios[0].failure.as_deref().unwrap();
+            assert!(failure.contains("11 attempts"), "{failure}");
+            let after = generator.next(UniqueKind::Number).parse::<u64>().unwrap();
+
+            assert_eq!(after - before, 2, "unique() must be evaluated only once");
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_missing_variable_is_fatal_without_waiting() {
+            let started = Instant::now();
+            let failure = failure(
+                r#"
+Feature: eventual assertion
+  Scenario: fatal
+    Given I expect the next assertion to pass within "1" seconds, checking every "100" milliseconds
+    Then variable "missing" should be equal to "ready"
+"#,
+                Registry::new().unwrap(),
+            )
+            .await;
+
+            assert!(
+                failure.contains("missing") && failure.contains("is not set"),
+                "{failure}"
+            );
+            assert_eq!(Instant::now(), started);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_later_modifier_silently_replaces_the_first() {
+            let failure = failure(
+                r#"
+Feature: eventual assertion
+  Scenario: replacement
+    Given set variable "state" to "pending"
+    And I expect the next assertion to pass within "5" seconds
+    And I expect the next assertion to pass within "1" seconds
+    Then variable "state" should be equal to "ready"
+"#,
+                Registry::new().unwrap(),
+            )
+            .await;
+
+            assert!(failure.contains("within 1s"), "{failure}");
+            assert!(!failure.contains("within 5s"), "{failure}");
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_modifier_survives_an_ordinary_action() {
+            let failure = failure(
+                r#"
+Feature: eventual assertion
+  Scenario: action
+    Given I expect the next assertion to pass within "1" seconds
+    And set variable "state" to "pending"
+    Then variable "state" should be equal to "ready"
+"#,
+                Registry::new().unwrap(),
+            )
+            .await;
+
+            assert!(failure.contains("did not pass within 1s"), "{failure}");
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_modifier_survives_a_macro_boundary() {
+            let registry = registry(
+                "eventual",
+                r#"
+- step: I check state through a macro
+  do:
+    - set variable "macro_ran" to "yes"
+    - variable "state" should be equal to "ready"
+"#,
+            );
+            let failure = failure(
+                r#"
+Feature: eventual assertion
+  Scenario: macro
+    Given set variable "state" to "pending"
+    And I expect the next assertion to pass within "1" seconds
+    Then I check state through a macro
+"#,
+                registry,
+            )
+            .await;
+
+            assert!(failure.contains("did not pass within 1s"), "{failure}");
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn the_first_assertion_consumes_the_modifier() {
+            let started = Instant::now();
+            let failure = failure(
+                r#"
+Feature: eventual assertion
+  Scenario: one shot
+    Given set variable "state" to "ready"
+    And I expect the next assertion to pass within "1" seconds
+    Then variable "state" should be equal to "ready"
+    And variable "state" should be equal to "later"
+"#,
+                Registry::new().unwrap(),
+            )
+            .await;
+
+            assert!(!failure.contains("did not pass"), "{failure}");
+            assert!(failure.contains("expected: later"), "{failure}");
+            assert_eq!(Instant::now(), started);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_dangling_modifier_passes_silently() {
+            let result = run(
+                r#"
+Feature: eventual assertion
+  Scenario: dangling
+    Given I expect the next assertion to pass eventually
+"#,
+                Registry::new().unwrap(),
+            )
+            .await;
+
+            assert_eq!(result.failed(), 0, "{:?}", result.scenarios[0].failure);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_scenario_reset_discards_a_dangling_modifier() {
+            let started = Instant::now();
+            let result = run(
+                r#"
+Feature: eventual assertion
+  Scenario: arm
+    Given I expect the next assertion to pass within "1" seconds
+  Scenario: assert
+    Given set variable "state" to "pending"
+    Then variable "state" should be equal to "ready"
+"#,
+                Registry::new().unwrap(),
+            )
+            .await;
+
+            assert!(result.scenarios[0].failure.is_none());
+            let failure = result.scenarios[1]
+                .failure
+                .as_deref()
+                .expect("second scenario fails");
+            assert!(!failure.contains("did not pass"), "{failure}");
+            assert_eq!(Instant::now(), started);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn zero_polling_values_are_rejected_when_arming() {
+            let failure = failure(
+                r#"
+Feature: eventual assertion
+  Scenario: zero
+    Given I expect the next assertion to pass within "0" seconds
+"#,
+                Registry::new().unwrap(),
+            )
+            .await;
+
+            assert!(failure.contains("positive"), "{failure}");
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn an_explicit_interval_cannot_exceed_the_explicit_timeout() {
+            let failure = failure(
+                r#"
+Feature: eventual assertion
+  Scenario: invalid interval
+    Given I expect the next assertion to pass within "1" seconds, checking every "1001" milliseconds
+"#,
+                Registry::new().unwrap(),
+            )
+            .await;
+
+            assert!(failure.contains("must not exceed"), "{failure}");
+        }
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use crate::json::path;
+use crate::polling::{AttemptError, AttemptResult};
 use crate::world::World;
 use aes::cipher::{BlockModeEncrypt, KeyIvInit, block_padding::Pkcs7};
 use base64::Engine;
@@ -100,18 +101,20 @@ pub fn extract_from_cookies(
     Ok(())
 }
 
-pub fn variable_equals(w: &World, name: &str, expected: &str, negate: bool) -> Result<(), String> {
+pub fn variable_equals(w: &World, name: &str, expected: &str, negate: bool) -> AttemptResult {
     let got = w
         .vars
         .get(name)
-        .ok_or_else(|| format!("variable {name:?} is not set"))?;
+        .ok_or_else(|| AttemptError::Fatal(format!("variable {name:?} is not set")))?;
     let equal = got == expected;
     match (equal, negate) {
         (true, false) | (false, true) => Ok(()),
-        (false, false) => Err(format!("    expected: {expected}\n    actual:   {got}")),
-        (true, true) => Err(format!(
+        (false, false) => Err(AttemptError::NotYet(format!(
+            "    expected: {expected}\n    actual:   {got}"
+        ))),
+        (true, true) => Err(AttemptError::NotYet(format!(
             "value must not equal {expected:?}, but it does"
-        )),
+        ))),
     }
 }
 
@@ -127,7 +130,13 @@ mod tests {
     fn world() -> World {
         let resources = HashMap::from([(
             "main".to_string(),
-            crate::http::ApiResource::new("http://x.local", 5, Vec::new()).expect("valid base URL"),
+            crate::http::ApiResource::new(
+                "http://x.local",
+                5,
+                Vec::new(),
+                crate::options::Options::default(),
+            )
+            .expect("valid base URL"),
         )]);
         let apis = Arc::new(
             crate::http::Apis::new(resources, Some("main".to_string()))
@@ -138,6 +147,7 @@ mod tests {
             Arc::new(crate::unique::Generator::new()),
             crate::db::DbHandle::new(None, String::new()),
             None,
+            crate::options::Options::default(),
         )
     }
 

@@ -1,9 +1,10 @@
-use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use url::Url;
 
+#[derive(Clone)]
 pub(crate) struct Credentials {
     pub id: String,
     pub key: String,
@@ -48,7 +49,11 @@ pub(crate) fn authorization(
 
 fn payload_hash(content_type: &str, body: &str) -> String {
     // Lowercase content type per Hawk spec before hashing
-    let payload_str = format!("hawk.1.payload\n{}\n{}\n", content_type.to_lowercase(), body);
+    let payload_str = format!(
+        "hawk.1.payload\n{}\n{}\n",
+        content_type.to_lowercase(),
+        body
+    );
     let mut hasher = Sha256::new();
     hasher.update(payload_str.as_bytes());
     let digest = hasher.finalize();
@@ -62,9 +67,7 @@ fn media_type(value: &str) -> &str {
 
 fn quoted(value: &str) -> String {
     // Escape backslashes and quotes for the header value
-    value
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
+    value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 fn normalized(
@@ -191,6 +194,9 @@ mod tests {
 
         assert_eq!(lowercase_hash, mixedcase_hash);
         assert_eq!(lowercase_hash, uppercase_hash);
-        assert_eq!(lowercase_hash, "Yi9LfIIFRtBEPt74PVmbTF/xVAwPn7ub15ePICfgnuY=");
+        assert_eq!(
+            lowercase_hash,
+            "Yi9LfIIFRtBEPt74PVmbTF/xVAwPn7ub15ePICfgnuY="
+        );
     }
 }

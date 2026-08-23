@@ -5,8 +5,8 @@ use crate::world::World;
 use sqlx::{PgPool, Postgres, Row, postgres::PgArguments, query::Query};
 use std::sync::Arc;
 
-/// Binds text parameters (`Option<String>`). The type drives the `$N::type`
-/// cast in the SQL itself, so everything is bound as text here.
+/// Binds text parameters (`Option<String>`). The type is set via `$N::type`
+/// casts in the SQL itself, so everything here is bound as text.
 pub fn bind_all<'q>(
     mut q: Query<'q, Postgres, PgArguments>,
     binds: &'q [Option<String>],
@@ -17,7 +17,7 @@ pub fn bind_all<'q>(
     q
 }
 
-/// Prints SQL and parameters when debug mode is on (§8).
+/// Prints the SQL and parameters if debug mode is enabled (§8).
 pub fn log_sql(w: &World, sql: &str, binds: &[Option<String>], logs: &[String]) {
     if w.debug {
         eprintln!("SQL: {sql}");
@@ -28,8 +28,8 @@ pub fn log_sql(w: &World, sql: &str, binds: &[Option<String>], logs: &[String]) 
     }
 }
 
-/// Resolves a reference into (pool, schema, parsed reference). The connection comes
-/// from the reference's prefix or the scenario's current connection.
+/// Resolves a reference into (pool, schema, parsed reference). The connection
+/// comes from the reference's prefix or the scenario's current connection.
 pub async fn resolve<'a>(
     w: &'a World,
     raw_table: &str,
@@ -45,7 +45,7 @@ pub async fn resolve<'a>(
     Ok((pool, schema, tref))
 }
 
-/// Inserts one row; stores the PK values in `last_insert_*`.
+/// Inserts one row; stores PK values in `last_insert_*`.
 pub async fn insert(
     w: &mut World,
     raw_table: &str,
@@ -72,7 +72,7 @@ pub async fn insert(
         .fetch_one(pool)
         .await
         .map_err(|e| format!("INSERT into {}: {e}", tref.sql_name()))?;
-    // PK values are returned as text (RETURNING (col)::text) in var_names order.
+    // PK values come back as text (RETURNING (col)::text) in var_names order.
     let mut assignments: Vec<(String, String)> = Vec::new();
     for (i, name) in var_names.iter().enumerate() {
         let v: String = row
@@ -80,7 +80,7 @@ pub async fn insert(
             .map_err(|e| format!("reading RETURNING: {e}"))?;
         assignments.push((name.clone(), v));
     }
-    // The pool borrow has ended — variables can now be written.
+    // The pool borrow has ended — now it's safe to write variables.
     for (name, v) in assignments {
         w.vars.set(&name, v);
     }
@@ -106,7 +106,7 @@ pub async fn update(w: &mut World, raw_table: &str, set: &str, where_: &str) -> 
     Ok(())
 }
 
-/// DELETE FROM ... WHERE ... (an empty WHERE is forbidden by the builder);
+/// DELETE FROM ... WHERE ... (an empty WHERE is rejected by the builder);
 /// stores the number of deleted rows in `deleted_<table>`.
 pub async fn delete(w: &mut World, raw_table: &str, where_: &str) -> Result<(), String> {
     let (pool, schema, tref) = resolve(w, raw_table).await?;
@@ -125,30 +125,23 @@ pub async fn delete(w: &mut World, raw_table: &str, where_: &str) -> Result<(), 
     Ok(())
 }
 
-/// Checks the presence/absence of a row. `negate=false` requires the row to
-/// exist; `negate=true` requires it not to.
-pub async fn assert_exists(
+/// Checks row presence with a fresh query on every assertion attempt.
+pub async fn exists(
     w: &mut World,
     raw_table: &str,
     where_pairs: &[(String, Option<String>)],
-    negate: bool,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let (pool, schema, tref) = resolve(w, raw_table).await?;
     let (sql, binds) = plan::build_exists(&schema, &tref.sql_name(), where_pairs)?;
     log_sql(w, &sql, &binds, &[]);
-    let found = bind_all(sqlx::query(&sql), &binds)
+    Ok(bind_all(sqlx::query(&sql), &binds)
         .fetch_optional(pool)
         .await
-        .map_err(|e| format!("existence check in {}: {e}", tref.sql_name()))?
-        .is_some();
-    match (found, negate) {
-        (true, false) | (false, true) => Ok(()),
-        (false, false) => Err(format!("expected a row in {}, but there is none", tref.sql_name())),
-        (true, true) => Err(format!("a row exists in {}, but it should not", tref.sql_name())),
-    }
+        .map_err(|e| format!("checking presence in {}: {e}", tref.sql_name()))?
+        .is_some())
 }
 
-/// SELECT (column)::text FROM ... WHERE ... LIMIT 1; stores the value into a variable.
+/// SELECT (column)::text FROM ... WHERE ... LIMIT 1; stores the value in a variable.
 pub async fn extract(
     w: &mut World,
     column: &str,
@@ -174,7 +167,7 @@ pub async fn extract(
         .fetch_optional(pool)
         .await
         .map_err(|e| format!("SELECT {}: {e}", tref.sql_name()))?
-        .ok_or_else(|| format!("no row in {} matches the condition", tref.sql_name()))?;
+        .ok_or_else(|| format!("no row in {} matched the condition", tref.sql_name()))?;
     let v: Option<String> = row
         .try_get(0)
         .map_err(|e| format!("reading value: {e}"))?;
@@ -183,7 +176,7 @@ pub async fn extract(
     Ok(())
 }
 
-/// DELETE FROM ... with no WHERE — a full table wipe;
+/// DELETE FROM ... with no WHERE — a full table clear;
 /// stores the number of deleted rows in `deleted_<table>`.
 pub async fn delete_all(w: &mut World, raw_table: &str) -> Result<(), String> {
     let (pool, _schema, tref) = resolve(w, raw_table).await?;
@@ -242,7 +235,7 @@ pub async fn call_procedure(w: &mut World, name: &str, args_str: &str) -> Result
     Ok(())
 }
 
-/// Calls a function `SELECT (name(...))::text` and stores the result into a variable.
+/// Calls a function `SELECT (name(...))::text` and stores the result in a variable.
 pub async fn call_function(
     w: &mut World,
     name: &str,
@@ -268,7 +261,7 @@ pub async fn call_function(
     Ok(())
 }
 
-/// Takes `nextval(seq)` and stores the value into a variable.
+/// Takes `nextval(seq)` and stores the value in a variable.
 pub async fn next_sequence(w: &mut World, seq: &str, var: &str) -> Result<(), String> {
     let sql = "SELECT nextval($1::regclass)::text";
     if w.debug {

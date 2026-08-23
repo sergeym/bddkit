@@ -148,15 +148,16 @@ fn hex_bytes(label: &str, value: &str) -> Result<Vec<u8>, String> {
     if !digits.len().is_multiple_of(2) {
         return Err(bad());
     }
-    Ok(digits.chunks(2).map(|pair| (pair[0] << 4) | pair[1]).collect())
+    Ok(digits
+        .chunks(2)
+        .map(|pair| (pair[0] << 4) | pair[1])
+        .collect())
 }
 
 fn x_of(p: &SrpParams, salt: &str, identity: &str, password: &str) -> Result<BigUint, String> {
     Ok(match p.variant {
         Variant::HexString => hex_string::compute_x(p, salt, identity, password),
-        Variant::Rfc5054 => {
-            rfc5054::compute_x(p, &hex_bytes("salt", salt)?, identity, password)
-        }
+        Variant::Rfc5054 => rfc5054::compute_x(p, &hex_bytes("salt", salt)?, identity, password),
     })
 }
 
@@ -258,7 +259,8 @@ mod tests {
     fn params_4096_sha256() -> SrpParams {
         SrpParams {
             variant: Variant::HexString,
-            prime: BigUint::parse_bytes(RFC5054_4096_PRIME_HEX.as_bytes(), 16).expect("valid prime"),
+            prime: BigUint::parse_bytes(RFC5054_4096_PRIME_HEX.as_bytes(), 16)
+                .expect("valid prime"),
             generator: BigUint::from(5u32),
             hash: HashAlg::Sha256,
         }
@@ -267,7 +269,8 @@ mod tests {
     fn params_1024_sha1() -> SrpParams {
         SrpParams {
             variant: Variant::Rfc5054,
-            prime: BigUint::parse_bytes(RFC5054_1024_PRIME_HEX.as_bytes(), 16).expect("valid prime"),
+            prime: BigUint::parse_bytes(RFC5054_1024_PRIME_HEX.as_bytes(), 16)
+                .expect("valid prime"),
             generator: BigUint::from(2u32),
             hash: HashAlg::Sha1,
         }
@@ -301,7 +304,15 @@ mod tests {
 
     /// Plays the server half of the protocol so the client can be checked
     /// end to end: the server proof only matches if x, u, S, M1 and M2 all do.
-    fn server_proof(p: &SrpParams, salt: &str, identity: &str, password: &str, b_hex: &str, a_pub_hex: &str, m1_hex: &str) -> String {
+    fn server_proof(
+        p: &SrpParams,
+        salt: &str,
+        identity: &str,
+        password: &str,
+        b_hex: &str,
+        a_pub_hex: &str,
+        m1_hex: &str,
+    ) -> String {
         let n = &p.prime;
         let b_priv = BigUint::parse_bytes(b_hex.as_bytes(), 16).expect("valid hex");
         let a_pub = BigUint::parse_bytes(a_pub_hex.as_bytes(), 16).expect("valid hex");
@@ -379,7 +390,15 @@ mod tests {
             .expect("login computes");
         assert_ne!(
             proof.m2,
-            server_proof(&p, &salt, "u@example.test", "right", b_hex, &a_pub_hex, &proof.m1)
+            server_proof(
+                &p,
+                &salt,
+                "u@example.test",
+                "right",
+                b_hex,
+                &a_pub_hex,
+                &proof.m1
+            )
         );
     }
 
@@ -390,10 +409,20 @@ mod tests {
     #[test]
     fn a_leading_zero_byte_in_the_rfc5054_salt_changes_x() {
         let p = params_1024_sha1();
-        let stripped = x_of(&p, "beb25379d1a8581eb5a727673a2441ee", "alice", "password123")
-            .expect("x computes");
-        let with_zero = x_of(&p, "00beb25379d1a8581eb5a727673a2441ee", "alice", "password123")
-            .expect("x computes");
+        let stripped = x_of(
+            &p,
+            "beb25379d1a8581eb5a727673a2441ee",
+            "alice",
+            "password123",
+        )
+        .expect("x computes");
+        let with_zero = x_of(
+            &p,
+            "00beb25379d1a8581eb5a727673a2441ee",
+            "alice",
+            "password123",
+        )
+        .expect("x computes");
         // The stripped form is the RFC 5054 Appendix B vector: proves the decode
         // itself is right, not merely different.
         assert_eq!(hex(&stripped), "94b7555aabe9127cc58ccf4993db6cf84d16c124");
@@ -423,6 +452,9 @@ mod tests {
         let p = params_4096_sha256();
         let (a_hex, _) = start_login(&p);
         let err = complete_login(&p, "aa", "u", "p", &a_hex, "not-hex").unwrap_err();
-        assert!(err.contains("B"), "error must name the offending value: {err}");
+        assert!(
+            err.contains("B"),
+            "error must name the offending value: {err}"
+        );
     }
 }

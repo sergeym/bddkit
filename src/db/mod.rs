@@ -5,22 +5,25 @@ pub mod reference;
 pub mod value;
 
 use crate::config::Connection;
+use crate::options::Options;
 use plan::TableSchema;
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
-/// Pools for every declared connection + an introspection cache. One per run:
-/// a connection belongs to the system under test, not to a test suite.
+/// Pools for all declared connections + the introspection cache. One per run:
+/// a connection belongs to the system under test, not to a test set.
 pub struct Db {
     pools: HashMap<String, PgPool>,
+    options: HashMap<String, Options>,
     cache: Mutex<HashMap<(String, String), Arc<TableSchema>>>,
 }
 
 impl Db {
     pub async fn connect(conns: &BTreeMap<String, Connection>, max: u32) -> Result<Db, String> {
         let mut pools = HashMap::new();
+        let mut options = HashMap::new();
         for (name, c) in conns {
             let opts = PgPoolOptions::new().max_connections(max.max(1));
             let pool = if c.search_path.is_empty() {
@@ -36,9 +39,11 @@ impl Db {
             };
             let pool = pool.map_err(|e| format!("connection {name}: {e}"))?;
             pools.insert(name.clone(), pool);
+            options.insert(name.clone(), c.effective_options.clone());
         }
         Ok(Db {
             pools,
+            options,
             cache: Mutex::new(HashMap::new()),
         })
     }
@@ -49,7 +54,13 @@ impl Db {
             .ok_or_else(|| format!("connection {name:?} is not declared in resources.db"))
     }
 
-    /// Cached introspection. std::Mutex is NEVER held across an await.
+    pub fn options(&self, name: &str) -> Result<&Options, String> {
+        self.options
+            .get(name)
+            .ok_or_else(|| format!("connection {name:?} is not declared in resources.db"))
+    }
+
+    /// Introspection with caching. std::Mutex is NOT held across an await.
     pub async fn schema(&self, conn: &str, sql_name: &str) -> Result<Arc<TableSchema>, String> {
         let key = (conn.to_string(), sql_name.to_string());
         if let Some(s) = self.cache.lock().expect("cache mutex").get(&key) {
@@ -65,8 +76,8 @@ impl Db {
     }
 }
 
-/// A DB handle for one file run: a reference to the shared pools + the current connection.
-/// `current` resets at the scenario boundary (§8: a connection's scope is the scenario).
+/// A DB handle for one file run: a reference to the shared pools + the current
+/// connection. `current` resets at the scenario boundary (§8: connection scope is the scenario).
 pub struct DbHandle {
     db: Option<Arc<Db>>,
     default: String,
@@ -92,7 +103,7 @@ impl DbHandle {
 
     pub fn resources(&self) -> Result<&Arc<Db>, String> {
         self.db.as_ref().ok_or_else(|| {
-            "no DB connection is declared in the config (resources.db)".to_string()
+            "no database connection is declared in the config (resources.db)".to_string()
         })
     }
 
@@ -100,6 +111,10 @@ impl DbHandle {
         self.resources()?.pool(name)?; // check that the connection exists
         self.current = name.to_string();
         Ok(())
+    }
+
+    pub fn options(&self) -> Result<&Options, String> {
+        self.resources()?.options(&self.current)
     }
 }
 
@@ -112,7 +127,7 @@ mod tests {
         let h = DbHandle::new(None, String::new());
         assert!(
             h.resources().is_err(),
-            "resources() without connections is an error"
+            "resources() is an error without connections"
         );
     }
 

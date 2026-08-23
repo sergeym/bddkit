@@ -1,3 +1,4 @@
+use crate::options::{Options, OptionsLayer};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -24,6 +25,10 @@ pub struct Config {
     pub default_db: Option<String>,
     #[serde(default)]
     pub default_srp: Option<String>,
+    #[serde(default)]
+    pub options: OptionsLayer,
+    #[serde(skip)]
+    pub effective_options: Options,
 }
 
 /// Resources under test. Not tied to a test set: any scenario can reach any
@@ -44,6 +49,10 @@ pub struct ApiConfig {
     pub timeout_secs: u64,
     #[serde(default)]
     pub default_headers: BTreeMap<String, String>,
+    #[serde(default)]
+    pub options: OptionsLayer,
+    #[serde(skip)]
+    pub effective_options: Options,
 }
 
 #[derive(Debug, Deserialize)]
@@ -51,6 +60,10 @@ pub struct Connection {
     pub dsn: String,
     #[serde(default)]
     pub search_path: Vec<String>,
+    #[serde(default)]
+    pub options: OptionsLayer,
+    #[serde(skip)]
+    pub effective_options: Options,
 }
 
 /// SRP parameters. Everything except `variant` has a sensible default: the
@@ -64,6 +77,10 @@ pub struct SrpConfig {
     pub generator: Option<String>,
     #[serde(default)]
     pub hash: Option<String>,
+    #[serde(default)]
+    pub options: OptionsLayer,
+    #[serde(skip)]
+    pub effective_options: Options,
 }
 
 impl SrpConfig {
@@ -80,20 +97,51 @@ impl SrpConfig {
             "sha-1" => HashAlg::Sha1,
             "sha-256" => HashAlg::Sha256,
             "sha-512" => HashAlg::Sha512,
-            other => bail!("unknown hash algorithm {other:?}: expected sha-1, sha-256, or sha-512"),
+            other => {
+                bail!("unknown hash algorithm {other:?}: expected sha-1, sha-256, or sha-512")
+            }
         };
         let prime_hex = self.prime.as_deref().unwrap_or(RFC5054_4096_PRIME_HEX);
         let prime = BigUint::parse_bytes(prime_hex.as_bytes(), 16)
             .ok_or_else(|| anyhow::anyhow!("prime is not a hexadecimal number"))?;
         let generator_text = self.generator.as_deref().unwrap_or("5");
-        let generator = BigUint::parse_bytes(generator_text.as_bytes(), 10)
-            .ok_or_else(|| anyhow::anyhow!("generator is not a decimal number: {generator_text:?}"))?;
+        let generator = BigUint::parse_bytes(generator_text.as_bytes(), 10).ok_or_else(|| {
+            anyhow::anyhow!("generator is not a decimal number: {generator_text:?}")
+        })?;
 
-        Ok(SrpParams { variant, prime, generator, hash })
+        Ok(SrpParams {
+            variant,
+            prime,
+            generator,
+            hash,
+        })
     }
 }
 
 impl Config {
+    fn resolve_options(&mut self) -> Result<()> {
+        let global = Options::default()
+            .apply(&self.options)
+            .map_err(anyhow::Error::msg)?;
+        self.effective_options = global.clone();
+        for (name, resource) in &mut self.resources.api {
+            resource.effective_options = global
+                .apply(&resource.options)
+                .map_err(|error| anyhow::anyhow!("resources.api.{name}: {error}"))?;
+        }
+        for (name, resource) in &mut self.resources.db {
+            resource.effective_options = global
+                .apply(&resource.options)
+                .map_err(|error| anyhow::anyhow!("resources.db.{name}: {error}"))?;
+        }
+        for (name, resource) in &mut self.resources.srp {
+            resource.effective_options = global
+                .apply(&resource.options)
+                .map_err(|error| anyhow::anyhow!("resources.srp.{name}: {error}"))?;
+        }
+        Ok(())
+    }
+
     /// The default API name. `None` if no APIs are declared at all — that's
     /// legal, HTTP steps then fail on first use (see `resolve_default_db`).
     pub fn resolve_default_api(&self) -> Result<Option<String>> {
@@ -177,9 +225,17 @@ fn load_env_file(path: &Path, map: &mut BTreeMap<String, String>) -> Result<()> 
 /// The real APP_ENV takes priority over `.env`, but NOT over the CLI flag —
 /// `--env` exists specifically to override it.
 fn resolve_app_env(cli_env: Option<&str>, base_map: &BTreeMap<String, String>) -> String {
+    resolve_app_env_with_process_env(cli_env, std::env::var("APP_ENV").ok(), base_map)
+}
+
+fn resolve_app_env_with_process_env(
+    cli_env: Option<&str>,
+    process_env: Option<String>,
+    base_map: &BTreeMap<String, String>,
+) -> String {
     cli_env
         .map(str::to_string)
-        .or_else(|| std::env::var("APP_ENV").ok())
+        .or(process_env)
         .or_else(|| base_map.get("APP_ENV").cloned())
         .unwrap_or_else(|| "dev".to_string())
 }
@@ -302,7 +358,7 @@ pub fn load(path: &Path, cli_env: Option<&str>) -> Result<Config> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read config {}", path.display()))?;
     let expanded = expand_env(&raw, &env_map)?;
-    let cfg: Config = serde_yaml_ng::from_str(&expanded).with_context(|| {
+    let mut cfg: Config = serde_yaml_ng::from_str(&expanded).with_context(|| {
         format!(
             "failed to parse config {}. The format changed: suites were replaced by \
              paths + resources, see docs/writing-tests.md",
@@ -314,6 +370,7 @@ pub fn load(path: &Path, cli_env: Option<&str>) -> Result<Config> {
     cfg.resolve_default_api()?;
     cfg.resolve_default_db()?;
     cfg.resolve_default_srp()?;
+    cfg.resolve_options()?;
     Ok(cfg)
 }
 
@@ -336,7 +393,9 @@ resources:
 
     fn parse(src: &str) -> Result<Config> {
         let expanded = expand_env(src, &BTreeMap::new())?;
-        Ok(serde_yaml_ng::from_str(&expanded)?)
+        let mut cfg: Config = serde_yaml_ng::from_str(&expanded)?;
+        cfg.resolve_options()?;
+        Ok(cfg)
     }
 
     #[test]
@@ -355,6 +414,57 @@ resources:
     fn timeout_can_be_set_per_api_resource() {
         let c = parse(SAMPLE).expect("config parses");
         assert_eq!(c.resources.api["billing"].timeout_secs, 5);
+    }
+
+    #[test]
+    fn options_cascade_from_root_to_each_resource_kind() {
+        let c = parse(
+            "options:\n  polling:\n    timeout_secs: 10\n    interval_ms: 200\nresources:\n  api:\n    jobs:\n      base_url: http://jobs.local\n      options:\n        polling:\n          timeout_secs: 30\n  db:\n    reporting:\n      dsn: postgres://u:p@db/reporting\n      options:\n        polling:\n          interval_ms: 500\n  srp:\n    login:\n      variant: hex-string\n      options: {}\npaths: [features]\n",
+        )
+        .expect("config parses");
+        assert_eq!(
+            c.effective_options.polling.timeout,
+            std::time::Duration::from_secs(10)
+        );
+        assert_eq!(
+            c.resources.api["jobs"].effective_options.polling.timeout,
+            std::time::Duration::from_secs(30)
+        );
+        assert_eq!(
+            c.resources.api["jobs"].effective_options.polling.interval,
+            std::time::Duration::from_millis(200)
+        );
+        assert_eq!(
+            c.resources.db["reporting"]
+                .effective_options
+                .polling
+                .timeout,
+            std::time::Duration::from_secs(10)
+        );
+        assert_eq!(
+            c.resources.db["reporting"]
+                .effective_options
+                .polling
+                .interval,
+            std::time::Duration::from_millis(500)
+        );
+        assert_eq!(
+            c.resources.srp["login"].effective_options.polling.timeout,
+            std::time::Duration::from_secs(10)
+        );
+        assert_eq!(
+            c.resources.srp["login"].effective_options.polling.interval,
+            std::time::Duration::from_millis(200)
+        );
+    }
+
+    #[test]
+    fn unknown_nested_option_fields_are_rejected() {
+        let error = parse(
+            "paths: [features]\nresources:\n  api:\n    jobs:\n      base_url: http://jobs.local\n      options:\n        polling:\n          retries: 3\n",
+        )
+        .expect_err("unknown option field is rejected");
+        assert!(error.to_string().contains("retries"), "{error}");
     }
 
     #[test]
@@ -730,7 +840,11 @@ resources:
         #[test]
         fn resolve_app_env_cli_flag_wins() {
             let base = BTreeMap::new();
-            let resolved = resolve_app_env(Some("from_cli"), &base);
+            let resolved = resolve_app_env_with_process_env(
+                Some("from_cli"),
+                Some("from_process".into()),
+                &base,
+            );
             assert_eq!(resolved, "from_cli");
         }
 
@@ -738,34 +852,23 @@ resources:
         fn resolve_app_env_falls_back_to_base_map_value() {
             let mut base = BTreeMap::new();
             base.insert("APP_ENV".to_string(), "from_dotenv".to_string());
-            // cli_env and the real APP_ENV variable are absent in this test —
-            // treat the real APP_ENV as unset in the CI test environment.
-            if std::env::var("APP_ENV").is_err() {
-                let resolved = resolve_app_env(None, &base);
-                assert_eq!(resolved, "from_dotenv");
-            }
+            let resolved = resolve_app_env_with_process_env(None, None, &base);
+            assert_eq!(resolved, "from_dotenv");
         }
 
         #[test]
         fn resolve_app_env_defaults_to_dev() {
             let base = BTreeMap::new();
-            if std::env::var("APP_ENV").is_err() {
-                let resolved = resolve_app_env(None, &base);
-                assert_eq!(resolved, "dev");
-            }
+            let resolved = resolve_app_env_with_process_env(None, None, &base);
+            assert_eq!(resolved, "dev");
         }
 
         #[test]
         fn resolve_app_env_real_env_var_wins_over_base_map() {
-            // The function specifically reads the real APP_ENV — a test
-            // variable won't do, so this test mutates the real APP_ENV for
-            // the duration of its run and unsets it at the end so it doesn't
-            // leak into neighboring tests.
-            unsafe { std::env::set_var("APP_ENV", "from_real_env") };
             let mut base = BTreeMap::new();
             base.insert("APP_ENV".to_string(), "from_base_map".to_string());
-            let resolved = resolve_app_env(None, &base);
-            unsafe { std::env::remove_var("APP_ENV") };
+            let resolved =
+                resolve_app_env_with_process_env(None, Some("from_real_env".into()), &base);
             assert_eq!(resolved, "from_real_env");
         }
     }
@@ -801,6 +904,8 @@ resources:
             prime: None,
             generator: None,
             hash: None,
+            options: OptionsLayer::default(),
+            effective_options: Options::default(),
         };
         let params = cfg.to_params().expect("defaults are valid");
         assert_eq!(params.variant, crate::srp::Variant::HexString);
@@ -819,6 +924,8 @@ resources:
             prime: Some(crate::srp::RFC5054_1024_PRIME_HEX.to_string()),
             generator: Some("2".into()),
             hash: Some("sha-1".into()),
+            options: OptionsLayer::default(),
+            effective_options: Options::default(),
         };
         let params = cfg.to_params().expect("explicit values are valid");
         assert_eq!(
@@ -834,6 +941,8 @@ resources:
             prime: None,
             generator: None,
             hash: None,
+            options: OptionsLayer::default(),
+            effective_options: Options::default(),
         };
         let err = cfg.to_params().unwrap_err().to_string();
         assert!(err.contains("srp7"), "error must name the value: {err}");

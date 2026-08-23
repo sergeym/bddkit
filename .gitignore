@@ -1,6 +1,7 @@
 /.idea/
 /target
 /.superpowers
+/.worktrees/
 .mcp.json
 .env.local
 .env.*.local

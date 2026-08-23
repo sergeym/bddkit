@@ -1,4 +1,5 @@
 use crate::hawk;
+use crate::options::Options;
 use anyhow::{Context, Result};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -16,6 +17,32 @@ pub struct Exchange {
     pub status: u16,
     pub resp_headers: Vec<(String, String)>,
     pub body: String,
+}
+
+#[derive(Clone)]
+struct RequestRecipe {
+    api: String,
+    method: String,
+    path: String,
+    query: Vec<(String, String)>,
+    headers: Vec<(String, String)>,
+    body: Option<String>,
+    form: Option<Vec<(String, String)>>,
+    signer: Option<hawk::Credentials>,
+}
+
+#[derive(Debug)]
+pub enum ReplayError {
+    NotYet(String),
+    Fatal(String),
+}
+
+impl ReplayError {
+    fn into_message(self) -> String {
+        match self {
+            Self::NotYet(message) | Self::Fatal(message) => message,
+        }
+    }
 }
 
 impl Exchange {
@@ -69,6 +96,7 @@ pub struct ApiResource {
     client: reqwest::Client,
     base_url: url::Url,
     default_headers: Vec<(String, String)>,
+    options: Options,
 }
 
 impl ApiResource {
@@ -76,6 +104,7 @@ impl ApiResource {
         base_url: &str,
         timeout_secs: u64,
         default_headers: Vec<(String, String)>,
+        options: Options,
     ) -> Result<Self> {
         Ok(Self {
             client: reqwest::Client::builder()
@@ -85,6 +114,7 @@ impl ApiResource {
             base_url: url::Url::parse(base_url)
                 .with_context(|| format!("invalid base_url {base_url:?}"))?,
             default_headers,
+            options,
         })
     }
 }
@@ -122,6 +152,10 @@ impl Apis {
         })
     }
 
+    pub fn options(&self, name: &str) -> Result<&Options, String> {
+        Ok(&self.get(name)?.options)
+    }
+
     pub fn default_name(&self) -> &str {
         &self.default
     }
@@ -142,9 +176,10 @@ pub struct HttpState {
     body: Option<String>,
     form: Option<Vec<(String, String)>>,
     last: Option<Exchange>,
-    /// One-shot Hawk credentials for the NEXT `send()` call only. Consumed
-    /// (never persisted) inside `send`; cleared by API switch and scenario
-    /// reset via `switch_to`.
+    replay: Option<RequestRecipe>,
+    /// Hawk credentials for the next initial send. A successful request keeps
+    /// them in its replay recipe; API switches and scenario resets clear only
+    /// credentials that have not been sent yet.
     signer: Option<hawk::Credentials>,
 }
 
@@ -158,25 +193,26 @@ impl HttpState {
             body: None,
             form: None,
             last: None,
+            replay: None,
             signer: None,
         };
         state.reset();
         state
     }
 
-    /// Scenario boundary: the current resource, headers, and accumulated
-    /// request return to their initial state; the last exchange is forgotten.
+    /// Restore the default request builder at a scenario boundary and forget
+    /// both the previous exchange and its replay recipe.
     pub fn reset(&mut self) {
         let default = self.apis.default_name().to_string();
         let headers = self.apis.default_headers();
         self.switch_to(default, headers);
         self.last = None;
+        self.replay = None;
     }
 
-    /// Switches to another API. Headers are replaced with the new resource's
-    /// default headers, and the accumulated request is cleared: auth set up
-    /// for one host must not leak to another. `last` is preserved — it is a
-    /// response, not a request, and checks against it must still work after switching.
+    /// Switch the pending request builder to another API. The previous exchange
+    /// and recipe stay attached to their originating API so an assertion can
+    /// still inspect or replay them after the switch.
     pub fn use_api(&mut self, name: &str) -> Result<(), String> {
         let headers = self.apis.get(name)?.default_headers.clone();
         self.switch_to(name.to_string(), headers);
@@ -192,9 +228,8 @@ impl HttpState {
         self.signer = None;
     }
 
-    /// Sign the NEXT `send()` call with Hawk, and only that one. `send`
-    /// consumes the signer, so a scenario must call this again before every
-    /// request it wants signed.
+    /// Sign the next distinct `send()` with Hawk. Automatic replays retain the
+    /// credentials and sign afresh; a later explicit send needs another call.
     pub fn sign_next(&mut self, id: &str, key: &str) {
         self.signer = Some(hawk::Credentials {
             id: id.to_string(),
@@ -242,29 +277,65 @@ impl HttpState {
         self.last.as_ref()
     }
 
+    pub fn options_for_last_response(&self) -> Result<&Options, String> {
+        let recipe = self.replay.as_ref().ok_or("request has not been sent")?;
+        self.apis.options(&recipe.api)
+    }
+
     pub async fn send(&mut self, path: &str, method: &str) -> Result<(), String> {
-        // Clear the last exchange BEFORE sending: on a network failure
-        // (connection refused, timeout) no successful exchange gets recorded,
-        // and a failure dump would otherwise show the previous step's stale
-        // response as the failed one's.
+        // Clear both before constructing the new request so no failure can
+        // expose an exchange or recipe belonging to an earlier explicit send.
         self.last = None;
-        let api = self.apis.get(&self.current)?;
+        self.replay = None;
+        let recipe = RequestRecipe {
+            api: self.current.clone(),
+            method: method.to_string(),
+            path: path.to_string(),
+            query: self.query.clone(),
+            headers: self.headers.clone(),
+            body: self.body.clone(),
+            form: self.form.clone(),
+            signer: self.signer.take(),
+        };
+        let exchange = self
+            .execute(&recipe)
+            .await
+            .map_err(ReplayError::into_message)?;
+        self.last = Some(exchange);
+        self.replay = Some(recipe);
+        Ok(())
+    }
+
+    pub async fn replay_last(&mut self) -> Result<(), ReplayError> {
+        self.last = None;
+        let recipe = self
+            .replay
+            .clone()
+            .ok_or_else(|| ReplayError::Fatal("request has not been sent".to_string()))?;
+        let exchange = self.execute(&recipe).await?;
+        self.last = Some(exchange);
+        Ok(())
+    }
+
+    async fn execute(&self, recipe: &RequestRecipe) -> Result<Exchange, ReplayError> {
+        let api = self.apis.get(&recipe.api).map_err(ReplayError::Fatal)?;
         let mut url = api
             .base_url
-            .join(path)
-            .map_err(|e| format!("invalid path {path:?}: {e}"))?;
-        if !self.query.is_empty() {
+            .join(&recipe.path)
+            .map_err(|e| ReplayError::Fatal(format!("invalid path {:?}: {e}", recipe.path)))?;
+        if !recipe.query.is_empty() {
             let mut qp = url.query_pairs_mut();
-            for (k, v) in &self.query {
+            for (k, v) in &recipe.query {
                 qp.append_pair(k, v);
             }
         }
-        let m = reqwest::Method::from_bytes(method.as_bytes())
-            .map_err(|e| format!("invalid HTTP method {method:?}: {e}"))?;
+        let method = reqwest::Method::from_bytes(recipe.method.as_bytes()).map_err(|e| {
+            ReplayError::Fatal(format!("invalid HTTP method {:?}: {e}", recipe.method))
+        })?;
 
         // Built before headers: a pending Hawk signer needs the exact bytes
         // being sent to hash the payload.
-        let sent_body = if let Some(form) = &self.form {
+        let sent_body = if let Some(form) = &recipe.form {
             Some(
                 form.iter()
                     .map(|(k, v)| format!("{k}={v}"))
@@ -272,43 +343,48 @@ impl HttpState {
                     .join("&"),
             )
         } else {
-            self.body.clone()
+            recipe.body.clone()
         };
 
-        let mut request_headers = self.headers.clone();
-        if let Some(credentials) = self.signer.take() {
-            if self.form.is_some() {
-                return Err(
+        let mut request_headers = recipe.headers.clone();
+        if let Some(credentials) = &recipe.signer {
+            if recipe.form.is_some() {
+                return Err(ReplayError::Fatal(
                     "Hawk signing supports raw request bodies only, not form bodies".to_string(),
-                );
+                ));
             }
-            let nonce = generate_nonce()?;
-            let timestamp = unix_timestamp()?;
+            let nonce = generate_nonce().map_err(ReplayError::Fatal)?;
+            let timestamp = unix_timestamp().map_err(ReplayError::Fatal)?;
             request_headers = apply_signer(
                 request_headers,
-                &credentials,
+                credentials,
                 &url,
-                method,
+                &recipe.method,
                 sent_body.as_deref().unwrap_or(""),
                 timestamp,
                 &nonce,
-            )?;
+            )
+            .map_err(ReplayError::Fatal)?;
         }
 
-        let mut req = api.client.request(m.clone(), url.clone());
+        let mut req = api.client.request(method.clone(), url.clone());
         for (k, v) in &request_headers {
             req = req.header(k, v);
         }
-        if let Some(form) = &self.form {
+        if let Some(form) = &recipe.form {
             req = req.form(form);
-        } else if let Some(b) = &self.body {
+        } else if let Some(b) = &recipe.body {
             req = req.body(b.clone());
         }
 
-        let resp = req
-            .send()
+        let request = req
+            .build()
+            .map_err(|e| ReplayError::Fatal(format!("failed to build HTTP request: {e}")))?;
+        let resp = api
+            .client
+            .execute(request)
             .await
-            .map_err(|e| format!("request failed: {e}"))?;
+            .map_err(|e| ReplayError::NotYet(format!("request failed: {e}")))?;
         let status = resp.status().as_u16();
         let resp_headers = resp
             .headers()
@@ -318,18 +394,17 @@ impl HttpState {
         let body = resp
             .text()
             .await
-            .map_err(|e| format!("failed to read response body: {e}"))?;
+            .map_err(|e| ReplayError::NotYet(format!("failed to read response body: {e}")))?;
 
-        self.last = Some(Exchange {
-            method: m.to_string(),
+        Ok(Exchange {
+            method: method.to_string(),
             url: url.to_string(),
             req_headers: request_headers,
             req_body: sent_body,
             status,
             resp_headers,
             body,
-        });
-        Ok(())
+        })
     }
 }
 
@@ -373,7 +448,15 @@ fn apply_signer(
     }
     let content_type = content_types.first().copied();
 
-    let header = hawk::authorization(url, method, body, content_type, credentials, timestamp, nonce)?;
+    let header = hawk::authorization(
+        url,
+        method,
+        body,
+        content_type,
+        credentials,
+        timestamp,
+        nonce,
+    )?;
     headers.retain(|(k, _)| !k.eq_ignore_ascii_case("authorization"));
     headers.push(("Authorization".to_string(), header));
     Ok(headers)
@@ -382,13 +465,20 @@ fn apply_signer(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::extract::OriginalUri;
+    use axum::http::{HeaderMap, Method};
+    use axum::routing::{any, post};
+    use axum::{Json, Router};
+    use serde_json::json;
     use std::collections::HashMap;
+    use std::sync::Mutex;
 
     fn apis_with(name: &str, base: &str, default_headers: Vec<(String, String)>) -> Arc<Apis> {
         let mut by_name = HashMap::new();
         by_name.insert(
             name.to_string(),
-            ApiResource::new(base, 5, default_headers).expect("valid base_url"),
+            ApiResource::new(base, 5, default_headers, Options::default())
+                .expect("valid base_url"),
         );
         Arc::new(Apis::new(by_name, Some(name.to_string())).expect("default declared"))
     }
@@ -405,6 +495,7 @@ mod tests {
                 "http://first.local/",
                 5,
                 vec![("x-source".to_string(), "first".to_string())],
+                Options::default(),
             )
             .expect("valid base_url"),
         );
@@ -414,10 +505,205 @@ mod tests {
                 "http://second.local/",
                 5,
                 vec![("x-source".to_string(), "second".to_string())],
+                Options {
+                    polling: crate::options::PollingOptions {
+                        timeout: Duration::from_secs(8),
+                        interval: Duration::from_millis(100),
+                    },
+                },
             )
             .expect("valid base_url"),
         );
         Arc::new(Apis::new(by_name, Some("first".to_string())).expect("default declared"))
+    }
+
+    fn local_apis(first: &str, second: &str) -> Arc<Apis> {
+        let mut by_name = HashMap::new();
+        by_name.insert(
+            "first".to_string(),
+            ApiResource::new(first, 5, Vec::new(), Options::default()).expect("valid first URL"),
+        );
+        by_name.insert(
+            "second".to_string(),
+            ApiResource::new(second, 5, Vec::new(), Options::default()).expect("valid second URL"),
+        );
+        Arc::new(Apis::new(by_name, Some("first".to_string())).expect("default is declared"))
+    }
+
+    async fn spawn_app(app: Router) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test app");
+        });
+        (format!("http://{address}/"), server)
+    }
+
+    async fn spawn_echo_app(server: &'static str) -> (String, tokio::task::JoinHandle<()>) {
+        let app = Router::new().route(
+            "/saved",
+            any(
+                move |method: Method,
+                      OriginalUri(uri): OriginalUri,
+                      headers: HeaderMap,
+                      body: String| async move {
+                    Json(json!({
+                        "server": server,
+                        "method": method.as_str(),
+                        "uri": uri.to_string(),
+                        "header": headers
+                            .get("x-recipe")
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or(""),
+                        "body": body,
+                    }))
+                },
+            ),
+        );
+        spawn_app(app).await
+    }
+
+    #[tokio::test]
+    async fn replay_preserves_the_original_api_method_path_query_headers_and_raw_body() {
+        let (first, _first_server) = spawn_echo_app("first").await;
+        let (second, _second_server) = spawn_echo_app("second").await;
+        let mut state = HttpState::new(local_apis(&first, &second));
+        state.set_query("phase", "initial");
+        state.set_header("x-recipe", "original");
+        state.set_body(r#"{"request":"saved"}"#.to_string());
+        state
+            .send("/saved", "PATCH")
+            .await
+            .expect("initial request succeeds");
+
+        state.use_api("second").expect("second API exists");
+        state.set_query("phase", "mutated");
+        state.set_header("x-recipe", "mutated");
+        state.set_body("mutated".to_string());
+        state.replay_last().await.expect("replay succeeds");
+
+        let exchange = state.last().expect("replay stores an exchange");
+        assert_eq!(
+            (
+                exchange.method.as_str(),
+                exchange.json().expect("stub response is JSON"),
+            ),
+            (
+                "PATCH",
+                json!({
+                    "server": "first",
+                    "method": "PATCH",
+                    "uri": "/saved?phase=initial",
+                    "header": "original",
+                    "body": r#"{"request":"saved"}"#,
+                }),
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_preserves_form_parameters() {
+        let (base, _server) = spawn_echo_app("form").await;
+        let mut state = HttpState::new(apis_with("main", &base, Vec::new()));
+        state.set_form(vec![
+            ("name".to_string(), "Jane Doe".to_string()),
+            ("role".to_string(), "admin/owner".to_string()),
+        ]);
+        state
+            .send("/saved", "POST")
+            .await
+            .expect("initial form request succeeds");
+        state.set_body("mutated".to_string());
+
+        state.replay_last().await.expect("replay succeeds");
+
+        assert_eq!(
+            state
+                .last()
+                .expect("replay stores an exchange")
+                .json()
+                .expect("stub response is JSON")["body"],
+            "name=Jane+Doe&role=admin%2Fowner"
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_generates_fresh_hawk_authorization() {
+        let authorizations = Arc::new(Mutex::new(Vec::new()));
+        let captured = authorizations.clone();
+        let app = Router::new().route(
+            "/hawk",
+            post(move |headers: HeaderMap| {
+                let captured = captured.clone();
+                async move {
+                    captured.lock().expect("capture lock").push(
+                        headers
+                            .get("authorization")
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or("")
+                            .to_string(),
+                    );
+                    Json(json!({"ok": true}))
+                }
+            }),
+        );
+        let (base, _server) = spawn_app(app).await;
+        let mut state = HttpState::new(apis_with("main", &base, Vec::new()));
+        state.set_header("content-type", "application/json");
+        state.set_body(r#"{"request":"saved"}"#.to_string());
+        state.sign_next("session", "secret");
+        state
+            .send("/hawk", "POST")
+            .await
+            .expect("initial signed request succeeds");
+
+        state.replay_last().await.expect("replay succeeds");
+
+        let authorizations = authorizations.lock().expect("capture lock");
+        assert_eq!(authorizations.len(), 2);
+        assert!(authorizations.iter().all(|value| !value.is_empty()));
+        assert_ne!(authorizations[0], authorizations[1]);
+    }
+
+    #[tokio::test]
+    async fn replay_transport_failure_clears_the_stale_exchange() {
+        let (base, server) = spawn_echo_app("temporary").await;
+        let mut state = HttpState::new(apis_with("main", &base, Vec::new()));
+        state
+            .send("/saved", "GET")
+            .await
+            .expect("initial request succeeds");
+        server.abort();
+        let _ = server.await;
+
+        let error = state.replay_last().await.expect_err("replay must fail");
+
+        assert!(matches!(error, ReplayError::NotYet(_)));
+        assert!(state.last().is_none());
+    }
+
+    #[tokio::test]
+    async fn replay_request_construction_errors_are_fatal() {
+        let state = state();
+        let recipe = RequestRecipe {
+            api: "main".to_string(),
+            method: "GET".to_string(),
+            path: "/saved".to_string(),
+            query: Vec::new(),
+            headers: vec![("bad\nheader".to_string(), "value".to_string())],
+            body: None,
+            form: None,
+            signer: None,
+        };
+
+        let error = state
+            .execute(&recipe)
+            .await
+            .expect_err("invalid headers must fail request construction");
+
+        assert!(matches!(error, ReplayError::Fatal(_)), "{error:?}");
     }
 
     #[test]
@@ -470,6 +756,46 @@ mod tests {
         assert!(
             s.last().is_some(),
             "the previous response must survive an API switch"
+        );
+    }
+
+    #[tokio::test]
+    async fn last_response_options_stay_with_its_originating_api() {
+        let (first, _first_server) = spawn_echo_app("first").await;
+        let (second, _second_server) = spawn_echo_app("second").await;
+        let mut apis = HashMap::new();
+        apis.insert(
+            "first".to_string(),
+            ApiResource::new(&first, 5, Vec::new(), Options::default()).expect("valid first URL"),
+        );
+        apis.insert(
+            "second".to_string(),
+            ApiResource::new(
+                &second,
+                5,
+                Vec::new(),
+                Options {
+                    polling: crate::options::PollingOptions {
+                        timeout: Duration::from_secs(8),
+                        interval: Duration::from_millis(100),
+                    },
+                },
+            )
+            .expect("valid second URL"),
+        );
+        let mut s = HttpState::new(Arc::new(
+            Apis::new(apis, Some("first".to_string())).expect("default is declared"),
+        ));
+        s.send("/saved", "GET")
+            .await
+            .expect("initial request succeeds");
+        s.use_api("second").expect("resource is declared");
+        assert_eq!(
+            s.options_for_last_response()
+                .expect("last response has an API")
+                .polling
+                .timeout,
+            Duration::from_secs(5)
         );
     }
 
@@ -560,7 +886,7 @@ mod tests {
 
     #[test]
     fn api_resource_rejects_an_invalid_base_url() {
-        assert!(ApiResource::new("not-a-url", 5, Vec::new()).is_err());
+        assert!(ApiResource::new("not-a-url", 5, Vec::new(), Options::default()).is_err());
     }
 
     #[test]
@@ -568,7 +894,8 @@ mod tests {
         let mut by_name = HashMap::new();
         by_name.insert(
             "a".to_string(),
-            ApiResource::new("http://a.local/", 5, Vec::new()).expect("valid base_url"),
+            ApiResource::new("http://a.local/", 5, Vec::new(), Options::default())
+                .expect("valid base_url"),
         );
         assert!(Apis::new(by_name, Some("b".to_string())).is_err());
     }

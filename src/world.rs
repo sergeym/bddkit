@@ -1,5 +1,6 @@
 use crate::db::DbHandle;
 use crate::http::{Apis, HttpState};
+use crate::options::{Options, OptionsLayer};
 use crate::unique::Generator;
 use crate::vars::VarStack;
 use std::sync::Arc;
@@ -12,6 +13,8 @@ pub struct World {
     pub db: DbHandle,
     pub debug: bool,
     pub generator: Arc<Generator>,
+    pub options: Options,
+    pending_options: Option<OptionsLayer>,
     /// Run-wide configuration, not scenario state: `reset_scenario`
     /// does not touch it.
     pub srp: Option<Arc<crate::srp::SrpParams>>,
@@ -23,6 +26,7 @@ impl World {
         generator: Arc<Generator>,
         db: DbHandle,
         srp: Option<Arc<crate::srp::SrpParams>>,
+        options: Options,
     ) -> Self {
         Self {
             vars: VarStack::new(),
@@ -31,7 +35,17 @@ impl World {
             debug: false,
             generator,
             srp,
+            options,
+            pending_options: None,
         }
+    }
+
+    pub fn arm_options(&mut self, layer: OptionsLayer) {
+        self.pending_options = Some(layer);
+    }
+
+    pub fn take_options(&mut self) -> Option<OptionsLayer> {
+        self.pending_options.take()
     }
 
     /// At the scenario boundary: the request, connection, and debug flag reset; variables remain.
@@ -39,6 +53,7 @@ impl World {
         self.http.reset();
         self.db.reset();
         self.debug = false;
+        self.pending_options = None;
     }
 }
 
@@ -55,7 +70,8 @@ mod tests {
         let mut by_name = HashMap::new();
         by_name.insert(
             "main".to_string(),
-            ApiResource::new("http://x.local", 5, Vec::new()).expect("valid base_url"),
+            ApiResource::new("http://x.local", 5, Vec::new(), Options::default())
+                .expect("valid base_url"),
         );
         Arc::new(Apis::new(by_name, Some("main".to_string())).expect("default declared"))
     }
@@ -67,6 +83,7 @@ mod tests {
             Arc::new(Generator::new()),
             DbHandle::new(None, String::new()),
             None,
+            Options::default(),
         );
         w.debug = true;
         w.reset_scenario();
@@ -86,6 +103,7 @@ mod tests {
             Arc::new(Generator::new()),
             DbHandle::new(None, String::new()),
             Some(params),
+            Options::default(),
         );
         w.reset_scenario();
         assert!(

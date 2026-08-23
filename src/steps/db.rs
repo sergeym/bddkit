@@ -1,4 +1,5 @@
 use crate::db::{ops, value};
+use crate::polling::{AttemptError, AttemptResult};
 use crate::world::World;
 
 /// Switches the scenario's current connection. An error if the name is unknown.
@@ -36,7 +37,7 @@ pub async fn have_where(
 
 pub async fn have_multi(w: &mut World, rows: Option<&Vec<Vec<String>>>) -> Result<(), String> {
     let rows = rows.ok_or("step requires a table")?;
-    // First row is the header (| table | record |), then (table, kv) pairs follow.
+    // The first row is the header (| table | record |), then (table, kv) pairs.
     for row in rows.iter().skip(1) {
         let table = row.first().ok_or("empty table row")?;
         let kv = row.get(1).map(String::as_str).unwrap_or("");
@@ -68,32 +69,54 @@ pub async fn extract_from_db(
     ops::extract(w, column, table, where_, var).await
 }
 
-pub async fn should_have(w: &mut World, table: &str, kv: &str) -> Result<(), String> {
-    let pairs = value::parse_oneliner(kv)?;
-    ops::assert_exists(w, table, &pairs, false).await
+async fn assert_presence(
+    w: &mut World,
+    table: &str,
+    pairs: &[(String, Option<String>)],
+    negate: bool,
+) -> AttemptResult {
+    let found = ops::exists(w, table, pairs)
+        .await
+        .map_err(AttemptError::Fatal)?;
+    match (found, negate) {
+        (true, false) | (false, true) => Ok(()),
+        (false, false) => Err(AttemptError::NotYet(format!(
+            "expected a row in {table}, but there is none"
+        ))),
+        (true, true) => Err(AttemptError::NotYet(format!(
+            "a row in {table} exists, but must not"
+        ))),
+    }
 }
 
-pub async fn should_not_have(w: &mut World, table: &str, kv: &str) -> Result<(), String> {
-    let pairs = value::parse_oneliner(kv)?;
-    ops::assert_exists(w, table, &pairs, true).await
+pub async fn should_have(w: &mut World, table: &str, kv: &str) -> AttemptResult {
+    let pairs = value::parse_oneliner(kv).map_err(AttemptError::Fatal)?;
+    assert_presence(w, table, &pairs, false).await
+}
+
+pub async fn should_not_have(w: &mut World, table: &str, kv: &str) -> AttemptResult {
+    let pairs = value::parse_oneliner(kv).map_err(AttemptError::Fatal)?;
+    assert_presence(w, table, &pairs, true).await
 }
 
 pub async fn should_have_table(
     w: &mut World,
     table: &str,
     rows: Option<&Vec<Vec<String>>>,
-) -> Result<(), String> {
-    let pairs = value::pairs_from_tall(rows.ok_or("step requires a table")?)?;
-    ops::assert_exists(w, table, &pairs, false).await
+) -> AttemptResult {
+    let rows = rows.ok_or_else(|| AttemptError::Fatal("step requires a table".to_string()))?;
+    let pairs = value::pairs_from_tall(rows).map_err(AttemptError::Fatal)?;
+    assert_presence(w, table, &pairs, false).await
 }
 
 pub async fn should_not_have_table(
     w: &mut World,
     table: &str,
     rows: Option<&Vec<Vec<String>>>,
-) -> Result<(), String> {
-    let pairs = value::pairs_from_tall(rows.ok_or("step requires a table")?)?;
-    ops::assert_exists(w, table, &pairs, true).await
+) -> AttemptResult {
+    let rows = rows.ok_or_else(|| AttemptError::Fatal("step requires a table".to_string()))?;
+    let pairs = value::pairs_from_tall(rows).map_err(AttemptError::Fatal)?;
+    assert_presence(w, table, &pairs, true).await
 }
 
 pub async fn call_procedure(w: &mut World, name: &str, args: &str) -> Result<(), String> {

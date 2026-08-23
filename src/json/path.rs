@@ -1,5 +1,16 @@
 use serde_json::Value;
 
+pub fn validate(path: &str) -> Result<(), String> {
+    let path = path.trim();
+    let path = path
+        .strip_prefix("root.")
+        .unwrap_or_else(|| if path == "root" { "" } else { path });
+    for segment in path.split('.').filter(|segment| !segment.is_empty()) {
+        split_indices(segment)?;
+    }
+    Ok(())
+}
+
 /// Reads a value by a path like `a.b[0].c`. An optional `root.` prefix
 /// is allowed for readability. Full JSONPath isn't needed — the reference
 /// only ever used this syntax.
@@ -116,5 +127,15 @@ mod tests {
     #[test]
     fn non_numeric_index_is_an_error() {
         assert!(read(&doc(), "list[x]").is_err());
+    }
+
+    #[test]
+    fn validation_rejects_a_non_numeric_index_without_reading_a_document() {
+        assert!(validate("data.items[x].id").is_err());
+    }
+
+    #[test]
+    fn validation_accepts_a_path_that_may_be_absent_from_a_document() {
+        assert!(validate("data.items[0].missing").is_ok());
     }
 }

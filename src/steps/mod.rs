@@ -6,6 +6,8 @@ pub mod srp;
 pub mod vars;
 
 use crate::macros::{MacroCatalog, MacroDef};
+use crate::options::{OptionsLayer, PollingOptionsLayer};
+use crate::polling::{AttemptError, AttemptResult};
 use crate::world::World;
 use regex::Regex;
 use std::collections::{HashSet, VecDeque};
@@ -24,6 +26,9 @@ pub enum StepId {
     RequestPathWithMethod,
     UseApi,
     SignNextRequestWithHawk,
+    ExpectEventually,
+    ExpectWithin,
+    ExpectWithinEvery,
     // response checks
     ResponseCode,
     ResponseBodyContainsJson,
@@ -72,231 +77,237 @@ pub enum StepId {
     SrpCompleteLogin,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OptionsSource {
+    Global,
+    Http,
+    Db,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepKind {
+    Action,
+    Assertion(OptionsSource),
+}
+
 pub struct StepDef {
     pub id: StepId,
     pub pattern: &'static str,
+    pub kind: StepKind,
+}
+
+const fn action(id: StepId, pattern: &'static str) -> StepDef {
+    StepDef {
+        id,
+        pattern,
+        kind: StepKind::Action,
+    }
+}
+
+const fn assertion(id: StepId, pattern: &'static str, source: OptionsSource) -> StepDef {
+    StepDef {
+        id,
+        pattern,
+        kind: StepKind::Assertion(source),
+    }
 }
 
 pub const BUILTIN_STEPS: &[StepDef] = &[
-    StepDef {
-        id: StepId::SetRequestHeader,
-        pattern: r#"^the "([^"]*)" request header is "([^"]*)"$"#,
-    },
-    StepDef {
-        id: StepId::AddRequestHeader,
-        pattern: r#"^I add "([^"]*)" to the "([^"]*)" request header$"#,
-    },
-    StepDef {
-        id: StepId::SetQueryParam,
-        pattern: r#"^the query parameter "([^"]*)" is "([^"]*)"$"#,
-    },
-    StepDef {
-        id: StepId::SetRequestBody,
-        pattern: r#"^the request body is:$"#,
-    },
-    StepDef {
-        id: StepId::EmptyRequestBody,
-        pattern: r#"^the request body is empty$"#,
-    },
-    StepDef {
-        id: StepId::SetFormParams,
-        pattern: r#"^the request form parameters are:$"#,
-    },
-    StepDef {
-        id: StepId::RequestPathWithMethod,
-        pattern: r#"^I request "([^"]*)" using HTTP (GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)$"#,
-    },
-    StepDef {
-        id: StepId::RequestPath,
-        pattern: r#"^I request "([^"]*)"$"#,
-    },
-    StepDef {
-        id: StepId::SignNextRequestWithHawk,
-        pattern: r#"^I sign the next request with Hawk id "([^"]*)" and key "([^"]*)"$"#,
-    },
-    StepDef {
-        id: StepId::ResponseCode,
-        pattern: r#"^the response code is (\d+)$"#,
-    },
-    StepDef {
-        id: StepId::ResponseBodyContainsJson,
-        pattern: r#"^the response body contains JSON:$"#,
-    },
-    StepDef {
-        id: StepId::ResponseBodyEqualsJson,
-        pattern: r#"^the response body equals JSON:$"#,
-    },
-    StepDef {
-        id: StepId::ResponseArrayLength,
-        pattern: r#"^the response body is a JSON array of length (\d+)$"#,
-    },
-    StepDef {
-        id: StepId::ResponseHeader,
-        pattern: r#"^the "([^"]*)" response header is "([^"]*)"$"#,
-    },
-    StepDef {
-        id: StepId::JsonNodeExists,
-        pattern: r#"^the JSON node "([^"]*)" should exist$"#,
-    },
-    StepDef {
-        id: StepId::SetVariableGlobal,
-        pattern: r#"^set variable "([^"]*)" to "([^"]*)" global$"#,
-    },
-    StepDef {
-        id: StepId::SetVariable,
-        pattern: r#"^set variable "([^"]*)" to "([^"]*)"$"#,
-    },
-    StepDef {
-        id: StepId::ExtractFromJsonGlobal,
-        pattern: r#"^extract "([^"]*)" from JSON as "([^"]*)" global$"#,
-    },
-    StepDef {
-        id: StepId::ExtractFromJson,
-        pattern: r#"^extract "([^"]*)" from JSON as "([^"]*)"$"#,
-    },
-    StepDef {
-        id: StepId::ExtractFromCookiesGlobal,
-        pattern: r#"^extract "([^"]*)" from cookies as "([^"]*)" global$"#,
-    },
-    StepDef {
-        id: StepId::ExtractFromCookies,
-        pattern: r#"^extract "([^"]*)" from cookies as "([^"]*)"$"#,
-    },
-    StepDef {
-        id: StepId::VariableNotEquals,
-        pattern: r#"^variable "([^"]*)" should not be equal to "([^"]*)"$"#,
-    },
-    StepDef {
-        id: StepId::VariableEquals,
-        pattern: r#"^variable "([^"]*)" should be equal to "([^"]*)"$"#,
-    },
-    StepDef {
-        id: StepId::EncryptWithAes,
-        pattern: r#"^I encrypt "([^"]*)" with AES using key "([^"]*)" as "([^"]*)"$"#,
-    },
-    StepDef {
-        id: StepId::UseApi,
-        pattern: r#"^I use "([^"]*)" api$"#,
-    },
-    StepDef {
-        id: StepId::UseConnection,
-        pattern: r#"^I use "([^"]*)" connection$"#,
-    },
-    StepDef {
-        id: StepId::DebugOn,
-        pattern: r#"^I am in debug mode$"#,
-    },
-    StepDef {
-        id: StepId::DebugOff,
-        pattern: r#"^I am not in debug mode$"#,
-    },
-    StepDef {
-        id: StepId::HaveWhere,
-        pattern: r#"^I have "([^"]*)" where:$"#,
-    },
-    StepDef {
-        id: StepId::HaveWith,
-        pattern: r#"^I have "([^"]*)" with "([^"]*)"$"#,
-    },
-    StepDef {
-        id: StepId::HaveMulti,
-        pattern: r#"^I have:$"#,
-    },
-    StepDef {
-        id: StepId::Update,
-        pattern: r#"^I update "([^"]*)" with "([^"]*)" where "([^"]*)"$"#,
-    },
-    StepDef {
-        id: StepId::DeleteAll,
-        pattern: r#"^I delete all "([^"]*)"$"#,
-    },
-    StepDef {
-        id: StepId::DeleteWhere,
-        pattern: r#"^I delete "([^"]*)" where "([^"]*)"$"#,
-    },
-    StepDef {
-        id: StepId::ExtractFromDb,
-        pattern: r#"^I extract "([^"]*)" from "([^"]*)" with "([^"]*)" as "([^"]*)"$"#,
-    },
-    StepDef {
-        id: StepId::ShouldNotHaveTable,
-        pattern: r#"^I should not have "([^"]*)" with:$"#,
-    },
-    StepDef {
-        id: StepId::ShouldNotHaveWith,
-        pattern: r#"^I should not have "([^"]*)" with "([^"]*)"$"#,
-    },
-    StepDef {
-        id: StepId::ShouldHaveTable,
-        pattern: r#"^I should have "([^"]*)" with:$"#,
-    },
-    StepDef {
-        id: StepId::ShouldHaveWith,
-        pattern: r#"^I should have "([^"]*)" with "([^"]*)"$"#,
-    },
-    StepDef {
-        id: StepId::CallProcedure,
-        pattern: r#"^I call procedure "([^"]*)" with "([^"]*)"$"#,
-    },
-    StepDef {
-        id: StepId::CallFunction,
-        pattern: r#"^I call function "([^"]*)" with "([^"]*)" as "([^"]*)"$"#,
-    },
-    StepDef {
-        id: StepId::GetSequence,
-        pattern: r#"^I get next value of sequence "([^"]*)" as "([^"]*)"$"#,
-    },
-    StepDef {
-        id: StepId::Sleep,
-        pattern: r#"^I sleep "(\d+)" seconds$"#,
-    },
-    StepDef {
-        id: StepId::ShowAllVariables,
-        pattern: r#"^Show all variables$"#,
-    },
-    StepDef {
-        id: StepId::ShowVariable,
-        pattern: r#"^Show "([^"]*)" variable$"#,
-    },
-    StepDef {
-        id: StepId::PrintResponseHeaders,
-        pattern: r#"^Print response headers$"#,
-    },
-    StepDef {
-        id: StepId::PrintResponseBody,
-        pattern: r#"^Print response body$"#,
-    },
-    StepDef {
-        id: StepId::PrintResponseBodyAsPath,
-        pattern: r#"^Print response body as "([^"]*)"$"#,
-    },
-    StepDef {
-        id: StepId::SrpVerifierWithSalt,
-        pattern: r#"^I generate an SRP verifier for "([^"]*)" with password "([^"]*)" and salt "([^"]*)" as "([^"]*)"$"#,
-    },
-    StepDef {
-        id: StepId::SrpVerifier,
-        pattern: r#"^I generate an SRP verifier for "([^"]*)" with password "([^"]*)" as "([^"]*)"$"#,
-    },
-    StepDef {
-        id: StepId::SrpStartLogin,
-        pattern: r#"^I start an SRP login as "([^"]*)"$"#,
-    },
-    StepDef {
-        id: StepId::SrpCompleteLogin,
-        pattern: r#"^I complete SRP login "([^"]*)" for "([^"]*)" with password "([^"]*)" salt "([^"]*)" and "([^"]*)"$"#,
-    },
+    action(
+        StepId::SetRequestHeader,
+        r#"^the "([^"]*)" request header is "([^"]*)"$"#,
+    ),
+    action(
+        StepId::AddRequestHeader,
+        r#"^I add "([^"]*)" to the "([^"]*)" request header$"#,
+    ),
+    action(
+        StepId::SetQueryParam,
+        r#"^the query parameter "([^"]*)" is "([^"]*)"$"#,
+    ),
+    action(StepId::SetRequestBody, r#"^the request body is:$"#),
+    action(StepId::EmptyRequestBody, r#"^the request body is empty$"#),
+    action(
+        StepId::SetFormParams,
+        r#"^the request form parameters are:$"#,
+    ),
+    action(
+        StepId::RequestPathWithMethod,
+        r#"^I request "([^"]*)" using HTTP (GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)$"#,
+    ),
+    action(StepId::RequestPath, r#"^I request "([^"]*)"$"#),
+    action(
+        StepId::SignNextRequestWithHawk,
+        r#"^I sign the next request with Hawk id "([^"]*)" and key "([^"]*)"$"#,
+    ),
+    action(
+        StepId::ExpectEventually,
+        r#"^I expect the next assertion to pass eventually$"#,
+    ),
+    action(
+        StepId::ExpectWithinEvery,
+        r#"^I expect the next assertion to pass within "(\d+)" seconds, checking every "(\d+)" milliseconds$"#,
+    ),
+    action(
+        StepId::ExpectWithin,
+        r#"^I expect the next assertion to pass within "(\d+)" seconds$"#,
+    ),
+    assertion(
+        StepId::ResponseCode,
+        r#"^the response code is (\d+)$"#,
+        OptionsSource::Http,
+    ),
+    assertion(
+        StepId::ResponseBodyContainsJson,
+        r#"^the response body contains JSON:$"#,
+        OptionsSource::Http,
+    ),
+    assertion(
+        StepId::ResponseBodyEqualsJson,
+        r#"^the response body equals JSON:$"#,
+        OptionsSource::Http,
+    ),
+    assertion(
+        StepId::ResponseArrayLength,
+        r#"^the response body is a JSON array of length (\d+)$"#,
+        OptionsSource::Http,
+    ),
+    assertion(
+        StepId::ResponseHeader,
+        r#"^the "([^"]*)" response header is "([^"]*)"$"#,
+        OptionsSource::Http,
+    ),
+    assertion(
+        StepId::JsonNodeExists,
+        r#"^the JSON node "([^"]*)" should exist$"#,
+        OptionsSource::Http,
+    ),
+    action(
+        StepId::SetVariableGlobal,
+        r#"^set variable "([^"]*)" to "([^"]*)" global$"#,
+    ),
+    action(
+        StepId::SetVariable,
+        r#"^set variable "([^"]*)" to "([^"]*)"$"#,
+    ),
+    action(
+        StepId::ExtractFromJsonGlobal,
+        r#"^extract "([^"]*)" from JSON as "([^"]*)" global$"#,
+    ),
+    action(
+        StepId::ExtractFromJson,
+        r#"^extract "([^"]*)" from JSON as "([^"]*)"$"#,
+    ),
+    action(
+        StepId::ExtractFromCookiesGlobal,
+        r#"^extract "([^"]*)" from cookies as "([^"]*)" global$"#,
+    ),
+    action(
+        StepId::ExtractFromCookies,
+        r#"^extract "([^"]*)" from cookies as "([^"]*)"$"#,
+    ),
+    assertion(
+        StepId::VariableNotEquals,
+        r#"^variable "([^"]*)" should not be equal to "([^"]*)"$"#,
+        OptionsSource::Global,
+    ),
+    assertion(
+        StepId::VariableEquals,
+        r#"^variable "([^"]*)" should be equal to "([^"]*)"$"#,
+        OptionsSource::Global,
+    ),
+    action(
+        StepId::EncryptWithAes,
+        r#"^I encrypt "([^"]*)" with AES using key "([^"]*)" as "([^"]*)"$"#,
+    ),
+    action(StepId::UseApi, r#"^I use "([^"]*)" api$"#),
+    action(StepId::UseConnection, r#"^I use "([^"]*)" connection$"#),
+    action(StepId::DebugOn, r#"^I am in debug mode$"#),
+    action(StepId::DebugOff, r#"^I am not in debug mode$"#),
+    action(StepId::HaveWhere, r#"^I have "([^"]*)" where:$"#),
+    action(StepId::HaveWith, r#"^I have "([^"]*)" with "([^"]*)"$"#),
+    action(StepId::HaveMulti, r#"^I have:$"#),
+    action(
+        StepId::Update,
+        r#"^I update "([^"]*)" with "([^"]*)" where "([^"]*)"$"#,
+    ),
+    action(StepId::DeleteAll, r#"^I delete all "([^"]*)"$"#),
+    action(
+        StepId::DeleteWhere,
+        r#"^I delete "([^"]*)" where "([^"]*)"$"#,
+    ),
+    action(
+        StepId::ExtractFromDb,
+        r#"^I extract "([^"]*)" from "([^"]*)" with "([^"]*)" as "([^"]*)"$"#,
+    ),
+    assertion(
+        StepId::ShouldNotHaveTable,
+        r#"^I should not have "([^"]*)" with:$"#,
+        OptionsSource::Db,
+    ),
+    assertion(
+        StepId::ShouldNotHaveWith,
+        r#"^I should not have "([^"]*)" with "([^"]*)"$"#,
+        OptionsSource::Db,
+    ),
+    assertion(
+        StepId::ShouldHaveTable,
+        r#"^I should have "([^"]*)" with:$"#,
+        OptionsSource::Db,
+    ),
+    assertion(
+        StepId::ShouldHaveWith,
+        r#"^I should have "([^"]*)" with "([^"]*)"$"#,
+        OptionsSource::Db,
+    ),
+    action(
+        StepId::CallProcedure,
+        r#"^I call procedure "([^"]*)" with "([^"]*)"$"#,
+    ),
+    action(
+        StepId::CallFunction,
+        r#"^I call function "([^"]*)" with "([^"]*)" as "([^"]*)"$"#,
+    ),
+    action(
+        StepId::GetSequence,
+        r#"^I get next value of sequence "([^"]*)" as "([^"]*)"$"#,
+    ),
+    action(StepId::Sleep, r#"^I sleep "(\d+)" seconds$"#),
+    action(StepId::ShowAllVariables, r#"^Show all variables$"#),
+    action(StepId::ShowVariable, r#"^Show "([^"]*)" variable$"#),
+    action(StepId::PrintResponseHeaders, r#"^Print response headers$"#),
+    action(StepId::PrintResponseBody, r#"^Print response body$"#),
+    action(
+        StepId::PrintResponseBodyAsPath,
+        r#"^Print response body as "([^"]*)"$"#,
+    ),
+    action(
+        StepId::SrpVerifierWithSalt,
+        r#"^I generate an SRP verifier for "([^"]*)" with password "([^"]*)" and salt "([^"]*)" as "([^"]*)"$"#,
+    ),
+    action(
+        StepId::SrpVerifier,
+        r#"^I generate an SRP verifier for "([^"]*)" with password "([^"]*)" as "([^"]*)"$"#,
+    ),
+    action(
+        StepId::SrpStartLogin,
+        r#"^I start an SRP login as "([^"]*)"$"#,
+    ),
+    action(
+        StepId::SrpCompleteLogin,
+        r#"^I complete SRP login "([^"]*)" for "([^"]*)" with password "([^"]*)" salt "([^"]*)" and "([^"]*)"$"#,
+    ),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StepTarget {
-    Builtin(StepId),
+    Builtin { id: StepId, kind: StepKind },
     Macro(usize),
 }
 
 impl PartialEq<StepId> for StepTarget {
     fn eq(&self, other: &StepId) -> bool {
-        matches!(self, Self::Builtin(id) if id == other)
+        matches!(self, Self::Builtin { id, .. } if id == other)
     }
 }
 
@@ -319,7 +330,13 @@ impl Registry {
         for def in BUILTIN_STEPS {
             let re = Regex::new(def.pattern)
                 .map_err(|e| format!("invalid step pattern {:?}: {e}", def.pattern))?;
-            entries.push((StepTarget::Builtin(def.id), re));
+            entries.push((
+                StepTarget::Builtin {
+                    id: def.id,
+                    kind: def.kind,
+                },
+                re,
+            ));
         }
         for (index, definition) in catalog.definitions.iter().enumerate() {
             entries.push((StepTarget::Macro(index), definition.regex.clone()));
@@ -396,7 +413,7 @@ impl Registry {
         for (index, definition) in self.macros.iter().enumerate() {
             for step in &definition.body {
                 match self.find(&step.text)? {
-                    Some((StepTarget::Builtin(_), _)) => {}
+                    Some((StepTarget::Builtin { .. }, _)) => {}
                     Some((StepTarget::Macro(_), _)) if step.docstring.is_some() => {
                         return Err(format!(
                             "macro call {:?} with a doc string inside macro {:?} from {}:{} is not supported",
@@ -626,8 +643,8 @@ impl Args {
 }
 
 /// One `match` instead of boxed futures and trait objects.
-pub async fn dispatch(w: &mut World, id: StepId, a: &Args) -> Result<(), String> {
-    match id {
+pub async fn dispatch(w: &mut World, id: StepId, a: &Args, attempt: u64) -> AttemptResult {
+    let result: Result<(), String> = match id {
         StepId::SetRequestHeader => api::set_header(w, a.cap(0), a.cap(1)),
         // The step names the value before the name: `I add "V" to the "H" request header`.
         StepId::AddRequestHeader => api::add_header(w, a.cap(1), a.cap(0)),
@@ -641,20 +658,71 @@ pub async fn dispatch(w: &mut World, id: StepId, a: &Args) -> Result<(), String>
             let (p, m) = (a.cap(0).to_string(), a.cap(1).to_string());
             api::request(w, &p, &m).await
         }
-        StepId::ResponseCode => assert::response_code(w, a.cap(0)),
-        StepId::ResponseHeader => assert::response_header(w, a.cap(0), a.cap(1)),
-        StepId::ResponseBodyContainsJson => assert::body_contains_json(w, a.docstring.as_ref()),
-        StepId::ResponseBodyEqualsJson => assert::body_equals_json(w, a.docstring.as_ref()),
-        StepId::ResponseArrayLength => assert::array_length(w, a.cap(0)),
-        StepId::JsonNodeExists => assert::json_node_exists(w, a.cap(0)),
+        StepId::ExpectEventually => {
+            w.arm_options(OptionsLayer::default());
+            Ok(())
+        }
+        StepId::ExpectWithin => {
+            let timeout_secs = parse_positive(a.cap(0))?;
+            w.arm_options(OptionsLayer {
+                polling: Some(PollingOptionsLayer {
+                    timeout_secs: Some(timeout_secs),
+                    interval_ms: None,
+                }),
+            });
+            Ok(())
+        }
+        StepId::ExpectWithinEvery => {
+            let timeout_secs = parse_positive(a.cap(0))?;
+            let interval_ms = parse_positive(a.cap(1))?;
+            if interval_ms > timeout_secs.saturating_mul(1000) {
+                Err("polling interval_ms must not exceed timeout_secs".to_string())
+            } else {
+                w.arm_options(OptionsLayer {
+                    polling: Some(PollingOptionsLayer {
+                        timeout_secs: Some(timeout_secs),
+                        interval_ms: Some(interval_ms),
+                    }),
+                });
+                Ok(())
+            }
+        }
+        StepId::ResponseCode => {
+            assert::replay_response(w, attempt).await?;
+            return assert::response_code(w, a.cap(0));
+        }
+        StepId::ResponseHeader => {
+            assert::replay_response(w, attempt).await?;
+            return assert::response_header(w, a.cap(0), a.cap(1));
+        }
+        StepId::ResponseBodyContainsJson => {
+            assert::replay_response(w, attempt).await?;
+            return assert::body_contains_json(w, a.docstring.as_ref());
+        }
+        StepId::ResponseBodyEqualsJson => {
+            assert::replay_response(w, attempt).await?;
+            return assert::body_equals_json(w, a.docstring.as_ref());
+        }
+        StepId::ResponseArrayLength => {
+            assert::replay_response(w, attempt).await?;
+            return assert::array_length(w, a.cap(0));
+        }
+        StepId::JsonNodeExists => {
+            assert::replay_response(w, attempt).await?;
+            return assert::json_node_exists(w, a.cap(0));
+        }
         StepId::SetVariable => vars::set_variable(w, a.cap(0), a.cap(1), false),
         StepId::SetVariableGlobal => vars::set_variable(w, a.cap(0), a.cap(1), true),
         StepId::ExtractFromJson => vars::extract_from_json(w, a.cap(0), a.cap(1), false),
         StepId::ExtractFromJsonGlobal => vars::extract_from_json(w, a.cap(0), a.cap(1), true),
         StepId::ExtractFromCookies => vars::extract_from_cookies(w, a.cap(0), a.cap(1), false),
         StepId::ExtractFromCookiesGlobal => vars::extract_from_cookies(w, a.cap(0), a.cap(1), true),
-        StepId::VariableEquals => vars::variable_equals(w, a.cap(0), a.cap(1), false),
-        StepId::VariableNotEquals => vars::variable_equals(w, a.cap(0), a.cap(1), true),
+        StepId::VariableEquals => {
+            return vars::variable_equals(w, a.cap(0), a.cap(1), false);
+        }
+        StepId::VariableNotEquals => {
+            return vars::variable_equals(w, a.cap(0), a.cap(1), true);
+        }
         StepId::EncryptWithAes => vars::encrypt_with_aes(w, a.cap(0), a.cap(1), a.cap(2)),
         StepId::UseApi => api::use_api(w, a.cap(0)),
         StepId::UseConnection => db::use_connection(w, a.cap(0)),
@@ -669,11 +737,13 @@ pub async fn dispatch(w: &mut World, id: StepId, a: &Args) -> Result<(), String>
         StepId::ExtractFromDb => {
             db::extract_from_db(w, a.cap(0), a.cap(1), a.cap(2), a.cap(3)).await
         }
-        StepId::ShouldHaveWith => db::should_have(w, a.cap(0), a.cap(1)).await,
-        StepId::ShouldHaveTable => db::should_have_table(w, a.cap(0), a.table.as_ref()).await,
-        StepId::ShouldNotHaveWith => db::should_not_have(w, a.cap(0), a.cap(1)).await,
+        StepId::ShouldHaveWith => return db::should_have(w, a.cap(0), a.cap(1)).await,
+        StepId::ShouldHaveTable => {
+            return db::should_have_table(w, a.cap(0), a.table.as_ref()).await;
+        }
+        StepId::ShouldNotHaveWith => return db::should_not_have(w, a.cap(0), a.cap(1)).await,
         StepId::ShouldNotHaveTable => {
-            db::should_not_have_table(w, a.cap(0), a.table.as_ref()).await
+            return db::should_not_have_table(w, a.cap(0), a.table.as_ref()).await;
         }
         StepId::CallProcedure => db::call_procedure(w, a.cap(0), a.cap(1)).await,
         StepId::CallFunction => db::call_function(w, a.cap(0), a.cap(1), a.cap(2)).await,
@@ -692,6 +762,18 @@ pub async fn dispatch(w: &mut World, id: StepId, a: &Args) -> Result<(), String>
         StepId::SrpCompleteLogin => {
             srp::complete_login(w, a.cap(0), a.cap(1), a.cap(2), a.cap(3), a.cap(4))
         }
+    };
+    result.map_err(AttemptError::Fatal)
+}
+
+fn parse_positive(value: &str) -> Result<u64, String> {
+    let parsed = value
+        .parse::<u64>()
+        .map_err(|_| format!("polling value must be a positive integer: {value:?}"))?;
+    if parsed == 0 {
+        Err("polling value must be positive".to_string())
+    } else {
+        Ok(parsed)
     }
 }
 
@@ -732,6 +814,60 @@ mod tests {
     #[test]
     fn all_builtin_patterns_compile() {
         assert!(Registry::new().is_ok());
+    }
+
+    #[test]
+    fn eventual_modifiers_are_registered_as_actions() {
+        let cases = [
+            (
+                "I expect the next assertion to pass eventually",
+                StepId::ExpectEventually,
+                vec![],
+            ),
+            (
+                r#"I expect the next assertion to pass within "10" seconds"#,
+                StepId::ExpectWithin,
+                vec!["10".to_string()],
+            ),
+            (
+                r#"I expect the next assertion to pass within "10" seconds, checking every "100" milliseconds"#,
+                StepId::ExpectWithinEvery,
+                vec!["10".to_string(), "100".to_string()],
+            ),
+        ];
+
+        for (text, expected_id, expected_caps) in cases {
+            let (target, caps) = reg().find(text).unwrap().expect("step is registered");
+            let StepTarget::Builtin { id, kind } = target else {
+                panic!("modifier resolved to a macro");
+            };
+            assert_eq!(id, expected_id);
+            assert_eq!(kind, StepKind::Action);
+            assert_eq!(caps, expected_caps);
+        }
+    }
+
+    #[test]
+    fn assertions_keep_their_option_source_in_registry_metadata() {
+        let cases = [
+            ("the response code is 200", OptionsSource::Http),
+            (
+                r#"variable "state" should be equal to "ready""#,
+                OptionsSource::Global,
+            ),
+            (
+                r#"I should have "users" with "state: ready""#,
+                OptionsSource::Db,
+            ),
+        ];
+
+        for (text, source) in cases {
+            let (target, _) = reg().find(text).unwrap().expect("assertion is registered");
+            let StepTarget::Builtin { kind, .. } = target else {
+                panic!("assertion resolved to a macro");
+            };
+            assert_eq!(kind, StepKind::Assertion(source));
+        }
     }
 
     #[test]

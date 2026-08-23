@@ -5,6 +5,8 @@ mod hawk;
 mod http;
 mod json;
 mod macros;
+mod options;
+mod polling;
 mod report;
 mod runner;
 mod srp;
@@ -106,7 +108,12 @@ async fn run(cli: Cli) -> Result<i32> {
             .collect();
         by_name.insert(
             name.clone(),
-            http::ApiResource::new(&api.base_url, api.timeout_secs, headers)?,
+            http::ApiResource::new(
+                &api.base_url,
+                api.timeout_secs,
+                headers,
+                api.effective_options.clone(),
+            )?,
         );
     }
     let apis = Arc::new(http::Apis::new(by_name, cfg.resolve_default_api()?)?);
@@ -137,6 +144,7 @@ async fn run(cli: Cli) -> Result<i32> {
         db,
         default_db,
         srp,
+        cfg.effective_options.clone(),
         cli.fail_fast,
     ));
 
