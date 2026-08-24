@@ -25,7 +25,10 @@ jobs:
         env:
           POSTGRES_PASSWORD: postgres
         ports:
+          # 5432 for the Rust DB tests, 5433 for examples/db.yaml, which is the
+          # file the README tells a reader to run against docker-compose.
           - 5432:5432
+          - 5433:5432
         options: >-
           --health-cmd pg_isready
           --health-interval 5s
@@ -61,6 +64,26 @@ jobs:
       # The apibdd_it fixture schema is shared, so DB tests run single-threaded.
       - name: Database tests
         run: cargo test --locked --test db -- --test-threads=1
+
+      # The examples are the tool's demonstration surface; without this they rot
+      # silently and the README's reader is the first to find out. Both suites run
+      # exactly as examples/README.md documents them, and a failed scenario exits 1.
+      # Smocker cannot be a service container: those start before checkout, so the
+      # mock file it mounts does not exist yet.
+      - name: Start the example mock server
+        run: |
+          docker compose up -d smocker
+          timeout 60 bash -c 'until curl -sf http://localhost:8081/mocks >/dev/null; do sleep 1; done'
+
+      # docker-compose seeds this through the entrypoint; the service container
+      # above comes up empty, so examples/db.yaml's schemas are applied by hand.
+      - name: Load the example database schema
+        run: psql -v ON_ERROR_STOP=1 "$BDDKIT_TEST_DSN" -f examples/db/init.sql
+
+      - name: Example suites
+        run: |
+          cargo run --locked --quiet -- --config examples/api.yaml
+          cargo run --locked --quiet -- --config examples/db.yaml
 
       - name: Package check
         run: cargo publish --dry-run --locked
