@@ -332,3 +332,30 @@ async fn srp_step2(body: String) -> impl IntoResponse {
     let m2 = srp_hash(&format!("{a_pub_hex}{expected_m1:064x}{s_hex}"));
     (StatusCode::OK, Json(json!({"m2": format!("{m2:064x}")})))
 }
+
+/// Builds the fixture plugin and returns the path to its shared library.
+/// Cargo caches it, so only the first test in a run pays for the build.
+#[allow(dead_code)]
+pub fn build_fixture_plugin() -> std::path::PathBuf {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let target = root.join("target/fixture-plugin");
+    let out = std::process::Command::new(env!("CARGO"))
+        .args(["build", "--manifest-path"])
+        .arg(root.join("tests/fixtures/echo-plugin/Cargo.toml"))
+        .arg("--target-dir")
+        .arg(&target)
+        .output()
+        .expect("failed to run cargo for the fixture plugin");
+    assert!(
+        out.status.success(),
+        "fixture plugin build failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let path = target.join("debug").join(format!(
+        "{}echo_plugin{}",
+        std::env::consts::DLL_PREFIX,
+        std::env::consts::DLL_SUFFIX
+    ));
+    assert!(path.exists(), "fixture plugin artifact missing at {}", path.display());
+    path
+}

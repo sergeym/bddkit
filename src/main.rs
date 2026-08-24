@@ -6,6 +6,7 @@ mod http;
 mod json;
 mod macros;
 mod options;
+mod plugin;
 mod polling;
 mod report;
 mod runner;
