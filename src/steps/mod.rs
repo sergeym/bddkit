@@ -2,6 +2,7 @@ pub mod api;
 pub mod assert;
 pub mod db;
 pub mod debug;
+pub mod plugin;
 pub mod srp;
 pub mod vars;
 
@@ -25,6 +26,7 @@ pub enum StepId {
     RequestPath,
     RequestPathWithMethod,
     UseApi,
+    UsePluginInstance,
     SignNextRequestWithHawk,
     ExpectEventually,
     ExpectWithin,
@@ -303,6 +305,13 @@ pub const BUILTIN_STEPS: &[StepDef] = &[
 pub enum StepTarget {
     Builtin { id: StepId, kind: StepKind },
     Macro(usize),
+    /// A step served over FFI. It never becomes a `StepId`, which is what
+    /// keeps `dispatch`'s exhaustive match (invariant 4) meaningful.
+    Plugin {
+        lib: usize,
+        step: usize,
+        assertion: bool,
+    },
 }
 
 impl PartialEq<StepId> for StepTarget {
@@ -326,6 +335,18 @@ impl Registry {
     }
 
     pub fn with_macros(catalog: MacroCatalog) -> Result<Self, String> {
+        Self::with_macros_and_plugins(catalog, &[], &[])
+    }
+
+    /// Everything is registered before macros are validated, so a macro body may
+    /// name a plugin step. Order inside `entries` is irrelevant — `find` collects
+    /// every match and reports ambiguity — but a plugin pattern that is not in the
+    /// registry yet is indistinguishable from a typo.
+    pub fn with_macros_and_plugins(
+        catalog: MacroCatalog,
+        plugin_steps: &[(usize, usize, String, bool)],
+        plugin_groups: &[String],
+    ) -> Result<Self, String> {
         let mut entries = Vec::with_capacity(BUILTIN_STEPS.len());
         for def in BUILTIN_STEPS {
             let re = Regex::new(def.pattern)
@@ -341,10 +362,14 @@ impl Registry {
         for (index, definition) in catalog.definitions.iter().enumerate() {
             entries.push((StepTarget::Macro(index), definition.regex.clone()));
         }
-        let registry = Self {
+        let mut registry = Self {
             entries,
             macros: catalog.definitions,
         };
+        for (lib, step, pattern, assertion) in plugin_steps {
+            registry.add_plugin_step(*lib, *step, pattern, *assertion)?;
+        }
+        registry.add_use_group_step(plugin_groups)?;
         registry.validate_macros()?;
         Ok(registry)
     }
@@ -376,6 +401,54 @@ impl Registry {
 
     pub fn macro_def(&self, index: usize) -> &MacroDef {
         &self.macros[index]
+    }
+
+    /// Registers one pattern a plugin declared. Called at startup, before the
+    /// first request, so `validate::check` still sees every step (invariant 1).
+    ///
+    /// ponytail: no static overlap analysis between two arbitrary plugin
+    /// regexes — `find` reports ambiguity per step and `validate::check` runs
+    /// it over every selected step, which catches every collision that can
+    /// actually fire. Upgrade path if a startup-time check is ever wanted:
+    /// extend the `patterns_overlap` token model in this file to raw regexes.
+    pub fn add_plugin_step(
+        &mut self,
+        lib: usize,
+        step: usize,
+        pattern: &str,
+        assertion: bool,
+    ) -> Result<(), String> {
+        let re = Regex::new(pattern)
+            .map_err(|e| format!("invalid plugin step pattern {pattern:?}: {e}"))?;
+        self.entries
+            .push((StepTarget::Plugin { lib, step, assertion }, re));
+        Ok(())
+    }
+
+    /// Registers `I use "<name>" <group>` over the groups the loaded plugins
+    /// actually claim. The alternation is built from the real group names, so
+    /// the pattern cannot overlap `I use "<name>" api` or
+    /// `I use "<conn>" connection` and no existing .feature changes meaning.
+    pub fn add_use_group_step(&mut self, groups: &[String]) -> Result<(), String> {
+        if groups.is_empty() {
+            return Ok(());
+        }
+        let alternation = groups
+            .iter()
+            .map(|g| regex::escape(g))
+            .collect::<Vec<_>>()
+            .join("|");
+        let pattern = format!(r#"^I use "([^"]*)" ({alternation})$"#);
+        let re = Regex::new(&pattern)
+            .map_err(|e| format!("invalid group-switch pattern {pattern:?}: {e}"))?;
+        self.entries.push((
+            StepTarget::Builtin {
+                id: StepId::UsePluginInstance,
+                kind: StepKind::Action,
+            },
+            re,
+        ));
+        Ok(())
     }
 
     fn validate_macros(&self) -> Result<(), String> {
@@ -414,6 +487,7 @@ impl Registry {
             for step in &definition.body {
                 match self.find(&step.text)? {
                     Some((StepTarget::Builtin { .. }, _)) => {}
+                    Some((StepTarget::Plugin { .. }, _)) => {}
                     Some((StepTarget::Macro(_), _)) if step.docstring.is_some() => {
                         return Err(format!(
                             "macro call {:?} with a doc string inside macro {:?} from {}:{} is not supported",
@@ -725,6 +799,7 @@ pub async fn dispatch(w: &mut World, id: StepId, a: &Args, attempt: u64) -> Atte
         }
         StepId::EncryptWithAes => vars::encrypt_with_aes(w, a.cap(0), a.cap(1), a.cap(2)),
         StepId::UseApi => api::use_api(w, a.cap(0)),
+        StepId::UsePluginInstance => plugin::use_instance(w, a.cap(1), a.cap(0)),
         StepId::UseConnection => db::use_connection(w, a.cap(0)),
         StepId::DebugOn => db::debug_on(w),
         StepId::DebugOff => db::debug_off(w),
@@ -814,6 +889,151 @@ mod tests {
     #[test]
     fn all_builtin_patterns_compile() {
         assert!(Registry::new().is_ok());
+    }
+
+    #[test]
+    fn a_plugin_step_is_found_like_any_other() {
+        let mut reg = Registry::new().expect("registry");
+        reg.add_plugin_step(0, 1, r#"^I upload file "([^"]*)" to "([^"]*)"$"#, false)
+            .expect("valid pattern");
+        let (target, caps) = reg
+            .find(r#"I upload file "report.pdf" to "backups""#)
+            .expect("no ambiguity")
+            .expect("matched");
+        assert_eq!(
+            target,
+            StepTarget::Plugin { lib: 0, step: 1, assertion: false }
+        );
+        assert_eq!(caps, vec!["report.pdf".to_string(), "backups".to_string()]);
+    }
+
+    #[test]
+    fn an_invalid_plugin_pattern_is_rejected_at_registration() {
+        let mut reg = Registry::new().expect("registry");
+        let error = reg
+            .add_plugin_step(0, 0, "^I upload file \"([^\"]*$", false)
+            .expect_err("unbalanced group");
+        assert!(error.contains("plugin"), "{error}");
+    }
+
+    #[test]
+    fn a_plugin_pattern_colliding_with_a_builtin_is_an_ambiguity_error() {
+        // Cross-layer ambiguity needs no separate checker: `find` already reports
+        // every match, and validate::check runs `find` over every selected step
+        // before the first request.
+        let mut reg = Registry::new().expect("registry");
+        reg.add_plugin_step(0, 0, r#"^the response code is (\d+)$"#, true)
+            .expect("valid pattern");
+        let error = reg
+            .find("the response code is 200")
+            .expect_err("two definitions match");
+        assert!(error.contains("several definitions"), "{error}");
+    }
+
+    #[test]
+    fn the_group_switch_step_does_not_shadow_api_or_connection() {
+        let reg = Registry::with_macros_and_plugins(
+            MacroCatalog { definitions: Vec::new() },
+            &[],
+            &["widget".to_string(), "browser".to_string()],
+        )
+        .expect("registry");
+
+        let (api_target, _) = reg
+            .find(r#"I use "main" api"#)
+            .expect("no ambiguity")
+            .expect("matched");
+        assert_eq!(api_target, StepTarget::Builtin { id: StepId::UseApi, kind: StepKind::Action });
+
+        let (conn_target, _) = reg
+            .find(r#"I use "pg" connection"#)
+            .expect("no ambiguity")
+            .expect("matched");
+        assert_eq!(
+            conn_target,
+            StepTarget::Builtin { id: StepId::UseConnection, kind: StepKind::Action }
+        );
+
+        let (group_target, caps) = reg
+            .find(r#"I use "bucket-a" widget"#)
+            .expect("no ambiguity")
+            .expect("matched");
+        assert_eq!(
+            group_target,
+            StepTarget::Builtin { id: StepId::UsePluginInstance, kind: StepKind::Action }
+        );
+        assert_eq!(caps, vec!["bucket-a".to_string(), "widget".to_string()], "name before group");
+    }
+
+    #[test]
+    fn a_group_name_with_regex_metacharacters_is_escaped_not_interpreted() {
+        let reg = Registry::with_macros_and_plugins(
+            MacroCatalog { definitions: Vec::new() },
+            &[],
+            &["widget.beta".to_string()],
+        )
+        .expect("registry");
+
+        // If the dot were left as a regex metachar it would match any single
+        // character here too, not just a literal dot.
+        assert!(
+            reg.find(r#"I use "x" widgetXbeta"#).expect("no ambiguity").is_none(),
+            "an unescaped '.' would wrongly match any character"
+        );
+        assert!(
+            reg.find(r#"I use "x" widget.beta"#).expect("no ambiguity").is_some(),
+            "the literal group name must still match"
+        );
+    }
+
+    #[test]
+    fn a_macro_body_may_call_a_plugin_step() {
+        // Macros exist to compose steps and plugins exist to add steps.
+        // Validating macros before the plugin patterns are registered made a
+        // plugin step in a macro body indistinguishable from a typo.
+        let path = std::env::temp_dir().join(format!(
+            "bddkit-steps-macro-calls-plugin-{}.yaml",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            "- step: I do the plugin thing\n  do: [I upload file \"a\" to \"b\"]\n",
+        )
+        .expect("write macro file");
+        let catalog = MacroCatalog::load(std::slice::from_ref(&path)).expect("macro loads");
+        std::fs::remove_file(&path).ok();
+
+        let reg = Registry::with_macros_and_plugins(
+            catalog,
+            &[(0, 1, r#"^I upload file "([^"]*)" to "([^"]*)"$"#.to_string(), false)],
+            &[],
+        )
+        .expect("a plugin step in a macro body is not a typo");
+
+        let (target, _) = reg
+            .find("I do the plugin thing")
+            .expect("no ambiguity")
+            .expect("matched");
+        assert_eq!(target, StepTarget::Macro(0));
+    }
+
+    #[test]
+    fn a_macro_body_calling_a_truly_unknown_step_still_fails() {
+        let path = std::env::temp_dir().join(format!(
+            "bddkit-steps-macro-calls-unknown-{}.yaml",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            "- step: I do the mystery thing\n  do: [I have never heard of this step]\n",
+        )
+        .expect("write macro file");
+        let catalog = MacroCatalog::load(std::slice::from_ref(&path)).expect("macro loads");
+        std::fs::remove_file(&path).ok();
+
+        let error = Registry::with_macros_and_plugins(catalog, &[], &[])
+            .expect_err("no builtin, macro, or plugin step matches");
+        assert!(error.contains("unknown step"), "{error}");
     }
 
     #[test]

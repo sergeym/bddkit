@@ -129,6 +129,9 @@ fn execute_step<'a>(
                 }
                 world.vars.pop_frame(&definition.exports)
             }
+            // Real dispatch over FFI is Task 10's job. Until then the arm
+            // must exist for the match to stay exhaustive (invariant 4).
+            StepTarget::Plugin { .. } => Err("plugin step dispatch is not implemented yet".into()),
         }
     })
 }
@@ -212,6 +215,7 @@ pub async fn run_file(lf: Arc<LoadedFeature>, ctx: Arc<RunContext>) -> FileResul
         ctx.generator.clone(),
         crate::db::DbHandle::new(ctx.db.clone(), ctx.default_db.clone()),
         ctx.srp.clone(),
+        None,
         ctx.options.clone(),
     );
     let mut scenarios = Vec::new();

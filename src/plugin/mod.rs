@@ -15,12 +15,16 @@ use anyhow::{Context, Result, bail};
 use library::Library;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Group names the host serves itself. A plugin claiming one of these would
 /// shadow `resources.api` or `resources.db`, so it is refused at startup.
-const HOST_GROUPS: &[&str] = &["api", "db", "srp"];
+/// `connection` is the built-in step word for the `db` group (`I use "<conn>"
+/// connection`) — a plugin claiming it would build a group-switch step that
+/// exactly overlaps the built-in one, so it is refused for the same reason.
+const HOST_GROUPS: &[&str] = &["api", "db", "srp", "connection"];
 
 /// Everything about plugins that lives for the whole run. Shared through
 /// `RunContext`, so every field is `Send + Sync`: handles are `u64`, and the
@@ -314,6 +318,71 @@ fn undeclared(group: &str, instance: &str) -> String {
     format!("instance {instance:?} is not declared in resources.{group}")
 }
 
+/// The scenario's current instance per group. Selection is per group on
+/// purpose: switching the browser must not disturb the selected widget instance.
+pub struct PluginState {
+    plugins: Option<Arc<Plugins>>,
+    defaults: BTreeMap<String, String>,
+    current: BTreeMap<String, String>,
+}
+
+impl PluginState {
+    pub fn new(plugins: Option<Arc<Plugins>>) -> Self {
+        let defaults = plugins
+            .as_ref()
+            .map(|p| p.defaults().clone())
+            .unwrap_or_default();
+        Self {
+            plugins,
+            current: defaults.clone(),
+            defaults,
+        }
+    }
+
+    /// `PluginState::new` already takes its defaults from `Plugins::defaults()`;
+    /// nothing in production sets them again. Kept for tests that need a
+    /// `PluginState` without loading a real `Plugins`.
+    #[cfg(test)]
+    pub fn set_defaults(&mut self, defaults: BTreeMap<String, String>) {
+        self.current = defaults.clone();
+        self.defaults = defaults;
+    }
+
+    pub fn plugins(&self) -> Option<&Arc<Plugins>> {
+        self.plugins.as_ref()
+    }
+
+    pub fn current(&self, group: &str) -> Result<&str, String> {
+        self.current.get(group).map(String::as_str).ok_or_else(|| {
+            format!(
+                "no instance of the resource group {group:?} is selected, and no default_{group} is set"
+            )
+        })
+    }
+
+    pub fn use_instance(&mut self, group: &str, name: &str) -> Result<(), String> {
+        let declared = self
+            .plugins
+            .as_ref()
+            .is_some_and(|p| p.is_declared(group, name));
+        if !declared {
+            return Err(undeclared(group, name));
+        }
+        self.current.insert(group.to_string(), name.to_string());
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn use_instance_unchecked(&mut self, group: &str, name: &str) {
+        self.current.insert(group.to_string(), name.to_string());
+    }
+
+    /// Per invariant 2 the selection returns to `default_<group>`.
+    pub fn reset(&mut self) {
+        self.current = self.defaults.clone();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -478,5 +547,21 @@ mod tests {
         let first = plugins.next_artifacts_dir();
         let second = plugins.next_artifacts_dir();
         assert_ne!(first, second, "two workers must never share an artifact path");
+    }
+
+    #[test]
+    fn switching_to_a_declared_instance_selects_it_and_an_undeclared_one_is_an_error() {
+        let plugins = Plugins::load(vec![entry()], &[instance("a", Some("p-"))], &["echo".into()])
+            .expect("loads");
+        let mut state = PluginState::new(Some(Arc::new(plugins)));
+        state.use_instance("echo", "a").expect("declared instance");
+        assert_eq!(state.current("echo").expect("selected"), "a");
+        let error = state.use_instance("echo", "ghost").expect_err("undeclared");
+        assert!(error.contains("ghost") && error.contains("echo"), "{error}");
+        assert_eq!(
+            state.current("echo").expect("selected"),
+            "a",
+            "a failed switch must not change the selection"
+        );
     }
 }

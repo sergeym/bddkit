@@ -18,6 +18,8 @@ pub struct World {
     /// Run-wide configuration, not scenario state: `reset_scenario`
     /// does not touch it.
     pub srp: Option<Arc<crate::srp::SrpParams>>,
+    /// Scenario state: which instance of each plugin group is selected.
+    pub plugins: crate::plugin::PluginState,
 }
 
 impl World {
@@ -26,6 +28,7 @@ impl World {
         generator: Arc<Generator>,
         db: DbHandle,
         srp: Option<Arc<crate::srp::SrpParams>>,
+        plugins: Option<Arc<crate::plugin::Plugins>>,
         options: Options,
     ) -> Self {
         Self {
@@ -37,6 +40,7 @@ impl World {
             srp,
             options,
             pending_options: None,
+            plugins: crate::plugin::PluginState::new(plugins),
         }
     }
 
@@ -54,6 +58,7 @@ impl World {
         self.db.reset();
         self.debug = false;
         self.pending_options = None;
+        self.plugins.reset();
     }
 }
 
@@ -83,11 +88,41 @@ mod tests {
             Arc::new(Generator::new()),
             DbHandle::new(None, String::new()),
             None,
+            None,
             Options::default(),
         );
         w.debug = true;
         w.reset_scenario();
         assert!(!w.debug, "debug resets at the scenario boundary");
+    }
+
+    #[test]
+    fn the_current_plugin_instance_resets_at_the_scenario_boundary() {
+        // Invariant 2: a scenario never inherits the instance another one switched
+        // to, exactly as the current API resource resets.
+        let mut state = crate::plugin::PluginState::new(None);
+        state.set_defaults([("echo".to_string(), "a".to_string())].into_iter().collect());
+        state.use_instance_unchecked("echo", "b");
+        assert_eq!(state.current("echo").expect("selected"), "b");
+        state.reset();
+        assert_eq!(state.current("echo").expect("selected"), "a");
+    }
+
+    #[test]
+    fn reset_scenario_resets_the_plugin_selection() {
+        let mut w = World::new(
+            apis(),
+            Arc::new(Generator::new()),
+            DbHandle::new(None, String::new()),
+            None,
+            None,
+            Options::default(),
+        );
+        w.plugins
+            .set_defaults([("echo".to_string(), "a".to_string())].into_iter().collect());
+        w.plugins.use_instance_unchecked("echo", "b");
+        w.reset_scenario();
+        assert_eq!(w.plugins.current("echo").expect("selected"), "a");
     }
 
     #[test]
@@ -103,6 +138,7 @@ mod tests {
             Arc::new(Generator::new()),
             DbHandle::new(None, String::new()),
             Some(params),
+            None,
             Options::default(),
         );
         w.reset_scenario();
