@@ -3,5 +3,5 @@ macro_paths: [examples/macros]
 
 resources:
   api:
-    jsonplaceholder:
-      base_url: https://jsonplaceholder.typicode.com/
+    api-server:
+      base_url: http://localhost:8080/
