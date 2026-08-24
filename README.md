@@ -58,17 +58,39 @@ re-run. JSON mismatches point at the path that differs.
 ## Quick start
 
 ```bash
+docker compose up -d smocker   # local mock API the example talks to
 cargo build --release
 ./target/release/bddkit --config examples/api.yaml
 ```
 
 ```console
 run m4k2p9x7q3b1
-  ✓ examples/features/demo.feature — scenarios: 2
+  ✓ examples/features/methods.feature — scenarios: 8
+  ✓ examples/features/json_matchers.feature — scenarios: 4
+  ✓ examples/features/variables.feature — scenarios: 5
+  ✓ examples/features/macros.feature — scenarios: 6
+  ✓ examples/features/content_types.feature — scenarios: 4
+  ✓ examples/features/eventual.feature — scenarios: 1
 
 run m4k2p9x7q3b1
-files: 1, scenarios: 2, failed: 0
+files: 6, scenarios: 28, failed: 0
 ```
+
+The example suite talks to a local [Smocker](https://github.com/smocker-dev/smocker)
+instance seeded from `examples/mocks/api-server.yaml`, so it runs offline and
+its responses are fixed by a file in this repo. Smocker's web UI is on
+<http://localhost:8081>.
+
+The database examples are a second suite with its own config and its own
+container:
+
+```bash
+docker compose up -d db
+./target/release/bddkit --config examples/db.yaml
+```
+
+`examples/README.md` covers both suites, what each feature file demonstrates,
+and how to narrow a run to one file or one tag.
 
 Flags: `--config` (required), positional paths to override the config's,
 `--tag` (repeatable), `--env` to pick a `.env.<name>` layer, `--fail-fast`.
@@ -111,9 +133,16 @@ contend, `@priority(N)` moves one up the queue.
 | For | Look at |
 |---|---|
 | Every step, authoritative | `BUILTIN_STEPS` in `src/steps/mod.rs` |
+| How to run the examples | `examples/README.md` |
 | A runnable HTTP example | `examples/api.yaml`, `examples/features/` |
+| Every HTTP method, 404 included | `examples/features/methods.feature` |
+| JSON matchers and paths | `examples/features/json_matchers.feature` |
+| Variables: set, extract, reuse | `examples/features/variables.feature` |
+| Macros, nesting, Scenario Outline | `examples/features/macros.feature`, `examples/macros/posts.yaml` |
+| Non-JSON responses, form login | `examples/features/content_types.feature` |
+| Polling an assertion until it passes | `examples/features/eventual.feature` |
+| The mock API behind all of it | `examples/mocks/api-server.yaml` |
 | Every DB step, worked through | `examples/db-features/db.feature` |
-| Macros with parameters and exports | `examples/macros/`, `tests/macros/` |
 | SRP handshake, Hawk signing | `tests/features/` |
 | Config schema | `src/config.rs` |
 
@@ -147,7 +176,10 @@ cargo test
 ```
 
 Some tests need PostgreSQL; `docker-compose.yml` brings one up and
-`examples/db/init.sql` creates the schema.
+`examples/db/init.sql` creates the schema. The same file brings up
+[Smocker](https://github.com/smocker-dev/smocker) as the HTTP example's mock
+API — it seeds `examples/mocks/api-server.yaml` at startup and serves it on
+`localhost:8080` (web UI on `localhost:8081`).
 
 ## License
 
