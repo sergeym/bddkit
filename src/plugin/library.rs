@@ -6,6 +6,7 @@ use super::abi::{
 };
 use anyhow::{Context, Result, bail};
 use std::ffi::{CStr, CString, c_char};
+use std::mem::ManuallyDrop;
 use std::path::Path;
 
 type AbiVersionFn = unsafe extern "C" fn() -> u32;
@@ -58,8 +59,18 @@ impl Library {
         // SAFETY: dlopen runs the library's initialisers, which is inherently
         // unsafe and cannot be made safe. Installing a plugin is a trust
         // decision, stated as a non-goal in the design.
-        let library = unsafe { libloading::Library::new(path) }
-            .with_context(|| format!("failed to load plugin {name:?} from {}", path.display()))?;
+        // `ManuallyDrop` is the whole point: every `?` below leaves the mapping
+        // in place instead of `dlclose`-ing it. `dlopen` has already run the
+        // library's initialisers by then, so a plugin that registered an
+        // `atexit` handler or a thread-local destructor would have it run
+        // against an unmapped page — the same reason `load_plugins` leaks the
+        // libraries at exit. A rejected plugin is a "nothing ran" exit anyway,
+        // so one leaked mapping costs nothing.
+        let library = ManuallyDrop::new(
+            unsafe { libloading::Library::new(path) }.with_context(|| {
+                format!("failed to load plugin {name:?} from {}", path.display())
+            })?,
+        );
 
         // The version check comes before any other symbol is resolved: a
         // binary from another ABI generation may not even have the rest.
@@ -71,8 +82,8 @@ impl Library {
         // lifetime, so its validity rests on the mapping outliving it, in both
         // of the two cases: on success `_library` is the last field of `Self`
         // and so is dropped after every pointer stored beside it; on any error
-        // path below `Self` is never built and the mapping drops first, which
-        // is sound only because no copied pointer is called after that point.
+        // path below the mapping is leaked by the `ManuallyDrop` above and so
+        // outlives every pointer copied out of it.
         let abi: AbiVersionFn = *unsafe { library.get(b"bddkit_abi_version\0") }
             .with_context(|| format!("plugin {name:?} exports no bddkit_abi_version"))?;
         // SAFETY: this one call is an unavoidable act of faith. Every other
@@ -124,10 +135,6 @@ impl Library {
         if manifest.groups.is_empty() {
             bail!("plugin {name:?} claims no resource group");
         }
-        // Before any further FFI work: asking a plugin for its step list and
-        // then rejecting it is wasted round trips.
-        check_concurrency(name, &manifest)?;
-
         // SAFETY: as for `manifest_fn` above.
         let steps_json = unsafe { take(free_string, list_steps_fn()) }
             .with_context(|| format!("plugin {name:?} returned no step list"))?;
@@ -145,11 +152,10 @@ impl Library {
             drop_instance,
             reset_scenario,
             free_string,
-            _library: library,
+            _library: ManuallyDrop::into_inner(library),
         })
     }
 
-    #[cfg(test)]
     pub fn has_reset_scenario(&self) -> bool {
         self.reset_scenario.is_some()
     }
@@ -225,7 +231,7 @@ impl Library {
 }
 
 /// The host speaks exactly one ABI generation. A pure predicate over the
-/// reported number, extracted for the same reason as `check_concurrency`: it is
+/// reported number, extracted for the same reason as `check_reset_scenario`: it is
 /// reachable from a unit test without building a cdylib per rejection case.
 fn check_abi_version(name: &str, reported: u32) -> Result<()> {
     if reported != ABI_VERSION {
@@ -242,7 +248,7 @@ fn check_abi_version(name: &str, reported: u32) -> Result<()> {
 /// as a mis-routed step much later.
 ///
 /// A pure predicate over already-parsed data, for the same reason as
-/// `check_concurrency`.
+/// `check_reset_scenario`.
 fn check_step_groups(name: &str, manifest: &Manifest, steps: &[StepSpec]) -> Result<()> {
     for step in steps {
         if !manifest.groups.contains(&step.group) {
@@ -256,17 +262,29 @@ fn check_step_groups(name: &str, manifest: &Manifest, steps: &[StepSpec]) -> Res
     Ok(())
 }
 
-/// P1 implements `shared` only. Treating `per_worker` as `shared` would hand an
-/// instance the plugin declared is NOT thread-safe to several concurrent
-/// workers — a data race inside someone else's cdylib, surfacing as a flaky
-/// suite. Refuse it instead of degrading it.
+/// A `shared` instance serves every worker at once, so its per-scenario reset
+/// cannot be scoped to the worker whose scenario just ended: one worker's
+/// boundary would clear state another is mid-scenario in — the reviewer saw
+/// both an assertion that never passed because its counter kept being zeroed,
+/// and a file with no plugin steps at all failing on another file's instance.
+/// `per_worker` has no such problem — its instances belong to one file — so it
+/// is allowed at any concurrency, and declaring it is the remedy this message
+/// offers.
 ///
-/// A free function over a parsed manifest, not an inline check, so it is
-/// reachable from a unit test without building a second cdylib.
-fn check_concurrency(name: &str, manifest: &Manifest) -> Result<()> {
-    if manifest.concurrency == Concurrency::PerWorker {
+/// A free function over already-parsed data, so it is reachable from a unit
+/// test without building a cdylib per rejection case.
+pub fn check_reset_scenario(
+    name: &str,
+    concurrency_mode: Concurrency,
+    exports_reset: bool,
+    concurrency: usize,
+) -> Result<()> {
+    if exports_reset && concurrency_mode == Concurrency::Shared && concurrency > 1 {
         bail!(
-            "plugin {name:?} declares concurrency \"per_worker\", which this bddkit does not implement yet"
+            "plugin {name:?} declares concurrency \"shared\" and exports \
+             bddkit_reset_scenario, but this run has concurrency {concurrency}: a shared \
+             instance cannot have its per-scenario reset scoped to one worker. Declare \
+             \"per_worker\" in the manifest, or set concurrency: 1"
         );
     }
     Ok(())
@@ -431,14 +449,31 @@ mod tests {
     }
 
     #[test]
-    fn a_per_worker_plugin_is_refused_rather_than_downgraded() {
-        // Treating it as `shared` would hand an instance the plugin declared is
-        // not thread-safe to several concurrent workers.
-        let manifest: Manifest = serde_json::from_str(
-            r#"{"name":"browser","version":"1.0.0","groups":["browser"],"concurrency":"per_worker"}"#,
-        )
-        .expect("manifest parses");
-        let error = check_concurrency("browser", &manifest).expect_err("refused");
-        assert!(format!("{error:#}").contains("per_worker"), "{error:#}");
+    fn a_shared_plugin_with_a_reset_is_still_refused_in_parallel() {
+        let error = check_reset_scenario("echo", Concurrency::Shared, true, 8)
+            .expect_err("refused");
+        let text = format!("{error:#}");
+        assert!(text.contains("echo"), "{text}");
+        assert!(text.contains("bddkit_reset_scenario"), "{text}");
+        assert!(text.contains("concurrency: 1"), "{text}");
+        assert!(text.contains("per_worker"), "the remedy is named: {text}");
+        // At the boundary too: the rule is "more than one worker", not "many".
+        check_reset_scenario("echo", Concurrency::Shared, true, 2).expect_err("refused at 2");
+    }
+
+    #[test]
+    fn a_per_worker_plugin_with_a_reset_loads_in_parallel() {
+        // This is the whole point of the milestone.
+        check_reset_scenario("browser", Concurrency::PerWorker, true, 8).expect("allowed");
+    }
+
+    #[test]
+    fn a_shared_plugin_with_a_reset_loads_sequentially() {
+        check_reset_scenario("echo", Concurrency::Shared, true, 1).expect("allowed");
+    }
+
+    #[test]
+    fn a_plugin_without_a_reset_loads_at_any_concurrency() {
+        check_reset_scenario("echo", Concurrency::Shared, false, 8).expect("allowed");
     }
 }

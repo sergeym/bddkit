@@ -19,10 +19,10 @@ pub const ABI_VERSION: u32 = 1;
 /// A message used whenever a plugin reports failure without giving a reason.
 const NO_MESSAGE: &str = "the plugin reported a failure with no message";
 
-/// The loader must refuse a manifest declaring `PerWorker` rather than
-/// silently treating it as `Shared`: that would hand an instance the plugin
-/// declared is *not* thread-safe to several concurrent workers at once — a
-/// data race inside someone else's cdylib, surfacing as a flaky suite.
+/// The loader must never silently treat a manifest declaring `PerWorker` as
+/// `Shared`: that would hand an instance the plugin declared is *not*
+/// thread-safe to several concurrent workers at once — a data race inside
+/// someone else's cdylib, surfacing as a flaky suite.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Concurrency {
@@ -30,7 +30,9 @@ pub enum Concurrency {
     /// safe to call from several workers at once.
     #[default]
     Shared,
-    /// One instance per worker. Declared in the ABI but not implemented in P1.
+    /// One instance per feature file: the plugin's state is never touched by
+    /// two workers at once, so it may keep per-scenario state at any
+    /// concurrency.
     ///
     /// The value set is closed on purpose: a scheduling mode the host does not
     /// implement cannot be degraded into one it does, so a new mode comes with

@@ -79,8 +79,15 @@ fn load_plugins(
         )?,
         &cfg.plugin_instances,
         &groups_in_config,
+        cfg.concurrency,
     )?;
-    cfg.check_group_defaults()?;
+    // Only meaningful once a plugin is loaded. With none there are no resource
+    // groups at all, so every top-level `default_*` key is the unknown key
+    // `Config` has always tolerated — it has never had `deny_unknown_fields`,
+    // and a suite written before plugins existed must keep running unchanged.
+    if !plugins.is_empty() {
+        cfg.check_group_defaults()?;
+    }
     let mut defaults = std::collections::BTreeMap::new();
     for group in &groups_in_config {
         if let Some(name) = cfg.resolve_default_group(group)? {

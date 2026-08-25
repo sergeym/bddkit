@@ -52,7 +52,7 @@ The build produces `libbddkit_s3.so` (Linux), `libbddkit_s3.dylib` (macOS) or `b
 
 A missing required symbol fails the load with a message naming the symbol. **Returning NULL from any of the string-returning exports is an error**, reported as "plugin `<name>` returned nothing from `<call>`" — there is no reply shape that means "nothing to say"; say it with an envelope.
 
-At load the host does, in order: `dlopen`; call `bddkit_abi_version` and refuse anything but `1`; resolve every required symbol, then `bddkit_reset_scenario` if it is exported; call `bddkit_manifest`; refuse a manifest whose `name` differs from the lock entry's name, or whose `groups` is empty, or whose `concurrency` is not `shared`; call `bddkit_list_steps`; refuse any step whose `group` the manifest does not claim. Nothing else is called until a scenario reaches a step.
+At load the host does, in order: `dlopen`; call `bddkit_abi_version` and refuse anything but `1`; resolve every required symbol, then `bddkit_reset_scenario` if it is exported; call `bddkit_manifest`; refuse a manifest whose `name` differs from the lock entry's name, or whose `groups` is empty, or whose `concurrency` is a value outside the closed set of section 6; call `bddkit_list_steps`; refuse any step whose `group` the manifest does not claim; refuse a plugin that declares `shared`, exports `bddkit_reset_scenario`, and meets a run whose `concurrency` is greater than 1 (see that export below). Nothing else is called until a scenario reaches a step.
 
 ### `bddkit_abi_version`
 
@@ -128,7 +128,7 @@ Reply — the **envelope**, shared with `drop_instance` and `reset_scenario`:
 
 ### `bddkit_init_instance`
 
-Called **lazily**: the first time a scenario runs a step of that group with that instance selected. A declared instance nobody uses is validated but never initialised. This is where you open connections, spawn processes, authenticate.
+Called **lazily**: the first time a scenario runs a step of that group with that instance selected. Under `shared` that happens once for the whole run; under `per_worker` it happens once per feature file that reaches such a step, because each file gets its own instance — see section 6. A declared instance nobody uses is validated but never initialised. This is where you open connections, spawn processes, authenticate.
 
 Request: identical to `validate_config`.
 
@@ -146,7 +146,7 @@ Reply:
 
 **A failed init is not cached.** The step that triggered it fails, and the *next* step of that group tries again — so an expensive initialisation that keeps failing is re-attempted per step, not once per run. Fail fast, and put anything slow-but-optional behind the first dispatch that needs it.
 
-**Every call must return a handle distinct from every other live instance of your plugin.** The host initialises without holding its lock, so two workers can call `init_instance` for the same instance at the same time; the loser's handle is then passed to `bddkit_drop_instance` while the winner's stays in use. A plugin that returns a singleton handle would have its live instance destroyed underneath it by that drop.
+**Every call must return a handle distinct from every other live instance of your plugin.** The host initialises without holding its lock, so two workers can call `init_instance` for the same instance at the same time; the loser's handle is then passed to `bddkit_drop_instance` while the winner's stays in use. A plugin that returns a singleton handle would have its live instance destroyed underneath it by that drop. Under `per_worker` several handles being live at once is not a race but the normal state of a parallel run: every feature file that runs a step of yours holds its own.
 
 ### `bddkit_dispatch`
 
@@ -205,13 +205,15 @@ A diagnostic is `{"title", "kind", "content", "path"}`: `title` and `kind` are r
 
 ### `bddkit_drop_instance`
 
-`bddkit_drop_instance(handle)`, replying with an envelope. Called once per live instance after the worker pool drains, on **every** exit path including a failed run and `--fail-fast`. Close connections and kill child processes here: a plugin's external process must not outlive the run. A failure is printed as a warning and does not change the exit code.
+`bddkit_drop_instance(handle)`, replying with an envelope. **When it is called depends on the mode in section 6:** a `per_worker` instance is dropped when its feature file ends — mid-run, while other files are still working — and a `shared` one after the worker pool has drained. Both happen on **every** exit path, including a failed run and `--fail-fast`: a file that panics never reaches its own cleanup, so the host sweeps whatever is still registered at the end of the run instead. One more case is neither, and it is `per_worker` only: a per-file handle whose very first dispatch failed at the boundary — a malformed reply, a NUL byte, no reply at all — is dropped right there, before the step's error is reported, because nothing else holds it yet. A `shared` handle in the same situation is kept and reused, since it is already the run's one instance for that group. Close connections and kill child processes here whichever mode you declare: a plugin's external process must not outlive the run, and under `per_worker` it must not outlive its file. A failure is printed as a warning and does not change the exit code.
 
 ### `bddkit_reset_scenario`
 
 `bddkit_reset_scenario(handle)`, replying with an envelope. Optional — a plugin with no per-scenario state need not export it, and the host then treats every reset as `ok`.
 
-Called at the scenario boundary for every instance that has been initialised, before the Background steps of the next scenario. This is the plugin's half of bddkit's state rule: HTTP state and the selected instance reset per scenario, variables do not. Clear anything the previous scenario left behind.
+**A plugin that keeps per-scenario state must declare `per_worker`.** Its instance belongs to one feature file, so the only boundary that resets it is that file's own and no other worker is inside it. A `shared` instance is one per run, so one worker's boundary would reset the instance every other worker is also mid-scenario with — an assertion whose counter an unrelated file keeps zeroing, or a file with no plugin steps at all failing on someone else's reset. A `shared` plugin exporting this symbol is therefore refused at load when the run's `concurrency` is greater than 1: exit 2, naming the plugin, before the first request, and the message names `per_worker` as the remedy. At `concurrency: 1` the pairing is legal, because there is one worker and one scenario boundary. If your plugin needs no per-scenario state at all, leave the symbol out and it runs shared at any concurrency.
+
+Called at the scenario boundary for every instance **the current feature file has used**, before the Background steps of the next scenario — never for an instance only some other file has touched, and not at all in a file that has run no step of yours. This is the plugin's half of bddkit's state rule: HTTP state and the selected instance reset per scenario, variables do not. Clear anything the previous scenario left behind.
 
 **A failed reset fails that scenario**, exactly as a failing Background step would — running a scenario against state the plugin could not clear is how a suite goes green for the wrong reason. Answer `{"ok":false,"error":…}` only when you mean it.
 
@@ -284,14 +286,14 @@ Every attempt is a full `bddkit_dispatch` with a fresh `artifacts_dir`. Re-obser
 
 ## 6. `concurrency`
 
-bddkit runs feature files in parallel — `concurrency: 8` by default — and one instance of your plugin serves all of them.
+bddkit runs feature files in parallel — `concurrency: 8` by default — and the manifest's `concurrency` is what the host promises about your handles. It is not a request for a thread count.
 
-- **`shared`** (the default) — you are promising that a handle is safe to call from several worker threads at the same time. In Rust that usually means a `Mutex` around your instance table and around anything mutable inside an instance.
-- **`per_worker`** — declared in the ABI, and **refused by this host**: a plugin whose manifest says `per_worker` fails to load with "which this bddkit does not implement yet". This is on purpose. Treating it as `shared` would hand an instance you explicitly declared is *not* thread-safe to concurrent workers — a data race inside someone else's library, surfacing as a flaky suite. Refusing is louder and cheaper.
+- **`shared`** (the default) — one instance serves the whole run, and the host may call that one handle from several workers at the same time. In Rust that usually means a `Mutex` around your instance table and around anything mutable inside an instance.
+- **`per_worker`** — the host never calls one handle from two workers at once. **This host keeps that promise by giving you one instance per feature file**, created lazily on that file's first step of yours and dropped when the file ends. That is stricter than the mode demands — a file runs on one worker and its scenarios are sequential — and it may later become one instance per worker, with no ABI change and no manifest change. So do not depend on an instance outliving the file that created it, and do not expect two files to share one: state you accumulate is per file, and several instances are alive at once whenever the run is parallel.
 
 The value set is closed: an unknown `concurrency` string fails the manifest parse. A new scheduling mode arrives with an `ABI_VERSION` bump, not with a tolerant parse, so that a mode the host does not implement can never be silently degraded into one it does.
 
-Until `per_worker` exists, a plugin that genuinely cannot be shared should say so in its README and its users should set `concurrency: 1`.
+A plugin that genuinely cannot be shared declares `per_worker` and then runs at any concurrency — it does not need its users to set `concurrency: 1`. That is also the mode for per-scenario state, as `bddkit_reset_scenario` above spells out.
 
 ## 7. Installing a plugin
 

@@ -156,6 +156,9 @@ fn execute_step<'a>(
                 let mut polling = layer
                     .as_ref()
                     .map(|_| Polling::new(&step.text, &effective.polling));
+                // A `per_worker` instance belongs to this file, so this file
+                // both creates and drops it; a `shared` one is only borrowed.
+                let per_worker = plugins.is_per_worker(lib);
 
                 loop {
                     let request = serde_json::to_string(&DispatchRequest {
@@ -174,17 +177,34 @@ fn execute_step<'a>(
                     // pin plugin and host to one tokio version.
                     let plugins_for_call = plugins.clone();
                     let (call_group, call_instance) = (group.clone(), instance.clone());
-                    let result = tokio::task::spawn_blocking(move || {
+                    // The handle this file already holds, if any. Passing it in
+                    // keeps the dispatch to one blocking hop: resolving it out
+                    // here and then dispatching would cost two on the first
+                    // plugin step of every file.
+                    // Filtered by library, not just group: a handle is unique
+                    // within one plugin, never across two. `Plugins::load`
+                    // refuses two plugins claiming one group, so this cannot
+                    // differ today — the filter keeps it true locally.
+                    let cached = world
+                        .plugins
+                        .handle_for(&group, &instance)
+                        .filter(|(l, _)| *l == lib)
+                        .map(|(_, h)| h);
+                    let (handle, result) = tokio::task::spawn_blocking(move || {
                         plugins_for_call.call_step(
                             &call_group,
                             &call_instance,
                             lib,
                             step_index,
                             &request,
+                            cached,
                         )
                     })
                     .await
                     .map_err(|error| format!("the plugin dispatch task failed: {error}"))??;
+                    world
+                        .plugins
+                        .record(&group, &instance, lib, handle, per_worker);
 
                     match result.status {
                         Status::Passed => {
@@ -340,16 +360,25 @@ pub async fn run_file(lf: Arc<LoadedFeature>, ctx: Arc<RunContext>) -> FileResul
             // the wrong reason.
             let mut failure = match ctx.plugins.clone() {
                 None => None,
-                Some(plugins) => match tokio::task::spawn_blocking(move || {
-                    plugins.reset_scenario()
-                })
-                .await
-                {
-                    Ok(result) => result.err().map(|error| format!("  scenario reset\n{error}")),
-                    Err(error) => Some(format!(
-                        "  scenario reset\nthe plugin reset task failed: {error}"
-                    )),
-                },
+                Some(plugins) => {
+                    // Only what THIS file has touched. A file with no plugin
+                    // steps has an empty list and does no work here at all.
+                    let handles = world.plugins.to_reset();
+                    if handles.is_empty() {
+                        None
+                    } else {
+                        match tokio::task::spawn_blocking(move || plugins.reset_instances(&handles))
+                            .await
+                        {
+                            Ok(result) => {
+                                result.err().map(|error| format!("  scenario reset\n{error}"))
+                            }
+                            Err(error) => Some(format!(
+                                "  scenario reset\nthe plugin reset task failed: {error}"
+                            )),
+                        }
+                    }
+                }
             };
 
             for step in background.iter().chain(ex.steps.iter()) {
@@ -372,6 +401,16 @@ pub async fn run_file(lf: Arc<LoadedFeature>, ctx: Arc<RunContext>) -> FileResul
             });
         }
     }
+    // Every exit path of this function, including a file whose scenarios all
+    // failed. A panicking file cannot reach here — its handles stay in the
+    // registry and `Plugins::shutdown` sweeps them after the pool drains.
+    if let Some(plugins) = ctx.plugins.clone() {
+        let handles = world.plugins.to_drop();
+        if !handles.is_empty() {
+            let _ = tokio::task::spawn_blocking(move || plugins.drop_instances(&handles)).await;
+        }
+    }
+
     FileResult {
         path: lf.path.clone(),
         scenarios,
@@ -562,6 +601,7 @@ mod tests {
             vec![crate::plugin::tests::entry()],
             &[crate::plugin::tests::instance("a", Some("p-"))],
             &["echo".to_string()],
+            1,
         )
         .expect("the fixture plugin loads");
         plugins.set_defaults([("echo".to_string(), "a".to_string())].into_iter().collect());
@@ -589,15 +629,19 @@ mod tests {
         .expect("the plugin registry builds")
     }
 
-    fn echo_world(plugins: crate::plugin::Plugins) -> World {
-        World::new(
+    /// The `Arc` comes back too: a test that asserts how many instances were
+    /// created needs the same registry the `World` dispatches through.
+    fn echo_world(plugins: crate::plugin::Plugins) -> (World, Arc<crate::plugin::Plugins>) {
+        let plugins = Arc::new(plugins);
+        let world = World::new(
             apis(),
             Arc::new(Generator::new()),
             crate::db::DbHandle::new(None, String::new()),
             None,
-            Some(Arc::new(plugins)),
+            Some(plugins.clone()),
             Options::default(),
-        )
+        );
+        (world, plugins)
     }
 
     async fn run_step(world: &mut World, reg: &Registry, text: &str) -> Result<(), String> {
@@ -612,12 +656,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_plugin_step_records_its_handle_on_the_world() {
+        // The second dispatch in a file must reuse the first one's handle
+        // rather than resolving again — that is what makes a per-file instance
+        // one instance rather than one per step.
+        let plugins = echo_plugins();
+        let reg = echo_registry(&plugins, None);
+        let (mut world, plugins) = echo_world(plugins);
+        run_step(&mut world, &reg, r#"I echo "x" as "first""#)
+            .await
+            .expect("first dispatch");
+        let recorded = world
+            .plugins
+            .handle_for("echo", "a")
+            .expect("the first dispatch recorded its handle");
+        run_step(&mut world, &reg, r#"I echo "y" as "second""#)
+            .await
+            .expect("second dispatch");
+        assert_eq!(
+            world.plugins.handle_for("echo", "a"),
+            Some(recorded),
+            "the second dispatch reused the recorded handle"
+        );
+        assert_eq!(
+            plugins.registered_count(),
+            1,
+            "and created no second instance"
+        );
+    }
+
+    #[tokio::test]
     async fn a_plugin_step_gets_interpolated_arguments_and_publishes_its_vars() {
         // The plugin echoes back its first argument; seeing "world" there is
         // what proves interpolation happened on the host side of the boundary.
         let plugins = echo_plugins();
         let reg = echo_registry(&plugins, None);
-        let mut world = echo_world(plugins);
+        let (mut world, _) = echo_world(plugins);
         world.vars.set("who", "world".to_string());
         run_step(&mut world, &reg, r#"I echo "<<who>>" as "greeting""#)
             .await
@@ -630,7 +704,7 @@ mod tests {
         // `not_yet` means "poll me again", and only an assertion may be polled.
         let plugins = echo_plugins();
         let reg = echo_registry(&plugins, Some(1));
-        let mut world = echo_world(plugins);
+        let (mut world, _) = echo_world(plugins);
         let error = run_step(&mut world, &reg, "the echo counter should reach 3")
             .await
             .expect_err("an action may not answer not_yet");
@@ -644,7 +718,7 @@ mod tests {
         // unfinished observation carries must not reach the scenario.
         let plugins = echo_plugins();
         let reg = echo_registry(&plugins, None);
-        let mut world = echo_world(plugins);
+        let (mut world, _) = echo_world(plugins);
         let error = run_step(&mut world, &reg, "the echo counter should reach 3")
             .await
             .expect_err("one attempt, and it did not pass");
@@ -658,7 +732,7 @@ mod tests {
         // fresh observation per dispatch and never sleeps.
         let plugins = echo_plugins();
         let reg = echo_registry(&plugins, None);
-        let mut world = echo_world(plugins);
+        let (mut world, _) = echo_world(plugins);
         world.arm_options(
             serde_yaml_ng::from_str("polling:\n  timeout_secs: 5\n  interval_ms: 1\n")
                 .expect("the layer parses"),
@@ -682,7 +756,7 @@ mod tests {
         // action swallowed it, the assertion below would get a single attempt.
         let plugins = echo_plugins();
         let reg = echo_registry(&plugins, None);
-        let mut world = echo_world(plugins);
+        let (mut world, _) = echo_world(plugins);
         world.arm_options(
             serde_yaml_ng::from_str("polling:\n  timeout_secs: 5\n  interval_ms: 1\n")
                 .expect("the layer parses"),
@@ -701,7 +775,7 @@ mod tests {
         // through a print that would land inside another worker's dump.
         let plugins = echo_plugins();
         let reg = echo_registry(&plugins, None);
-        let mut world = echo_world(plugins);
+        let (mut world, _) = echo_world(plugins);
         let error = run_step(&mut world, &reg, "the echo should fail")
             .await
             .expect_err("the step is asked to fail");
