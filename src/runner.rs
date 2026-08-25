@@ -1,6 +1,7 @@
 use crate::feature::{ExpandedStep, LoadedFeature, expand_outlines};
 use crate::options::Options;
 use crate::polling::{AttemptError, Polling};
+use crate::plugin::abi::{DispatchRequest, OptionsJson, Status};
 use crate::report::render_file;
 use crate::report::{FileResult, ScenarioResult};
 use crate::steps::{Args, OptionsSource, Registry, StepKind, StepTarget, dispatch};
@@ -129,9 +130,88 @@ fn execute_step<'a>(
                 }
                 world.vars.pop_frame(&definition.exports)
             }
-            // Real dispatch over FFI is Task 10's job. Until then the arm
-            // must exist for the match to stay exhaustive (invariant 4).
-            StepTarget::Plugin { .. } => Err("plugin step dispatch is not implemented yet".into()),
+            StepTarget::Plugin {
+                lib,
+                step: step_index,
+                assertion,
+            } => {
+                // Arguments cross the boundary already interpolated: a plugin
+                // never sees raw step text and never sees `<<variable>>`
+                // syntax (invariant 1, restated at the FFI boundary).
+                let args = prepare(step, caps, &world.vars, generator)?;
+                let Some(plugins) = world.plugins.plugins().cloned() else {
+                    return Err("this step is served by a plugin, but no plugin is loaded".into());
+                };
+                let group = plugins.group_of_step(lib, step_index).to_string();
+                let instance = world.plugins.current(&group)?.to_string();
+                let base = plugins.options_for(&group, &instance)?.clone();
+
+                // Only an assertion consumes an armed eventual-assertion
+                // modifier; an action leaves it for the assertion that follows.
+                let layer = if assertion { world.take_options() } else { None };
+                let effective = match &layer {
+                    Some(layer) => base.apply(layer)?,
+                    None => base,
+                };
+                let mut polling = layer
+                    .as_ref()
+                    .map(|_| Polling::new(&step.text, &effective.polling));
+
+                loop {
+                    let request = serde_json::to_string(&DispatchRequest {
+                        args: &args.caps,
+                        docstring: args.docstring.as_ref(),
+                        table: args.table.as_ref(),
+                        artifacts_dir: plugins.next_artifacts_dir(),
+                        debug: world.debug,
+                        options: OptionsJson::from(&effective),
+                    })
+                    .map_err(|error| format!("failed to encode the plugin request: {error}"))?;
+
+                    // The FFI call is synchronous and may block for seconds;
+                    // spawn_blocking keeps it off the executor. Passing the
+                    // host's tokio Handle across the boundary instead would
+                    // pin plugin and host to one tokio version.
+                    let plugins_for_call = plugins.clone();
+                    let (call_group, call_instance) = (group.clone(), instance.clone());
+                    let result = tokio::task::spawn_blocking(move || {
+                        plugins_for_call.call_step(
+                            &call_group,
+                            &call_instance,
+                            lib,
+                            step_index,
+                            &request,
+                        )
+                    })
+                    .await
+                    .map_err(|error| format!("the plugin dispatch task failed: {error}"))??;
+
+                    match result.status {
+                        Status::Passed => {
+                            // Variables are published only on success: an
+                            // intermediate observation must not leak into the
+                            // scenario.
+                            for (name, value) in result.vars {
+                                world.vars.set(&name, value);
+                            }
+                            return Ok(());
+                        }
+                        Status::Fatal => return Err(result.render_failure()),
+                        Status::NotYet if !assertion => {
+                            return Err(format!(
+                                "a plugin action answered not_yet, which only an assertion may do: {}",
+                                result.render_failure()
+                            ));
+                        }
+                        Status::NotYet => match &mut polling {
+                            // Without an armed modifier there is no second
+                            // attempt, so not_yet is simply a failure.
+                            None => return Err(result.render_failure()),
+                            Some(polling) => polling.after_not_yet(&result.render_failure()).await?,
+                        },
+                    }
+                }
+            }
         }
     })
 }
@@ -419,17 +499,20 @@ mod tests {
     use crate::unique::UniqueKind;
     use std::path::PathBuf;
 
-    fn context_with_generator(registry: Registry, generator: Arc<Generator>) -> Arc<RunContext> {
+    fn apis() -> Arc<crate::http::Apis> {
         let mut by_name = std::collections::HashMap::new();
         by_name.insert(
             "default".to_string(),
             crate::http::ApiResource::new("http://example.test", 1, Vec::new(), Options::default())
                 .unwrap(),
         );
-        let apis = Arc::new(crate::http::Apis::new(by_name, Some("default".to_string())).unwrap());
+        Arc::new(crate::http::Apis::new(by_name, Some("default".to_string())).unwrap())
+    }
+
+    fn context_with_generator(registry: Registry, generator: Arc<Generator>) -> Arc<RunContext> {
         Arc::new(RunContext::new(
             registry,
-            apis,
+            apis(),
             generator,
             crate::feature::TagFilter::new(&[]),
             None,
@@ -442,6 +525,162 @@ mod tests {
 
     fn context(registry: Registry) -> Arc<RunContext> {
         context_with_generator(registry, Arc::new(Generator::new()))
+    }
+
+    /// The fixture plugin, with one declared instance "a" that is also the
+    /// group default. Built by `plugin::tests` — the same helper its own unit
+    /// tests use, so there is one place that knows how to build the cdylib.
+    fn echo_plugins() -> crate::plugin::Plugins {
+        let mut plugins = crate::plugin::Plugins::load(
+            vec![crate::plugin::tests::entry()],
+            &[crate::plugin::tests::instance("a", Some("p-"))],
+            &["echo".to_string()],
+        )
+        .expect("the fixture plugin loads");
+        plugins.set_defaults([("echo".to_string(), "a".to_string())].into_iter().collect());
+        plugins
+    }
+
+    /// `force_action` overrides the kind the plugin declared for one step,
+    /// which is how a plugin that answers `not_yet` from an ACTION is built:
+    /// the registry, not the reply, is what says a step is an assertion.
+    fn echo_registry(plugins: &crate::plugin::Plugins, force_action: Option<usize>) -> Registry {
+        let steps: Vec<(usize, usize, String, bool)> = plugins
+            .steps()
+            .into_iter()
+            .map(|(lib, index, pattern, assertion)| {
+                (lib, index, pattern, assertion && force_action != Some(index))
+            })
+            .collect();
+        Registry::with_macros_and_plugins(
+            MacroCatalog {
+                definitions: Vec::new(),
+            },
+            &steps,
+            &["echo".to_string()],
+        )
+        .expect("the plugin registry builds")
+    }
+
+    fn echo_world(plugins: crate::plugin::Plugins) -> World {
+        World::new(
+            apis(),
+            Arc::new(Generator::new()),
+            crate::db::DbHandle::new(None, String::new()),
+            None,
+            Some(Arc::new(plugins)),
+            Options::default(),
+        )
+    }
+
+    async fn run_step(world: &mut World, reg: &Registry, text: &str) -> Result<(), String> {
+        let step = ExpandedStep {
+            text: text.to_string(),
+            line: 1,
+            docstring: None,
+            table: None,
+        };
+        let generator = world.generator.clone();
+        execute_step(world, reg, &step, &generator, 0).await
+    }
+
+    #[tokio::test]
+    async fn a_plugin_step_gets_interpolated_arguments_and_publishes_its_vars() {
+        // The plugin echoes back its first argument; seeing "world" there is
+        // what proves interpolation happened on the host side of the boundary.
+        let plugins = echo_plugins();
+        let reg = echo_registry(&plugins, None);
+        let mut world = echo_world(plugins);
+        world.vars.set("who", "world".to_string());
+        run_step(&mut world, &reg, r#"I echo "<<who>>" as "greeting""#)
+            .await
+            .expect("the action passes");
+        assert_eq!(world.vars.get("greeting"), Some("p-world"));
+    }
+
+    #[tokio::test]
+    async fn an_action_answering_not_yet_is_a_contract_error() {
+        // `not_yet` means "poll me again", and only an assertion may be polled.
+        let plugins = echo_plugins();
+        let reg = echo_registry(&plugins, Some(1));
+        let mut world = echo_world(plugins);
+        let error = run_step(&mut world, &reg, "the echo counter should reach 3")
+            .await
+            .expect_err("an action may not answer not_yet");
+        assert!(error.contains("only an assertion may do"), "{error}");
+        assert!(error.contains("counter is 1 of 3"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_not_yet_without_an_armed_modifier_fails_and_discards_its_vars() {
+        // No modifier armed means no second attempt, and the vars an
+        // unfinished observation carries must not reach the scenario.
+        let plugins = echo_plugins();
+        let reg = echo_registry(&plugins, None);
+        let mut world = echo_world(plugins);
+        let error = run_step(&mut world, &reg, "the echo counter should reach 3")
+            .await
+            .expect_err("one attempt, and it did not pass");
+        assert!(error.contains("counter is 1 of 3"), "{error}");
+        assert_eq!(world.vars.get("echo_attempts"), None);
+    }
+
+    #[tokio::test]
+    async fn an_armed_modifier_polls_the_plugin_until_it_passes() {
+        // The retry loop belongs to the host: the plugin makes exactly one
+        // fresh observation per dispatch and never sleeps.
+        let plugins = echo_plugins();
+        let reg = echo_registry(&plugins, None);
+        let mut world = echo_world(plugins);
+        world.arm_options(
+            serde_yaml_ng::from_str("polling:\n  timeout_secs: 5\n  interval_ms: 1\n")
+                .expect("the layer parses"),
+        );
+        run_step(&mut world, &reg, "the echo counter should reach 3")
+            .await
+            .expect("the third attempt passes");
+        assert_eq!(
+            world.vars.get("echo_attempts"),
+            Some("3"),
+            // Not "only the passing attempt publishes its vars" — the passing
+            // attempt's value would overwrite a leaked one anyway, so this
+            // assertion cannot see that rule. The discard test guards it.
+            "the retry loop reached the third attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_plugin_action_leaves_an_armed_modifier_for_the_next_assertion() {
+        // The other half of "only an assertion consumes the modifier": if the
+        // action swallowed it, the assertion below would get a single attempt.
+        let plugins = echo_plugins();
+        let reg = echo_registry(&plugins, None);
+        let mut world = echo_world(plugins);
+        world.arm_options(
+            serde_yaml_ng::from_str("polling:\n  timeout_secs: 5\n  interval_ms: 1\n")
+                .expect("the layer parses"),
+        );
+        run_step(&mut world, &reg, r#"I echo "x" as "ignored""#)
+            .await
+            .expect("the action passes");
+        run_step(&mut world, &reg, "the echo counter should reach 3")
+            .await
+            .expect("the modifier survived the action");
+    }
+
+    #[tokio::test]
+    async fn a_fatal_reply_carries_its_message_and_its_diagnostics() {
+        // Evidence reaches the user through the returned string, never
+        // through a print that would land inside another worker's dump.
+        let plugins = echo_plugins();
+        let reg = echo_registry(&plugins, None);
+        let mut world = echo_world(plugins);
+        let error = run_step(&mut world, &reg, "the echo should fail")
+            .await
+            .expect_err("the step is asked to fail");
+        assert!(error.contains("the echo step was asked to fail"), "{error}");
+        assert!(error.contains("echo state"), "{error}");
+        assert!(error.contains("prefix=p-"), "{error}");
     }
 
     fn registry(name: &str, source: &str) -> Registry {

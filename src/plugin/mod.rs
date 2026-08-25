@@ -1,7 +1,9 @@
 // The plugin layer is built bottom-up over several commits: the ABI types, the
 // loader, and the registry all land before `main` wires any of it in. Scoped to
-// this module so it cannot mask dead code anywhere else, and removed once the
-// runner dispatches plugin steps.
+// this module so it cannot mask dead code anywhere else, and removed once
+// `main` loads plugins — dispatching them is not enough, several items here
+// (the lock reader, the artifact root, the ABI version) have no caller until
+// then.
 #![allow(dead_code)]
 
 pub mod abi;
@@ -384,14 +386,14 @@ impl PluginState {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::config::InstanceSpec;
     use crate::options::Options;
 
     /// Same build as `library`'s own fixture helper; a unit test cannot reach
     /// the integration test helpers, and six lines beat a shared crate.
-    fn fixture() -> std::path::PathBuf {
+    pub fn fixture() -> std::path::PathBuf {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let target = root.join("target/fixture-plugin");
         let out = std::process::Command::new(env!("CARGO"))
@@ -413,12 +415,12 @@ mod tests {
         ))
     }
 
-    fn entry() -> crate::plugin::lock::LockEntry {
+    pub fn entry() -> crate::plugin::lock::LockEntry {
         serde_yaml_ng::from_str(&format!("name: echo\npath: {}\n", fixture().display()))
             .expect("entry parses")
     }
 
-    fn instance(name: &str, prefix: Option<&str>) -> InstanceSpec {
+    pub fn instance(name: &str, prefix: Option<&str>) -> InstanceSpec {
         InstanceSpec {
             group: "echo".to_string(),
             name: name.to_string(),
