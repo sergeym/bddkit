@@ -34,7 +34,6 @@ pub struct Config {
     /// spelled the same way as `default_api`, and the host cannot know the
     /// group names before the plugins are loaded.
     #[serde(flatten)]
-    #[allow(dead_code)] // read by resolve_default_group; main wires plugin loading in a later task
     pub extra: BTreeMap<String, serde_yaml_ng::Value>,
     #[serde(skip)]
     pub plugin_instances: Vec<InstanceSpec>,
@@ -57,9 +56,6 @@ pub struct Resources {
 
 /// One declared instance of a plugin group, after the host has taken its
 /// reserved `options` key out and resolved it.
-// Fields unread outside tests until main wires up plugin loading (a later
-// task in this plan) and hands these to the plugin loader.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct InstanceSpec {
     pub group: String,
@@ -218,8 +214,6 @@ impl Config {
         )
     }
 
-    // Called by tests today; main wires this into plugin loading in a later task.
-    #[allow(dead_code)]
     pub fn group_names(&self) -> impl Iterator<Item = &String> {
         self.resources.groups.keys()
     }
@@ -227,7 +221,6 @@ impl Config {
     /// Same rule as `default_api`: an explicit name must be declared, a lone
     /// instance is the default on its own, several without an explicit choice
     /// is a startup error.
-    #[allow(dead_code)]
     pub fn resolve_default_group(&self, group: &str) -> Result<Option<String>> {
         let field = format!("default_{group}");
         let explicit = match self.extra.get(&field) {
@@ -238,6 +231,35 @@ impl Config {
         let empty = BTreeMap::new();
         let names = self.resources.groups.get(group).unwrap_or(&empty).keys();
         resolve_default(&field, &format!("resources.{group}"), &explicit, names)
+    }
+
+    /// `extra` keeps every top-level key the host does not name itself, because
+    /// a plugin group's default is spelled exactly like `default_api` and the
+    /// group names are unknown at parse time. That makes a typo — `default_widgte`
+    /// for `default_widget` — a key nothing ever reads, which is the silent no-op
+    /// the config layer refuses everywhere else. Checked once the groups are
+    /// known, i.e. after the plugins have loaded.
+    pub fn check_group_defaults(&self) -> Result<()> {
+        for key in self.extra.keys() {
+            let Some(group) = key.strip_prefix("default_") else {
+                continue;
+            };
+            // api/db/srp are typed fields and never reach `extra`; listed so a
+            // future untyped one cannot be reported as a typo.
+            if matches!(group, "api" | "db" | "srp") || self.resources.groups.contains_key(group) {
+                continue;
+            }
+            let declared: Vec<&str> = self.resources.groups.keys().map(String::as_str).collect();
+            bail!(
+                "{key} names the resource group {group:?}, but this config declares no resources.{group} (groups declared here: {})",
+                if declared.is_empty() {
+                    "none".to_string()
+                } else {
+                    declared.join(", ")
+                }
+            );
+        }
+        Ok(())
     }
 }
 
@@ -481,6 +503,31 @@ resources:
         let mut cfg: Config = serde_yaml_ng::from_str(&expanded)?;
         cfg.resolve_options()?;
         Ok(cfg)
+    }
+
+    /// The whole point of `check_group_defaults`: `extra` swallows the typo
+    /// silently, so nothing else in the config layer can catch it.
+    #[test]
+    fn a_default_for_a_group_nothing_declares_is_rejected() {
+        let c = parse(
+            "paths: [features]\nresources:\n  api: {}\n  widget:\n    main:\n      bucket: b\ndefault_widgte: main\n",
+        )
+        .expect("config parses");
+        let error = c
+            .check_group_defaults()
+            .expect_err("default_widgte names nothing")
+            .to_string();
+        assert!(error.contains("default_widgte"), "{error}");
+        assert!(error.contains("widget"), "{error}");
+    }
+
+    #[test]
+    fn a_default_for_a_declared_group_is_accepted() {
+        let c = parse(
+            "paths: [features]\nresources:\n  api: {}\n  widget:\n    main:\n      bucket: b\ndefault_widget: main\n",
+        )
+        .expect("config parses");
+        c.check_group_defaults().expect("default_widget names its group");
     }
 
     #[test]

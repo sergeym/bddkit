@@ -334,6 +334,9 @@ impl Registry {
         })
     }
 
+    /// Only tests build a registry without plugins now: `main` always goes
+    /// through `with_macros_and_plugins`, which is a superset.
+    #[cfg(test)]
     pub fn with_macros(catalog: MacroCatalog) -> Result<Self, String> {
         Self::with_macros_and_plugins(catalog, &[], &[])
     }

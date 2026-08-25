@@ -1,11 +1,3 @@
-// The plugin layer is built bottom-up over several commits: the ABI types, the
-// loader, and the registry all land before `main` wires any of it in. Scoped to
-// this module so it cannot mask dead code anywhere else, and removed once
-// `main` loads plugins — dispatching them is not enough, several items here
-// (the lock reader, the artifact root, the ABI version) have no caller until
-// then.
-#![allow(dead_code)]
-
 pub mod abi;
 pub mod library;
 pub mod lock;
@@ -170,6 +162,7 @@ impl Plugins {
         out
     }
 
+    #[cfg(test)]
     pub fn step_count(&self) -> usize {
         self.libs.iter().map(|l| l.steps.len()).sum()
     }
@@ -260,15 +253,32 @@ impl Plugins {
 
     /// Called at the scenario boundary. A plugin without `reset_scenario`
     /// answers Ok, and an instance nobody has created yet is not touched.
-    pub fn reset_scenario(&self) {
+    ///
+    /// A failure is returned, never swallowed: an instance that reports it
+    /// could not reset carries state into the next scenario, which is the one
+    /// shape of bug that makes a test pass for the wrong reason. Every
+    /// instance is still attempted — the first failure is the one reported.
+    pub fn reset_scenario(&self) -> Result<(), String> {
         let live: Vec<((String, String), u64)> = {
             let live = self.live.lock().expect("plugin instances");
             live.iter().map(|(k, v)| (k.clone(), *v)).collect()
         };
-        for ((group, _), handle) in live {
+        let mut failure = None;
+        for ((group, instance), handle) in live {
             if let Some(index) = self.groups.get(&group) {
-                let _ = self.libs[*index].reset_scenario(handle);
+                let error = match self.libs[*index].reset_scenario(handle) {
+                    Ok(Ok(())) => continue,
+                    // The plugin answered, and answered that it failed.
+                    Ok(Err(error)) => error,
+                    // The call itself failed: a malformed reply, a NUL byte.
+                    Err(error) => format!("{error:#}"),
+                };
+                failure.get_or_insert(format!("resetting {group}.{instance} failed: {error}"));
             }
+        }
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
         }
     }
 
@@ -526,12 +536,12 @@ pub(crate) mod tests {
         let plugins = Plugins::load(vec![entry()], &[instance("a", Some("p-"))], &["echo".into()])
             .expect("loads");
         // Nothing initialised yet: this must be a no-op, not a failure.
-        plugins.reset_scenario();
+        plugins.reset_scenario().expect("nothing to reset");
         let request = r#"{"args":["2"],"debug":false}"#;
         plugins
             .call_step("echo", "a", 0, 1, request)
             .expect("dispatch");
-        plugins.reset_scenario();
+        plugins.reset_scenario().expect("the fixture resets");
         let after = plugins
             .call_step("echo", "a", 0, 1, request)
             .expect("dispatch");

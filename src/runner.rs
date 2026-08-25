@@ -223,8 +223,7 @@ fn attempt_message(error: AttemptError) -> String {
 }
 
 /// Everything shared across the whole run, behind one `Arc`: a worker clones
-/// a single reference instead of six. This is also where the plugin registry
-/// (P1) will land — see docs/superpowers/specs/2026-07-30-plugin-system-design.md.
+/// a single reference instead of six.
 pub struct RunContext {
     pub reg: Registry,
     pub apis: Arc<crate::http::Apis>,
@@ -233,6 +232,7 @@ pub struct RunContext {
     pub db: Option<Arc<crate::db::Db>>,
     pub default_db: String,
     pub srp: Option<Arc<crate::srp::SrpParams>>,
+    pub plugins: Option<Arc<crate::plugin::Plugins>>,
     pub options: Options,
     fail_fast: bool,
     stop: std::sync::atomic::AtomicBool,
@@ -250,6 +250,7 @@ impl RunContext {
         db: Option<Arc<crate::db::Db>>,
         default_db: String,
         srp: Option<Arc<crate::srp::SrpParams>>,
+        plugins: Option<Arc<crate::plugin::Plugins>>,
         options: Options,
         fail_fast: bool,
     ) -> Self {
@@ -261,6 +262,7 @@ impl RunContext {
             db,
             default_db,
             srp,
+            plugins,
             options,
             fail_fast,
             stop: std::sync::atomic::AtomicBool::new(false),
@@ -295,7 +297,7 @@ pub async fn run_file(lf: Arc<LoadedFeature>, ctx: Arc<RunContext>) -> FileResul
         ctx.generator.clone(),
         crate::db::DbHandle::new(ctx.db.clone(), ctx.default_db.clone()),
         ctx.srp.clone(),
-        None,
+        ctx.plugins.clone(),
         ctx.options.clone(),
     );
     let mut scenarios = Vec::new();
@@ -327,9 +329,33 @@ pub async fn run_file(lf: Arc<LoadedFeature>, ctx: Arc<RunContext>) -> FileResul
         }
         for ex in expand_outlines(sc) {
             world.reset_scenario();
-            let mut failure = None;
+            // The FFI half of the scenario reset. It is here rather than in
+            // World::reset_scenario because the call is blocking and this is
+            // the async context that can hand it to spawn_blocking; runs with
+            // no plugin loaded pay nothing.
+            //
+            // A reset that fails is this scenario's failure, exactly as a
+            // failing Background step would be: running its steps against
+            // state the plugin could not clear is how a suite goes green for
+            // the wrong reason.
+            let mut failure = match ctx.plugins.clone() {
+                None => None,
+                Some(plugins) => match tokio::task::spawn_blocking(move || {
+                    plugins.reset_scenario()
+                })
+                .await
+                {
+                    Ok(result) => result.err().map(|error| format!("  scenario reset\n{error}")),
+                    Err(error) => Some(format!(
+                        "  scenario reset\nthe plugin reset task failed: {error}"
+                    )),
+                },
+            };
 
             for step in background.iter().chain(ex.steps.iter()) {
+                if failure.is_some() {
+                    break;
+                }
                 if let Err(e) = execute_step(&mut world, &ctx.reg, step, &generator, 0).await {
                     let mut msg = format!("  {}\n{e}", step.text);
                     if let Some(ex) = world.http.last() {
@@ -517,6 +543,7 @@ mod tests {
             crate::feature::TagFilter::new(&[]),
             None,
             String::new(),
+            None,
             None,
             Options::default(),
             false,
