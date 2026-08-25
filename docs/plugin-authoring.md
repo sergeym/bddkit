@@ -34,6 +34,15 @@ The build produces `libbddkit_s3.so` (Linux), `libbddkit_s3.dylib` (macOS) or `b
 
 **`tests/fixtures/echo-plugin/` in the bddkit repository is a complete, working plugin — 230 lines, every export, every reply shape, the panic guard, the NUL handling.** Copy it and replace the body. It is also what the host's own test suite runs against, so it cannot rot: a change to the ABI that the fixture does not follow turns the suite red.
 
+For a plugin that does real work rather than echoing its arguments back, read
+[`sergeym/bddkit-s3`](https://github.com/sergeym/bddkit-s3): an S3/MinIO plugin
+with 22 steps, written against this document and nothing else — no part of it
+required reading the host's source, which is the claim this document opens
+with. It is where to look for what a skeleton cannot show: validating an
+instance config the host is blind to, deciding where `not_yet` ends and `fatal`
+begins, attaching an HTTP exchange to a failure without leaking the credential
+inside it, and refusing a file name that arrived from a `.feature` file.
+
 ## 3. The ABI
 
 `ABI_VERSION` is **1**. Every symbol is `extern "C"` and `#[unsafe(no_mangle)]`.
@@ -160,17 +169,19 @@ Request:
   "docstring": null,
   "table": null,
   "artifacts_dir": "/tmp/bddkit-3n2k9a0f1x7q/000007",
+  "workspace_dir": "/tmp/bddkit-3n2k9a0f1x7q/workspace/000004",
   "debug": false,
   "options": { "polling": { "timeout_secs": 30, "interval_ms": 100 } }
 }
 ```
 
-All six keys are always present; `docstring` and `table` are `null` when the step carries neither.
+All seven keys are always present; `docstring` and `table` are `null` when the step carries neither.
 
 - `args` — the regex capture groups in order, **already interpolated**: `<<variable>>`, `<<unique()>>` and `<<null>>` have been resolved before the payload was built. A plugin never sees raw step text and never sees bddkit's variable syntax.
 - `docstring` — the step's doc string, interpolated, or `null`.
 - `table` — the step's data table as an array of rows of strings, cells interpolated, or `null`. **Row 0 is the header row**; bddkit does not strip it, and gherkin guarantees every row has the same length as row 0.
 - `artifacts_dir` — a fresh, unique directory path for this one dispatch, under `<temp dir>/bddkit-<run id>/<six-digit counter>`. **The host does not create it.** Call `create_dir_all` before writing, and write nothing if you have nothing to write — most dispatches never touch it.
+- `workspace_dir` — the working directory of the feature file this call belongs to, for files the run produces rather than evidence about a failure. **The host has already created it**, unlike `artifacts_dir`. It is the same directory for every dispatch in one feature file and a different one in every other file, so a plugin can accept a bare file name from a tester without two files colliding on it. It is shared with the host's own steps, so a file written by one and read by the other needs no path in the feature text. Nothing deletes it: a failed run's files stay inspectable.
 - `debug` — true while the scenario is inside `I am in debug mode`. It resets at the scenario boundary.
 - `options` — the polling options resolved for this instance, after the global → instance cascade and after any armed eventual-assertion modifier. Informational: **the retry loop is the host's**, see section 5.
 
@@ -268,7 +279,7 @@ Guard the trivial exports too. "Every export is guarded" is an invariant a reade
 
 **stderr** is the escape hatch, and only for tracing while someone is debugging: bddkit's own debug steps use it, precisely because it is outside the per-file dump. It still interleaves between parallel workers, so gate it behind the request's `debug` flag and tell your users to set `concurrency: 1` when they turn it on. Nothing you write there ends up in the test report.
 
-**`create_dir_all(artifacts_dir)` before writing into it.** The host allocates a fresh unique path per dispatch but does not create the directory, because most dispatches write nothing and a `mkdir` per step for the rare case is waste.
+**`create_dir_all(artifacts_dir)` before writing into it.** The host allocates a fresh unique path per dispatch but does not create the directory, because most dispatches write nothing and a `mkdir` per step for the rare case is waste. `workspace_dir` is the opposite and the exception: the host creates that one before handing it over, because it is one directory per feature file rather than a fresh one per dispatch, and several writers share it. Do not `create_dir_all` it and do not delete it.
 
 ## 5. `passed | not_yet | fatal`
 
