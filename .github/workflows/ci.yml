@@ -61,6 +61,9 @@ jobs:
       - name: Acceptance tests
         run: cargo test --locked --test acceptance
 
+      - name: Plugin acceptance tests
+        run: cargo test --locked --test plugin
+
       # The apibdd_it fixture schema is shared, so DB tests run single-threaded.
       - name: Database tests
         run: cargo test --locked --test db -- --test-threads=1

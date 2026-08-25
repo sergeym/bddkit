@@ -15,6 +15,13 @@ static NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
 struct Instance {
     prefix: String,
     attempts: u64,
+    /// Instance-config-driven, not an env var: `std::env::set_var` is `unsafe`
+    /// in edition 2024 and process-global, so it would race every other test.
+    fail_reset: bool,
+    /// Same reasoning: a path to write a marker file to when this instance is
+    /// dropped, so a host test can observe `bddkit_drop_instance` from outside
+    /// the process without an env var.
+    drop_log: Option<String>,
 }
 
 /// Deliberately called OUTSIDE `guard`, and safe there only because it
@@ -102,11 +109,13 @@ pub extern "C" fn bddkit_init_instance(request: *const c_char) -> *mut c_char {
         let Some(prefix) = value["config"]["prefix"].as_str() else {
             return r#"{"ok":false,"error":"echo instance requires a string \"prefix\""}"#.to_string();
         };
+        let fail_reset = value["config"]["fail_reset"].as_bool().unwrap_or(false);
+        let drop_log = value["config"]["drop_log"].as_str().map(str::to_string);
         let handle = NEXT_HANDLE.fetch_add(1, Ordering::SeqCst);
         let mut guard = INSTANCES.lock().expect("instances");
         guard.get_or_insert_with(HashMap::new).insert(
             handle,
-            Instance { prefix: prefix.to_string(), attempts: 0 },
+            Instance { prefix: prefix.to_string(), attempts: 0, fail_reset, drop_log },
         );
         serde_json::json!({"ok": true, "handle": handle}).to_string()
     })
@@ -184,9 +193,13 @@ pub extern "C" fn bddkit_dispatch(
 pub extern "C" fn bddkit_reset_scenario(handle: u64) -> *mut c_char {
     guard("envelope", move || {
         let mut guard = INSTANCES.lock().expect("instances");
-        if let Some(instance) = guard.get_or_insert_with(HashMap::new).get_mut(&handle) {
-            instance.attempts = 0;
+        let Some(instance) = guard.get_or_insert_with(HashMap::new).get_mut(&handle) else {
+            return r#"{"ok":true}"#.to_string();
+        };
+        if instance.fail_reset {
+            return r#"{"ok":false,"error":"the echo instance refuses to reset"}"#.to_string();
         }
+        instance.attempts = 0;
         r#"{"ok":true}"#.to_string()
     })
 }
@@ -195,7 +208,11 @@ pub extern "C" fn bddkit_reset_scenario(handle: u64) -> *mut c_char {
 pub extern "C" fn bddkit_drop_instance(handle: u64) -> *mut c_char {
     guard("envelope", move || {
         let mut guard = INSTANCES.lock().expect("instances");
-        guard.get_or_insert_with(HashMap::new).remove(&handle);
+        if let Some(instance) = guard.get_or_insert_with(HashMap::new).remove(&handle)
+            && let Some(path) = instance.drop_log
+        {
+            let _ = std::fs::write(path, "dropped");
+        }
         r#"{"ok":true}"#.to_string()
     })
 }

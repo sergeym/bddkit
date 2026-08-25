@@ -1,5 +1,5 @@
 /.idea/
-/target
+target/
 /.superpowers
 /.worktrees/
 .mcp.json

@@ -128,6 +128,45 @@ what an earlier one produced. Request state and the current connection reset
 per **scenario**. Files run in parallel; `@serial(name)` chains files that
 contend, `@priority(N)` moves one up the queue.
 
+## Plugins
+
+`api`, `db` and `srp` are the resource kinds built into the binary. Any **other** key under `resources:` is a group served by a plugin — a shared library bddkit loads at startup — so reaching an object store, a queue or a mailbox is the same move as reaching a second database:
+
+```yaml
+resources:
+  api:
+    review: { base_url: http://review.local }
+  s3:                       # served by a plugin, not by bddkit itself
+    backups:
+      bucket: acme-backups
+      endpoint: http://minio:9000
+    archive:
+      bucket: acme-archive
+default_s3: backups
+```
+
+The plugin brings its own steps, which read like any other step — a tester cannot tell a built-in from a plugin step, and a macro can call one. Instances are selected the same way as an API or a connection:
+
+```gherkin
+Given I use "archive" s3
+When I upload file "report.pdf"
+```
+
+The selection resets to `default_<group>` at every scenario boundary, exactly like the current API and the current connection. With one instance in a group its `default_<group>` is inferred; with several it must be spelled out.
+
+Which plugins are installed is **machine state, not test config**. It lives in `.bddkit/plugins.yaml` next to your config file — a list of `{name, path}` — and it does not belong in the repository with the suite: the config describes the system under test, a path to a `.so` describes one laptop or one CI runner.
+
+```yaml
+# .bddkit/plugins.yaml
+plugin:
+  - name: s3
+    path: /opt/bddkit/libbddkit_s3.so
+```
+
+A plugin runs inside the bddkit process with full privileges and there is no sandbox — installing one is the same trust decision as installing any other binary.
+
+Writing one: [`docs/plugin-authoring.md`](docs/plugin-authoring.md) is the complete contract, and `tests/fixtures/echo-plugin/` is a working plugin to copy.
+
 ## Where to look next
 
 | For | Look at |
@@ -145,6 +184,7 @@ contend, `@priority(N)` moves one up the queue.
 | Every DB step, worked through | `examples/db-features/db.feature` |
 | SRP handshake, Hawk signing | `tests/features/` |
 | Config schema | `src/config.rs` |
+| Writing a plugin | `docs/plugin-authoring.md`, `tests/fixtures/echo-plugin/` |
 
 ## Design notes
 
@@ -161,13 +201,14 @@ would break any test where a step writes and the API reads. Isolation comes
 from unique data instead.
 
 **Where this is going.** `api`, `db`, and `srp` are the resource kinds that
-ship, not the ceiling — a key under `resources:` is meant to be a capability
-group, so reaching an object store or a mailbox becomes the same move as
-reaching a second database. The seams exist (options cascade per instance,
-`I use "<name>" <kind>` is one step shape, dispatch returns
-`passed | not yet | fatal` so eventual assertions work without knowing what
-they retry). What's missing is loading steps and resource kinds from outside
-the binary.
+ship, not the ceiling — any other key under `resources:` is a capability group
+a plugin serves, so reaching an object store or a mailbox is the same move as
+reaching a second database. The seams that made that possible were there from
+the start: options cascade per instance, `I use "<name>" <kind>` is one step
+shape, and dispatch returns `passed | not yet | fatal` so eventual assertions
+work without knowing what they retry. What is still missing is the
+`bddkit plugin install` side of it — today `.bddkit/plugins.yaml` is written
+by hand.
 
 ## Development
 
