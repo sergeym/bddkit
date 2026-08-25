@@ -114,6 +114,10 @@ pub struct DispatchRequest<'a> {
     pub docstring: Option<&'a String>,
     pub table: Option<&'a Vec<Vec<String>>>,
     pub artifacts_dir: String,
+    /// The working directory of the feature file this call belongs to. Unlike
+    /// `artifacts_dir` the host has already created it: it is one per file and
+    /// shared with host steps, not fresh per dispatch.
+    pub workspace_dir: String,
     pub debug: bool,
     pub options: OptionsJson,
 }
@@ -322,6 +326,7 @@ mod tests {
             docstring: None,
             table: None,
             artifacts_dir: "/tmp/run/0007".into(),
+            workspace_dir: "/tmp/run/workspace/000000".into(),
             debug: false,
             options: OptionsJson::from(&crate::options::Options::default()),
         };
@@ -331,7 +336,15 @@ mod tests {
         // sort both sides to pin the key SET without depending on that.
         let mut keys: Vec<&String> = value.as_object().expect("an object").keys().collect();
         keys.sort();
-        let mut expected = ["args", "docstring", "table", "artifacts_dir", "debug", "options"];
+        let mut expected = [
+            "args",
+            "docstring",
+            "table",
+            "artifacts_dir",
+            "workspace_dir",
+            "debug",
+            "options",
+        ];
         expected.sort();
         assert_eq!(keys, expected);
         assert!(

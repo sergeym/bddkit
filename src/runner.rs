@@ -160,12 +160,18 @@ fn execute_step<'a>(
                 // both creates and drops it; a `shared` one is only borrowed.
                 let per_worker = plugins.is_per_worker(lib);
 
+                // Resolved once per plugin step rather than per attempt: the
+                // path is constant for the file, and `Workspace` caches the
+                // `create_dir_all` after the first call.
+                let workspace_dir = world.workspace_dir()?.display().to_string();
+
                 loop {
                     let request = serde_json::to_string(&DispatchRequest {
                         args: &args.caps,
                         docstring: args.docstring.as_ref(),
                         table: args.table.as_ref(),
                         artifacts_dir: plugins.next_artifacts_dir(),
+                        workspace_dir: workspace_dir.clone(),
                         debug: world.debug,
                         options: OptionsJson::from(&effective),
                     })
