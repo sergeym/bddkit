@@ -1,7 +1,10 @@
 /.idea/
-/target
+target/
 /.superpowers
 /.worktrees/
 .mcp.json
 .env.local
 .env.*.local
+
+# Session artefacts: specs and plans live on the machine, not in the repo.
+docs/superpowers/

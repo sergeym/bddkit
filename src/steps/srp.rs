@@ -90,6 +90,7 @@ mod tests {
                 generator: num_bigint::BigUint::from(5u32),
                 hash: HashAlg::Sha256,
             })),
+            None,
             crate::options::Options::default(),
         )
     }

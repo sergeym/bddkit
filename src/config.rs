@@ -29,6 +29,14 @@ pub struct Config {
     pub options: OptionsLayer,
     #[serde(skip)]
     pub effective_options: Options,
+    /// Everything the host does not name itself: `default_<group>` keys for
+    /// plugin groups. Captured rather than rejected — a group's default is
+    /// spelled the same way as `default_api`, and the host cannot know the
+    /// group names before the plugins are loaded.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_yaml_ng::Value>,
+    #[serde(skip)]
+    pub plugin_instances: Vec<InstanceSpec>,
 }
 
 /// Resources under test. Not tied to a test set: any scenario can reach any
@@ -40,6 +48,20 @@ pub struct Resources {
     pub db: BTreeMap<String, Connection>,
     #[serde(default)]
     pub srp: BTreeMap<String, SrpConfig>,
+    /// Groups the host does not serve. The value is kept verbatim: validating
+    /// `bucket` is the plugin's job, the host has no schema for it.
+    #[serde(flatten)]
+    pub groups: BTreeMap<String, BTreeMap<String, serde_yaml_ng::Value>>,
+}
+
+/// One declared instance of a plugin group, after the host has taken its
+/// reserved `options` key out and resolved it.
+#[derive(Debug, Clone)]
+pub struct InstanceSpec {
+    pub group: String,
+    pub name: String,
+    pub config: serde_json::Value,
+    pub options: Options,
 }
 
 #[derive(Debug, Deserialize)]
@@ -139,6 +161,23 @@ impl Config {
                 .apply(&resource.options)
                 .map_err(|error| anyhow::anyhow!("resources.srp.{name}: {error}"))?;
         }
+        self.plugin_instances.clear();
+        for (group, instances) in &self.resources.groups {
+            for (name, body) in instances {
+                let where_ = format!("resources.{group}.{name}");
+                let (config, layer) = split_instance_options(body)
+                    .map_err(|error| anyhow::anyhow!("{where_}: {error}"))?;
+                let options = global
+                    .apply(&layer)
+                    .map_err(|error| anyhow::anyhow!("{where_}: {error}"))?;
+                self.plugin_instances.push(InstanceSpec {
+                    group: group.clone(),
+                    name: name.clone(),
+                    config,
+                    options,
+                });
+            }
+        }
         Ok(())
     }
 
@@ -174,9 +213,57 @@ impl Config {
             self.resources.srp.keys(),
         )
     }
+
+    pub fn group_names(&self) -> impl Iterator<Item = &String> {
+        self.resources.groups.keys()
+    }
+
+    /// Same rule as `default_api`: an explicit name must be declared, a lone
+    /// instance is the default on its own, several without an explicit choice
+    /// is a startup error.
+    pub fn resolve_default_group(&self, group: &str) -> Result<Option<String>> {
+        let field = format!("default_{group}");
+        let explicit = match self.extra.get(&field) {
+            Some(serde_yaml_ng::Value::String(name)) => Some(name.clone()),
+            Some(other) => bail!("{field} must be a string, got {other:?}"),
+            None => None,
+        };
+        let empty = BTreeMap::new();
+        let names = self.resources.groups.get(group).unwrap_or(&empty).keys();
+        resolve_default(&field, &format!("resources.{group}"), &explicit, names)
+    }
+
+    /// `extra` keeps every top-level key the host does not name itself, because
+    /// a plugin group's default is spelled exactly like `default_api` and the
+    /// group names are unknown at parse time. That makes a typo — `default_widgte`
+    /// for `default_widget` — a key nothing ever reads, which is the silent no-op
+    /// the config layer refuses everywhere else. Checked once the groups are
+    /// known, i.e. after the plugins have loaded.
+    pub fn check_group_defaults(&self) -> Result<()> {
+        for key in self.extra.keys() {
+            let Some(group) = key.strip_prefix("default_") else {
+                continue;
+            };
+            // api/db/srp are typed fields and never reach `extra`; listed so a
+            // future untyped one cannot be reported as a typo.
+            if matches!(group, "api" | "db" | "srp") || self.resources.groups.contains_key(group) {
+                continue;
+            }
+            let declared: Vec<&str> = self.resources.groups.keys().map(String::as_str).collect();
+            bail!(
+                "{key} names the resource group {group:?}, but this config declares no resources.{group} (groups declared here: {})",
+                if declared.is_empty() {
+                    "none".to_string()
+                } else {
+                    declared.join(", ")
+                }
+            );
+        }
+        Ok(())
+    }
 }
 
-/// Shared logic for api and db: an explicit name is checked for existence,
+/// Shared logic for every `default_*`: an explicit name is checked for existence,
 /// a single resource becomes the default on its own, several without an
 /// explicit one is an error.
 fn resolve_default<'a>(
@@ -199,6 +286,26 @@ fn resolve_default<'a>(
             "{field} is not set, and {section} declares several resources — specify which one is the default"
         ),
     }
+}
+
+/// Splits a plugin instance body into the opaque config the plugin sees and the
+/// host's reserved `options` layer. `deny_unknown_fields` on `OptionsLayer` is
+/// what turns `pollng:` into a startup error instead of a silent no-op.
+fn split_instance_options(
+    body: &serde_yaml_ng::Value,
+) -> std::result::Result<(serde_json::Value, OptionsLayer), String> {
+    let serde_yaml_ng::Value::Mapping(mapping) = body else {
+        return Err("an instance must be a mapping".to_string());
+    };
+    let mut mapping = mapping.clone();
+    let layer = match mapping.remove("options") {
+        Some(value) => serde_yaml_ng::from_value::<OptionsLayer>(value)
+            .map_err(|error| format!("invalid options: {error}"))?,
+        None => OptionsLayer::default(),
+    };
+    let config = serde_json::to_value(serde_yaml_ng::Value::Mapping(mapping))
+        .map_err(|error| format!("instance config is not representable as JSON: {error}"))?;
+    Ok((config, layer))
 }
 
 /// Reads one `.env` file into `map`; later keys (from later layers)
@@ -396,6 +503,31 @@ resources:
         let mut cfg: Config = serde_yaml_ng::from_str(&expanded)?;
         cfg.resolve_options()?;
         Ok(cfg)
+    }
+
+    /// The whole point of `check_group_defaults`: `extra` swallows the typo
+    /// silently, so nothing else in the config layer can catch it.
+    #[test]
+    fn a_default_for_a_group_nothing_declares_is_rejected() {
+        let c = parse(
+            "paths: [features]\nresources:\n  api: {}\n  widget:\n    main:\n      bucket: b\ndefault_widgte: main\n",
+        )
+        .expect("config parses");
+        let error = c
+            .check_group_defaults()
+            .expect_err("default_widgte names nothing")
+            .to_string();
+        assert!(error.contains("default_widgte"), "{error}");
+        assert!(error.contains("widget"), "{error}");
+    }
+
+    #[test]
+    fn a_default_for_a_declared_group_is_accepted() {
+        let c = parse(
+            "paths: [features]\nresources:\n  api: {}\n  widget:\n    main:\n      bucket: b\ndefault_widget: main\n",
+        )
+        .expect("config parses");
+        c.check_group_defaults().expect("default_widget names its group");
     }
 
     #[test]
@@ -1022,5 +1154,163 @@ resources:
             let c = load(&path, None).expect("config loads");
             assert_eq!(c.resources.db["main"].dsn, "postgres://u:local_secret@db/x");
         }
+    }
+
+    const WITH_GROUP: &str = "\
+paths: [features]
+options:
+  polling:
+    timeout_secs: 10
+resources:
+  api:
+    review:
+      base_url: http://review.local
+  widget:
+    backups:
+      endpoint: http://storage.internal:9000
+      bucket: backups
+      options:
+        polling:
+          timeout_secs: 30
+    archive:
+      endpoint: http://storage.internal:9000
+      bucket: archive
+default_widget: backups
+";
+
+    #[test]
+    fn an_unknown_resource_group_is_kept_verbatim() {
+        // The host has no schema for a group it did not write: it must carry the
+        // instance body through untouched and let the plugin judge it.
+        let cfg = parse(WITH_GROUP).expect("parses");
+        let names: Vec<&String> = cfg.group_names().collect();
+        assert_eq!(names, vec!["widget"]);
+        let instance = cfg
+            .plugin_instances
+            .iter()
+            .find(|i| i.name == "backups")
+            .expect("backups declared");
+        assert_eq!(instance.config["bucket"], serde_json::json!("backups"));
+        assert_eq!(instance.config["endpoint"], serde_json::json!("http://storage.internal:9000"));
+        // A flattened catch-all is one typo away from cannibalising the typed
+        // fields beside it, and the failure would be silent: the field keeps
+        // its default and the value lands in `extra` instead.
+        assert_eq!(cfg.paths, vec![std::path::PathBuf::from("features")]);
+        assert_eq!(cfg.concurrency, default_concurrency());
+        assert!(
+            cfg.extra.keys().eq(["default_widget".to_string()].iter()),
+            "only the group default is unclaimed, got {:?}",
+            cfg.extra.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn the_reserved_options_key_never_reaches_the_plugin() {
+        let cfg = parse(WITH_GROUP).expect("parses");
+        let instance = cfg
+            .plugin_instances
+            .iter()
+            .find(|i| i.name == "backups")
+            .expect("backups declared");
+        assert!(
+            instance.config.get("options").is_none(),
+            "options is host-managed and must be stripped: {:?}",
+            instance.config
+        );
+    }
+
+    #[test]
+    fn instance_options_inherit_from_the_global_layer() {
+        let cfg = parse(WITH_GROUP).expect("parses");
+        let backups = cfg.plugin_instances.iter().find(|i| i.name == "backups").unwrap();
+        let archive = cfg.plugin_instances.iter().find(|i| i.name == "archive").unwrap();
+        assert_eq!(backups.options.polling.timeout, std::time::Duration::from_secs(30));
+        assert_eq!(
+            archive.options.polling.timeout,
+            std::time::Duration::from_secs(10),
+            "an instance with no options layer inherits the global one"
+        );
+    }
+
+    #[test]
+    fn an_invalid_host_option_inside_a_group_is_rejected_before_the_plugin_loads() {
+        let src = "\
+paths: [features]
+resources:
+  api: {}
+  widget:
+    backups:
+      options:
+        polling:
+          timeout_secs: 0
+";
+        let error = parse(src).expect_err("zero timeout is invalid");
+        assert!(format!("{error:#}").contains("resources.widget.backups"), "{error:#}");
+    }
+
+    #[test]
+    fn an_unknown_option_inside_a_group_is_rejected() {
+        let src = "\
+paths: [features]
+resources:
+  api: {}
+  widget:
+    backups:
+      options:
+        pollng:
+          timeout_secs: 3
+";
+        let error = parse(src).expect_err("typo in a host option");
+        assert!(format!("{error:#}").contains("resources.widget.backups"), "{error:#}");
+    }
+
+    #[test]
+    fn a_group_default_resolves_like_every_other_default() {
+        let cfg = parse(WITH_GROUP).expect("parses");
+        assert_eq!(cfg.resolve_default_group("widget").unwrap().as_deref(), Some("backups"));
+    }
+
+    #[test]
+    fn a_single_instance_becomes_the_group_default_on_its_own() {
+        let src = "\
+paths: [features]
+resources:
+  api: {}
+  widget:
+    only:
+      bucket: b
+";
+        let cfg = parse(src).expect("parses");
+        assert_eq!(cfg.resolve_default_group("widget").unwrap().as_deref(), Some("only"));
+    }
+
+    #[test]
+    fn several_instances_without_a_default_is_an_error() {
+        let src = "\
+paths: [features]
+resources:
+  api: {}
+  widget:
+    a: {bucket: a}
+    b: {bucket: b}
+";
+        let cfg = parse(src).expect("parses");
+        let error = cfg.resolve_default_group("widget").expect_err("ambiguous");
+        assert!(format!("{error:#}").contains("default_widget"), "{error:#}");
+    }
+
+    #[test]
+    fn a_group_default_naming_an_undeclared_instance_is_an_error() {
+        let src = "\
+paths: [features]
+resources:
+  api: {}
+  widget:
+    a: {bucket: a}
+default_widget: nope
+";
+        let cfg = parse(src).expect("parses");
+        let error = cfg.resolve_default_group("widget").expect_err("undeclared");
+        assert!(format!("{error:#}").contains("nope"), "{error:#}");
     }
 }
