@@ -18,13 +18,31 @@ mod vars;
 mod world;
 
 use anyhow::Result;
-use clap::Parser;
+use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 #[derive(Parser)]
-#[command(name = "bddkit", about = "Run Gherkin scenarios against an HTTP API")]
+#[command(
+    name = "bddkit",
+    version,
+    about = "Run Gherkin scenarios against an HTTP API"
+)]
 struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Run the feature files the config selects
+    Run(RunArgs),
+    /// Show the steps this binary understands
+    Steps(StepsArgs),
+}
+
+#[derive(Args)]
+struct RunArgs {
     /// Path to the YAML config
     #[arg(long)]
     config: PathBuf,
@@ -41,6 +59,9 @@ struct Cli {
     fail_fast: bool,
 }
 
+#[derive(Args)]
+struct StepsArgs {}
+
 /// Everything that fails before the first request must exit with code 2 (invariant 6):
 /// config loading, path traversal, building API resources and DB pools, parsing
 /// scheduling tags — this is a "nothing ran" failure, while 1 is reserved for
@@ -48,10 +69,16 @@ struct Cli {
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
-    match run(cli).await {
+    // Each command names what did not happen: "run not started" is a lie when
+    // the user only asked for a listing.
+    let (result, nothing_happened) = match cli.command {
+        Command::Run(args) => (run(args).await, "run not started"),
+        Command::Steps(_) => (Ok(0), "nothing listed"),
+    };
+    match result {
         Ok(code) => std::process::exit(code),
         Err(error) => {
-            eprintln!("error: {error:#}\n\nrun not started");
+            eprintln!("error: {error:#}\n\n{nothing_happened}");
             std::process::exit(2);
         }
     }
@@ -64,7 +91,7 @@ async fn main() {
 /// `None` means no plugin was installed at all — the path every existing suite
 /// takes, and the one that must cost nothing.
 fn load_plugins(
-    cli: &Cli,
+    config_path: &std::path::Path,
     cfg: &config::Config,
     generator: &unique::Generator,
 ) -> Result<Option<Arc<plugin::Plugins>>> {
@@ -73,7 +100,7 @@ fn load_plugins(
         // The same anchor `config::load` uses for the `.env` layers: the lock
         // belongs to the suite, not to whatever directory the run started in.
         plugin::lock::load_default(
-            cli.config
+            config_path
                 .parent()
                 .unwrap_or_else(|| std::path::Path::new(".")),
         )?,
@@ -116,11 +143,11 @@ fn load_plugins(
     Ok(Some(plugins))
 }
 
-async fn run(cli: Cli) -> Result<i32> {
+async fn run(cli: RunArgs) -> Result<i32> {
     let cfg = config::load(&cli.config, cli.env.as_deref())?;
     // Before the plugins: the artifact root is derived from the run id.
     let generator = Arc::new(unique::Generator::new());
-    let plugins = load_plugins(&cli, &cfg, &generator)?;
+    let plugins = load_plugins(&cli.config, &cfg, &generator)?;
 
     // `with_macros_and_plugins`, not `with_macros` plus a registration loop:
     // macros are validated after everything is registered, so a macro body may

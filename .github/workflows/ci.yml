@@ -85,8 +85,8 @@ jobs:
 
       - name: Example suites
         run: |
-          cargo run --locked --quiet -- --config examples/api.yaml
-          cargo run --locked --quiet -- --config examples/db.yaml
+          cargo run --locked --quiet -- run --config examples/api.yaml
+          cargo run --locked --quiet -- run --config examples/db.yaml
 
       - name: Package check
         run: cargo publish --dry-run --locked

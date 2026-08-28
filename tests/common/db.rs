@@ -124,7 +124,7 @@ pub fn feature_command(feature_src: &str) -> Command {
     std::fs::write(&cfg_path, cfg).expect("write config");
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_bddkit"));
-    command.args(["--config", cfg_path.to_str().expect("path is UTF-8")]);
+    command.args(["run", "--config", cfg_path.to_str().expect("path is UTF-8")]);
     command
 }
 

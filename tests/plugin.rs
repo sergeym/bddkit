@@ -106,7 +106,7 @@ fn two_plugin_project(name: &str, feature: &str, config_tail: &str) -> PathBuf {
 
 fn run(dir: &Path) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_bddkit"))
-        .args(["--config", "cfg.yaml"])
+        .args(["run", "--config", "cfg.yaml"])
         // `--config cfg.yaml` has no parent directory component, so the lock
         // is looked for next to it — i.e. inside this project directory.
         .current_dir(dir)
@@ -548,7 +548,7 @@ fn a_per_worker_instance_is_dropped_when_its_file_ends() {
     );
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_bddkit"))
-        .args(["--config", "cfg.yaml"])
+        .args(["run", "--config", "cfg.yaml"])
         .current_dir(&dir)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())

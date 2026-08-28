@@ -19,7 +19,7 @@ async fn all_feature_files_pass_against_the_stub() {
 
     let exe = env!("CARGO_BIN_EXE_bddkit");
     let out = Command::new(exe)
-        .args(["--config", "tests/acceptance.yaml"])
+        .args(["run", "--config", "tests/acceptance.yaml"])
         .env("BDDKIT_STUB_URL", &base)
         .output()
         .expect("failed to run bddkit");
@@ -105,7 +105,7 @@ async fn eventual_post_response_replays_the_saved_method_and_body() {
     let config = write_eventual_post_project(&base, "eventual-post-success");
 
     let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
-        .args(["--config", config.to_str().expect("UTF-8 config path")])
+        .args(["run", "--config", config.to_str().expect("UTF-8 config path")])
         .output()
         .expect("run bddkit");
 
@@ -124,7 +124,7 @@ async fn eventual_post_timeout_reports_last_mismatch_and_final_exchange() {
     let config = write_eventual_post_project(&base, "eventual-post-timeout");
 
     let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
-        .args(["--config", config.to_str().expect("UTF-8 config path")])
+        .args(["run", "--config", config.to_str().expect("UTF-8 config path")])
         .output()
         .expect("run bddkit");
 
@@ -173,6 +173,7 @@ async fn unknown_step_fails_before_running() {
     let exe = env!("CARGO_BIN_EXE_bddkit");
     let out = Command::new(exe)
         .args([
+            "run",
             "--config",
             dir.join("cfg.yaml").to_str().expect("path is UTF-8"),
         ])
@@ -212,6 +213,7 @@ async fn a_config_without_any_api_resource_runs_a_non_http_scenario() {
     let exe = env!("CARGO_BIN_EXE_bddkit");
     let out = Command::new(exe)
         .args([
+            "run",
             "--config",
             dir.join("cfg.yaml").to_str().expect("path is UTF-8"),
         ])
@@ -254,6 +256,7 @@ async fn a_config_without_any_api_resource_fails_at_first_http_step() {
     let exe = env!("CARGO_BIN_EXE_bddkit");
     let out = Command::new(exe)
         .args([
+            "run",
             "--config",
             dir.join("cfg.yaml").to_str().expect("path is UTF-8"),
         ])
@@ -305,6 +308,7 @@ async fn tag_filter_runs_only_the_matching_scenarios() {
 
     let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
         .args([
+            "run",
             "--config",
             cfg.to_str().expect("path is UTF-8"),
             "--tag",
@@ -337,6 +341,7 @@ async fn a_tag_matching_nothing_fails_with_exit_code_two() {
 
     let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
         .args([
+            "run",
             "--config",
             cfg.to_str().expect("path is UTF-8"),
             "--tag",
@@ -365,6 +370,7 @@ async fn a_positional_path_overrides_the_config_paths() {
 
     let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
         .args([
+            "run",
             "--config",
             cfg.to_str().expect("path is UTF-8"),
             only.to_str().expect("path is UTF-8"),
@@ -426,6 +432,7 @@ async fn one_scenario_can_call_two_different_apis() {
 
     let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
         .args([
+            "run",
             "--config",
             dir.join("cfg.yaml").to_str().expect("path is UTF-8"),
         ])
@@ -478,6 +485,7 @@ fn macro_cycle_fails_validation_with_exit_code_two() {
 
     let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
         .args([
+            "run",
             "--config",
             dir.join("cfg.yaml").to_str().expect("path is UTF-8"),
         ])
@@ -516,6 +524,7 @@ async fn print_body_as_path_fails_for_plain_content_type() {
 
     let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
         .args([
+            "run",
             "--config",
             dir.join("cfg.yaml").to_str().expect("path is UTF-8"),
         ])
@@ -582,7 +591,7 @@ async fn two_feature_files_run_at_the_same_time() {
     let cfg = write_parallel_fixture(&dir, &base, 2, "");
 
     let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
-        .args(["--config", cfg.to_str().expect("path is UTF-8")])
+        .args(["run", "--config", cfg.to_str().expect("path is UTF-8")])
         .output()
         .expect("failed to run bddkit");
 
@@ -606,7 +615,7 @@ async fn a_single_worker_cannot_release_the_barrier() {
     let cfg = write_parallel_fixture(&dir, &base, 1, "");
 
     let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
-        .args(["--config", cfg.to_str().expect("path is UTF-8")])
+        .args(["run", "--config", cfg.to_str().expect("path is UTF-8")])
         .output()
         .expect("failed to run bddkit");
 
@@ -627,7 +636,7 @@ async fn two_files_in_one_serial_chain_never_run_together() {
     let cfg = write_parallel_fixture(&dir, &base, 2, "@serial(shared)\n");
 
     let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
-        .args(["--config", cfg.to_str().expect("path is UTF-8")])
+        .args(["run", "--config", cfg.to_str().expect("path is UTF-8")])
         .output()
         .expect("failed to run bddkit");
 
@@ -663,6 +672,7 @@ async fn a_file_in_two_chains_fails_the_startup() {
 
     let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
         .args([
+            "run",
             "--config",
             dir.join("cfg.yaml").to_str().expect("path is UTF-8"),
         ])
@@ -700,6 +710,7 @@ async fn an_unreachable_database_fails_the_startup_with_code_two() {
 
     let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
         .args([
+            "run",
             "--config",
             dir.join("cfg.yaml").to_str().expect("path is UTF-8"),
         ])
@@ -752,6 +763,7 @@ async fn higher_priority_files_run_first() {
 
     let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
         .args([
+            "run",
             "--config",
             dir.join("cfg.yaml").to_str().expect("path is UTF-8"),
         ])
@@ -792,6 +804,7 @@ async fn a_non_numeric_priority_fails_the_startup() {
 
     let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
         .args([
+            "run",
             "--config",
             dir.join("cfg.yaml").to_str().expect("path is UTF-8"),
         ])
@@ -840,6 +853,7 @@ async fn fail_fast_stops_starting_new_files() {
 
     let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
         .args([
+            "run",
             "--config",
             dir.join("cfg.yaml").to_str().expect("path is UTF-8"),
             "--fail-fast",
@@ -898,6 +912,7 @@ async fn fail_fast_stops_a_chain_partway_through() {
 
     let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
         .args([
+            "run",
             "--config",
             dir.join("cfg.yaml").to_str().expect("path is UTF-8"),
             "--fail-fast",
@@ -949,6 +964,7 @@ async fn without_fail_fast_every_file_still_runs() {
 
     let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
         .args([
+            "run",
             "--config",
             dir.join("cfg.yaml").to_str().expect("path is UTF-8"),
         ])
@@ -958,4 +974,33 @@ async fn without_fail_fast_every_file_still_runs() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(out.status.code(), Some(1), "{stdout}");
     assert!(stdout.contains("files: 2"), "{stdout}");
+}
+
+/// The flat `bddkit --config x.yaml` form is gone: `steps` has to be a real
+/// subcommand, and clap cannot have both a positional path list at the top
+/// level and subcommands to disambiguate it against.
+#[test]
+fn the_run_subcommand_is_how_a_suite_is_started() {
+    let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
+        .args(["--config", "tests/acceptance.yaml"])
+        .output()
+        .expect("run bddkit");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "the flat form is a usage error");
+    assert!(
+        stderr.contains("unexpected argument"),
+        "the flat form must be refused by the parser, not started:\n{stderr}"
+    );
+
+    let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
+        .args(["run", "--help"])
+        .output()
+        .expect("run bddkit");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}");
+    assert!(stdout.contains("Usage: bddkit run"), "{stdout}");
+    assert!(
+        stdout.contains("--fail-fast"),
+        "run keeps every flag the flat form had:\n{stdout}"
+    );
 }
