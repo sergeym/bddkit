@@ -52,7 +52,7 @@ pub fn load_from(project: &Path, user: Option<&Path>) -> Result<Vec<LockEntry>> 
 ///
 /// Anchored to the config file's directory, not the process working directory,
 /// for the same reason `config::load` anchors the `.env` layers there: the lock
-/// belongs to the suite, and `bddkit --config suites/cfg.yaml` run from the
+/// belongs to the suite, and `bddkit run --config suites/cfg.yaml` run from the
 /// parent directory must find the same plugins as a run from inside `suites/`.
 /// An unset `HOME` simply means no user lock, which is indistinguishable from a
 /// `HOME` that has no lock file in it.

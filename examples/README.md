@@ -8,7 +8,7 @@ Talks to a local [Smocker](https://github.com/smocker-dev/smocker) instance, so 
 
 ```bash
 docker compose up -d smocker                      # from the repo root
-./target/release/bddkit --config examples/api.yaml
+./target/release/bddkit run --config examples/api.yaml
 ```
 
 The mocks live in `examples/mocks/api-server.yaml` and are seeded into Smocker at startup — after editing them, `docker compose restart smocker` reloads. Smocker's web UI (mocks, request history) is on <http://localhost:8081>; the mocked API itself is on <http://localhost:8080>.
@@ -28,7 +28,7 @@ The mocks live in `examples/mocks/api-server.yaml` and are seeded into Smocker a
 
 ```bash
 docker compose up -d db                          # Postgres on :5433, schema from examples/db/init.sql
-./target/release/bddkit --config examples/db.yaml
+./target/release/bddkit run --config examples/db.yaml
 ```
 
 `db-features/db.feature` walks through every DB step: inserts (one-liner, table, multi-table), update, delete, extraction into a variable, row-presence assertions, procedures, functions, sequences, and a second connection.
@@ -37,10 +37,10 @@ docker compose up -d db                          # Postgres on :5433, schema fro
 
 ```bash
 # one file (a positional path overrides the config's `paths`)
-./target/release/bddkit --config examples/api.yaml examples/features/methods.feature
+./target/release/bddkit run --config examples/api.yaml examples/features/methods.feature
 
 # one tag (repeatable; feature-level tags apply to every scenario in the file)
-./target/release/bddkit --config examples/api.yaml --tag json
+./target/release/bddkit run --config examples/api.yaml --tag json
 ```
 
 Exit codes: `0` everything passed, `1` a scenario failed, `2` the run never started (bad config, unknown step, no scenario matched the filter).
