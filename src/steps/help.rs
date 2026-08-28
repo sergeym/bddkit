@@ -75,6 +75,7 @@ pub fn builtin_rows(overlay: &BTreeMap<String, String>) -> Vec<StepRow> {
 pub fn plugin_rows(
     steps: Vec<(String, String, bool, Option<String>)>,
     groups: &[String],
+    overlay: &BTreeMap<String, String>,
 ) -> Vec<StepRow> {
     let mut rows: Vec<StepRow> = steps
         .into_iter()
@@ -87,27 +88,41 @@ pub fn plugin_rows(
         })
         .collect();
     for group in groups {
-        let pattern = format!(r#"^I use "(?P<name>[^"]*)" {group}$"#);
+        // `regex::escape`, exactly as `Registry::add_use_group_step` does it: a
+        // group named `widget.beta` must list the pattern that actually runs,
+        // not one whose dot matches any character.
+        let pattern = format!(r#"^I use "(?P<name>[^"]*)" {}$"#, regex::escape(group));
         rows.push(StepRow {
             group: group.clone(),
-            template: template(&pattern),
+            // Host-owned text, so it is translated like any builtin. The step
+            // has a real `StepId`; it is simply built at startup rather than
+            // declared in the table, because it cannot exist until a plugin
+            // claims a group.
+            description: Some(
+                describe(
+                    "UsePluginInstance",
+                    "switches to another instance of this group, until the scenario ends",
+                    overlay,
+                )
+                .to_string(),
+            ),
+            // Written out rather than derived: deriving it from the escaped
+            // pattern would print `widget\.beta` at the reader.
+            template: format!(r#"I use "<name>" {group}"#),
             pattern,
             kind: "action",
-            description: Some(format!(
-                "switches to another {group} instance, until the scenario ends"
-            )),
         });
     }
     rows
 }
 
-/// Case-insensitive substring over the template, and over the description too
-/// when it is on screen — filtering on text the caller cannot see is worse
-/// than not filtering on it at all.
-pub fn matches_filter(row: &StepRow, filter: &str, verbose: bool) -> bool {
+/// Case-insensitive substring over the template, and over the description when
+/// `descriptions` says it reaches the caller — filtering on text nobody can see
+/// is worse than not filtering on it at all.
+pub fn matches_filter(row: &StepRow, filter: &str, descriptions: bool) -> bool {
     let needle = filter.to_lowercase();
     row.template.to_lowercase().contains(&needle)
-        || (verbose
+        || (descriptions
             && row
                 .description
                 .as_deref()
@@ -162,25 +177,43 @@ pub fn template(pattern: &str) -> String {
             out.push_str(&rest[start..]);
             return out;
         };
-        index += 1;
         let group = &rest[start + 1..start + end];
-        out.push('<');
-        match group_name(group) {
-            Some(name) => out.push_str(name),
-            None => out.push_str(&format!("value{index}")),
+        match classify(group) {
+            Group::Named(name) => out.push_str(&format!("<{name}>")),
+            Group::Positional => {
+                index += 1;
+                out.push_str(&format!("<value{index}>"));
+            }
+            // `(?:…)` and `(?i)` capture nothing, so they take no argument and
+            // must not consume a position — labelling the next real group
+            // `<value2>` would misstate the dispatch order a plugin author
+            // reads this listing to learn.
+            Group::NonCapturing(text) => out.push_str(text),
         }
-        out.push('>');
         rest = &rest[start + end + 1..];
     }
     out.push_str(rest);
     out
 }
 
-fn group_name(group: &str) -> Option<&str> {
-    let inner = group
-        .strip_prefix("?P<")
-        .or_else(|| group.strip_prefix("?<"))?;
-    inner.split_once('>').map(|(name, _)| name)
+enum Group<'a> {
+    Named(&'a str),
+    Positional,
+    /// Whatever of it is literal text: the body of a `(?:…)`, and nothing at
+    /// all for an inline flag like `(?i)`.
+    NonCapturing(&'a str),
+}
+
+fn classify(group: &str) -> Group<'_> {
+    let Some(rest) = group.strip_prefix('?') else {
+        return Group::Positional;
+    };
+    if let Some(named) = rest.strip_prefix('P').unwrap_or(rest).strip_prefix('<')
+        && let Some((name, _)) = named.split_once('>')
+    {
+        return Group::Named(name);
+    }
+    Group::NonCapturing(rest.strip_prefix(':').unwrap_or(""))
 }
 
 #[cfg(test)]
@@ -218,6 +251,18 @@ mod tests {
     }
 
     #[test]
+    fn a_non_capturing_group_takes_no_argument_position() {
+        // A plugin author reads this listing to learn the argument ORDER their
+        // dispatch receives. `(?:…)` captures nothing, so counting it would
+        // label the one real argument `<value2>` and misstate that contract.
+        assert_eq!(
+            template(r#"^I upload(?: the)? file "([^"]*)"$"#),
+            r#"I upload the? file "<value1>""#
+        );
+        assert_eq!(template("^(?i)the thing$"), "the thing");
+    }
+
+    #[test]
     fn a_pattern_without_groups_keeps_its_trailing_colon() {
         // The colon is what tells a reader the step takes a docstring or table.
         assert_eq!(template("^the request body is:$"), "the request body is:");
@@ -229,10 +274,14 @@ mod tests {
         // ours — and a key naming a step that no longer exists is dead weight
         // that will never be printed. Completeness is deliberately NOT checked:
         // falling back to English per step is what lets a translation lag.
-        let ids: Vec<String> = crate::steps::BUILTIN_STEPS
+        let mut ids: Vec<String> = crate::steps::BUILTIN_STEPS
             .iter()
             .map(|def| format!("{:?}", def.id))
             .collect();
+        // The one step with a `StepId` that is not in the table: it is built at
+        // startup from the loaded plugin groups, because it cannot exist until
+        // a plugin claims one. Its text is still the host's, so it translates.
+        ids.push("UsePluginInstance".to_string());
         for (code, _) in LOCALES {
             let map = translations(code);
             assert!(!map.is_empty(), "locale {code} is empty");

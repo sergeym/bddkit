@@ -715,4 +715,10 @@ fn steps_list_shows_a_plugins_group_only_once_a_config_names_it() {
         stdout.contains(r#"I use "<name>" echo"#),
         "the group-switch step exists once a plugin claims the group:\n{stdout}"
     );
+    // The fixture's third step declares neither a name nor a description, which
+    // is what an older plugin looks like: it must list, not break the listing.
+    assert!(
+        stdout.contains("  the echo should fail\n  "),
+        "a step without a description is followed by the next step, not a blank line:\n{stdout}"
+    );
 }

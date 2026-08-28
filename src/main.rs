@@ -103,8 +103,12 @@ struct ListArgs {
 fn steps_command(args: StepsArgs) -> Result<i32> {
     let Some(StepsCommand::List(args)) = args.command else {
         use clap::CommandFactory;
-        Cli::command()
-            .find_subcommand_mut("steps")
+        let mut cli = Cli::command();
+        // `build` first: an unbuilt `Command` has not propagated `bin_name` to
+        // its subcommands, so the help would print `Usage: steps [COMMAND]` —
+        // a line the reader cannot type.
+        cli.build();
+        cli.find_subcommand_mut("steps")
             .expect("the steps subcommand is declared")
             .print_help()?;
         println!();
@@ -127,6 +131,7 @@ fn list_steps(args: ListArgs) -> Result<i32> {
             rows.extend(steps::help::plugin_rows(
                 plugins.described_steps(),
                 &plugins.group_names(),
+                &overlay,
             ));
         }
     }
@@ -140,7 +145,10 @@ fn list_steps(args: ListArgs) -> Result<i32> {
         rows.retain(|row| &row.group == resource);
     }
     if let Some(filter) = &args.filter {
-        rows.retain(|row| steps::help::matches_filter(row, filter, args.verbose));
+        // `--json` always emits the description, so there it is searchable
+        // whether or not `-v` was passed — `-v` has no other effect on JSON.
+        let searches_descriptions = args.verbose || args.json;
+        rows.retain(|row| steps::help::matches_filter(row, filter, searches_descriptions));
     }
 
     if args.json {

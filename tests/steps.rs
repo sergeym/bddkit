@@ -87,7 +87,11 @@ fn json_is_machine_readable_and_carries_the_raw_pattern() {
 fn the_family_help_names_the_list_subcommand() {
     let (out, code) = steps(&["steps"]);
     assert_eq!(code, Some(0), "{out}");
-    assert!(out.contains("list"), "{out}");
+    // The word "list" alone appears in the examples and the description too,
+    // so it would pass on almost any output. The usage line is the contract:
+    // it has to be a command the reader can actually type.
+    assert!(out.contains("Usage: bddkit steps"), "{out}");
+    assert!(out.contains("bddkit steps list --config"), "{out}");
 }
 
 #[test]

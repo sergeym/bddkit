@@ -1,6 +1,6 @@
-# Перевод описаний шагов. Ключ — имя варианта StepId.
-# Английский текст живёт в BUILTIN_STEPS рядом с паттерном; отсутствующий здесь
-# ключ отдаётся по-английски, поэтому файл может отставать от новых шагов.
+# Translated step descriptions. The key is the StepId variant name.
+# English lives in BUILTIN_STEPS beside the pattern it describes; a key missing
+# here falls back to English, so this file may lag behind newly added steps.
 
 SetRequestHeader: устанавливает заголовок собираемого запроса, заменяя прежнее значение
 AddRequestHeader: добавляет ещё одно значение к заголовку запроса, сохраняя прежнее
@@ -57,3 +57,4 @@ SrpVerifierWithSalt: вычисляет SRP-верификатор с этой �
 SrpVerifier: вычисляет SRP-верификатор со свежей солью в <prefix>_salt и <prefix>_verifier
 SrpStartLogin: начинает SRP-вход, сохраняя клиентские значения в <prefix>_a и <prefix>_A
 SrpCompleteLogin: отвечает на вызов сервера в <prefix>_M1, <prefix>_M2 и <prefix>_sessionKey
+UsePluginInstance: переключает экземпляр этой группы до конца сценария

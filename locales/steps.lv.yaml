@@ -1,6 +1,6 @@
-# Soļu aprakstu tulkojums. Atslēga — StepId varianta nosaukums.
-# Angļu teksts glabājas BUILTIN_STEPS blakus paraugam; trūkstoša atslēga tiek
-# rādīta angliski, tāpēc šis fails drīkst atpalikt no jauniem soļiem.
+# Translated step descriptions. The key is the StepId variant name.
+# English lives in BUILTIN_STEPS beside the pattern it describes; a key missing
+# here falls back to English, so this file may lag behind newly added steps.
 
 SetRequestHeader: iestata veidojamā pieprasījuma galveni, aizstājot iepriekšējo vērtību
 AddRequestHeader: pievieno vēl vienu vērtību pieprasījuma galvenei, saglabājot esošo
@@ -57,3 +57,4 @@ SrpVerifierWithSalt: aprēķina SRP verifikatoru ar šo sāli mainīgajos <prefi
 SrpVerifier: aprēķina SRP verifikatoru ar jaunu sāli mainīgajos <prefix>_salt un <prefix>_verifier
 SrpStartLogin: sāk SRP pieteikšanos, saglabājot klienta vērtības <prefix>_a un <prefix>_A
 SrpCompleteLogin: atbild uz servera izaicinājumu mainīgajos <prefix>_M1, <prefix>_M2 un <prefix>_sessionKey
+UsePluginInstance: pārslēdz šīs grupas instanci līdz scenārija beigām
