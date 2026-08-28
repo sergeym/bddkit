@@ -60,7 +60,7 @@ re-run. JSON mismatches point at the path that differs.
 ```bash
 docker compose up -d smocker   # local mock API the example talks to
 cargo build --release
-./target/release/bddkit --config examples/api.yaml
+./target/release/bddkit run --config examples/api.yaml
 ```
 
 ```console
@@ -86,15 +86,39 @@ container:
 
 ```bash
 docker compose up -d db
-./target/release/bddkit --config examples/db.yaml
+./target/release/bddkit run --config examples/db.yaml
 ```
 
 `examples/README.md` covers both suites, what each feature file demonstrates,
 and how to narrow a run to one file or one tag.
 
-Flags: `--config` (required), positional paths to override the config's,
-`--tag` (repeatable), `--env` to pick a `.env.<name>` layer, `--fail-fast`.
-Exit codes: `0` passed, `1` a scenario failed, `2` the run never started.
+`bddkit run` flags: `--config` (required), positional paths to override the config's, `--tag` (repeatable), `--env` to pick a `.env.<name>` layer, `--fail-fast`. Exit codes: `0` passed, `1` a scenario failed, `2` the run never started.
+
+## What steps exist
+
+`bddkit steps list` prints the whole vocabulary as templates, grouped by resource, with no config and no regex:
+
+```console
+$ bddkit steps list db
+db:
+  I use "<name>" connection
+  I have "<table>" where:
+  I have "<table>" with "<pairs>"
+  I have:
+  I update "<table>" with "<pairs>" where "<condition>"
+  ...
+```
+
+Narrow it with a positional resource (`api`, `db`, `srp`, `vars`, `debug`, `general`, or a plugin's group) and with `--filter <text>`, a case-insensitive substring match. `-v` adds a one-line description under each step — filtering down to one step and adding `-v` is the help-for-one-step path, so there is no separate `describe` command:
+
+```console
+$ bddkit steps list --filter "response code" -v
+api:
+  the response code is <code>
+    asserts the HTTP status code of the last response
+```
+
+`--json` emits the same listing machine-readably, with the raw pattern included. `--config <file>` also loads that suite's plugins, so their steps appear under their own groups. Descriptions follow `--lang`, else `$BDDKIT_LANG`, else English; `ru` and `lv` ship with the binary, and an untranslated step falls back to English rather than to a blank line.
 
 ## Config
 

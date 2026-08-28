@@ -176,6 +176,25 @@ impl Plugins {
         out
     }
 
+    /// `(group, pattern, is assertion, description)` for `bddkit steps list`.
+    /// Separate from `steps()`, which feeds the registry and needs indices
+    /// instead of the help text.
+    pub fn described_steps(&self) -> Vec<(String, String, bool, Option<String>)> {
+        self.libs
+            .iter()
+            .flat_map(|lib| {
+                lib.steps.iter().map(|step| {
+                    (
+                        step.group.clone(),
+                        step.pattern.clone(),
+                        step.is_assertion(),
+                        step.description.clone(),
+                    )
+                })
+            })
+            .collect()
+    }
+
     #[cfg(test)]
     pub fn step_count(&self) -> usize {
         self.libs.iter().map(|l| l.steps.len()).sum()

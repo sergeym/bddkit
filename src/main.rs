@@ -18,13 +18,31 @@ mod vars;
 mod world;
 
 use anyhow::Result;
-use clap::Parser;
+use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 #[derive(Parser)]
-#[command(name = "bddkit", about = "Run Gherkin scenarios against an HTTP API")]
+#[command(
+    name = "bddkit",
+    version,
+    about = "Run Gherkin scenarios against an HTTP API"
+)]
 struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Run the feature files the config selects
+    Run(RunArgs),
+    /// Show the steps this binary understands
+    Steps(StepsArgs),
+}
+
+#[derive(Args)]
+struct RunArgs {
     /// Path to the YAML config
     #[arg(long)]
     config: PathBuf,
@@ -41,6 +59,106 @@ struct Cli {
     fail_fast: bool,
 }
 
+#[derive(Args)]
+#[command(after_help = "Examples:
+  bddkit steps list                          every builtin step, grouped by resource
+  bddkit steps list db                       only the database steps
+  bddkit steps list --filter response -v     narrow, and describe what is left
+  bddkit steps list --json                   the same listing, machine-readable
+  bddkit steps list --config suite.yaml      also the steps of that suite's plugins")]
+struct StepsArgs {
+    #[command(subcommand)]
+    command: Option<StepsCommand>,
+}
+
+#[derive(Subcommand)]
+enum StepsCommand {
+    /// List the available steps, grouped by resource
+    List(ListArgs),
+}
+
+#[derive(Args)]
+struct ListArgs {
+    /// Only this resource: api, db, srp, vars, debug, general, or a plugin group
+    resource: Option<String>,
+    /// Case-insensitive substring match on the step template
+    #[arg(long)]
+    filter: Option<String>,
+    /// Add a one-line description under each step
+    #[arg(short, long)]
+    verbose: bool,
+    /// Machine-readable output
+    #[arg(long)]
+    json: bool,
+    /// Also list the steps of the plugins this config loads
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// Description language (default: $BDDKIT_LANG, else en)
+    #[arg(long)]
+    lang: Option<String>,
+}
+
+/// Bare `bddkit steps` is a signpost, not an error: it prints what the family
+/// can do and how, which is the question someone typing it is asking.
+fn steps_command(args: StepsArgs) -> Result<i32> {
+    let Some(StepsCommand::List(args)) = args.command else {
+        use clap::CommandFactory;
+        let mut cli = Cli::command();
+        // `build` first: an unbuilt `Command` has not propagated `bin_name` to
+        // its subcommands, so the help would print `Usage: steps [COMMAND]` —
+        // a line the reader cannot type.
+        cli.build();
+        cli.find_subcommand_mut("steps")
+            .expect("the steps subcommand is declared")
+            .print_help()?;
+        println!();
+        return Ok(0);
+    };
+    list_steps(args)
+}
+
+fn list_steps(args: ListArgs) -> Result<i32> {
+    let overlay = steps::help::translations(&steps::help::language(args.lang.as_deref()));
+    let mut rows = steps::help::builtin_rows(&overlay);
+
+    // A plugin's vocabulary lives inside its `cdylib`, so listing it means
+    // loading it — which is why `--config` is optional here and required by
+    // `run`: the common question, "what steps exist", must cost nothing.
+    if let Some(path) = &args.config {
+        let cfg = config::load(path, None)?;
+        let generator = unique::Generator::new();
+        if let Some(plugins) = load_plugins(path, &cfg, &generator)? {
+            rows.extend(steps::help::plugin_rows(
+                plugins.described_steps(),
+                &plugins.group_names(),
+                &overlay,
+            ));
+        }
+    }
+
+    if let Some(resource) = &args.resource {
+        // Checked before filtering, so a typo is named rather than silently
+        // producing the same empty output an over-narrow filter does.
+        if !rows.iter().any(|row| &row.group == resource) {
+            anyhow::bail!("no such resource: {resource:?}");
+        }
+        rows.retain(|row| &row.group == resource);
+    }
+    if let Some(filter) = &args.filter {
+        // `--json` always emits the description, so there it is searchable
+        // whether or not `-v` was passed — `-v` has no other effect on JSON.
+        let searches_descriptions = args.verbose || args.json;
+        rows.retain(|row| steps::help::matches_filter(row, filter, searches_descriptions));
+    }
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+    } else {
+        print!("{}", steps::help::render(&rows, args.verbose));
+    }
+    Ok(0)
+}
+
 /// Everything that fails before the first request must exit with code 2 (invariant 6):
 /// config loading, path traversal, building API resources and DB pools, parsing
 /// scheduling tags — this is a "nothing ran" failure, while 1 is reserved for
@@ -48,10 +166,16 @@ struct Cli {
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
-    match run(cli).await {
+    // Each command names what did not happen: "run not started" is a lie when
+    // the user only asked for a listing.
+    let (result, nothing_happened) = match cli.command {
+        Command::Run(args) => (run(args).await, "run not started"),
+        Command::Steps(args) => (steps_command(args), "nothing listed"),
+    };
+    match result {
         Ok(code) => std::process::exit(code),
         Err(error) => {
-            eprintln!("error: {error:#}\n\nrun not started");
+            eprintln!("error: {error:#}\n\n{nothing_happened}");
             std::process::exit(2);
         }
     }
@@ -64,7 +188,7 @@ async fn main() {
 /// `None` means no plugin was installed at all — the path every existing suite
 /// takes, and the one that must cost nothing.
 fn load_plugins(
-    cli: &Cli,
+    config_path: &std::path::Path,
     cfg: &config::Config,
     generator: &unique::Generator,
 ) -> Result<Option<Arc<plugin::Plugins>>> {
@@ -73,7 +197,7 @@ fn load_plugins(
         // The same anchor `config::load` uses for the `.env` layers: the lock
         // belongs to the suite, not to whatever directory the run started in.
         plugin::lock::load_default(
-            cli.config
+            config_path
                 .parent()
                 .unwrap_or_else(|| std::path::Path::new(".")),
         )?,
@@ -116,11 +240,11 @@ fn load_plugins(
     Ok(Some(plugins))
 }
 
-async fn run(cli: Cli) -> Result<i32> {
+async fn run(cli: RunArgs) -> Result<i32> {
     let cfg = config::load(&cli.config, cli.env.as_deref())?;
     // Before the plugins: the artifact root is derived from the run id.
     let generator = Arc::new(unique::Generator::new());
-    let plugins = load_plugins(&cli, &cfg, &generator)?;
+    let plugins = load_plugins(&cli.config, &cfg, &generator)?;
 
     // `with_macros_and_plugins`, not `with_macros` plus a registration loop:
     // macros are validated after everything is registered, so a macro body may

@@ -2,6 +2,7 @@ pub mod api;
 pub mod assert;
 pub mod db;
 pub mod debug;
+pub mod help;
 pub mod plugin;
 pub mod srp;
 pub mod vars;
@@ -94,210 +95,395 @@ pub enum StepKind {
 
 pub struct StepDef {
     pub id: StepId,
+    /// The resource this step belongs to, and the heading `bddkit steps list`
+    /// prints it under: `api`, `db`, `srp`, `vars`, `debug`, or `general` for
+    /// the few steps that belong to no resource at all.
+    pub group: &'static str,
     pub pattern: &'static str,
+    /// One line, in English, stating the step's effect. English is the source
+    /// language and it lives here, beside the pattern it describes;
+    /// `locales/steps.<code>.yaml` carries translations of it.
+    pub description: &'static str,
     pub kind: StepKind,
 }
 
-const fn action(id: StepId, pattern: &'static str) -> StepDef {
+const fn action(
+    id: StepId,
+    group: &'static str,
+    pattern: &'static str,
+    description: &'static str,
+) -> StepDef {
     StepDef {
         id,
+        group,
         pattern,
+        description,
         kind: StepKind::Action,
     }
 }
 
-const fn assertion(id: StepId, pattern: &'static str, source: OptionsSource) -> StepDef {
+const fn assertion(
+    id: StepId,
+    group: &'static str,
+    pattern: &'static str,
+    description: &'static str,
+    source: OptionsSource,
+) -> StepDef {
     StepDef {
         id,
+        group,
         pattern,
+        description,
         kind: StepKind::Assertion(source),
     }
 }
 
+/// Capture groups are named, and the name is the parameter's whole
+/// documentation: `bddkit steps list` renders `(?P<path>[^"]*)` as `<path>`.
+/// The `regex` crate keeps a named group addressable by index too, so every
+/// dispatch arm below still captures by position.
 pub const BUILTIN_STEPS: &[StepDef] = &[
     action(
         StepId::SetRequestHeader,
-        r#"^the "([^"]*)" request header is "([^"]*)"$"#,
+        "api",
+        r#"^the "(?P<name>[^"]*)" request header is "(?P<value>[^"]*)"$"#,
+        "sets a header on the request being built, replacing any previous value",
     ),
     action(
         StepId::AddRequestHeader,
-        r#"^I add "([^"]*)" to the "([^"]*)" request header$"#,
+        "api",
+        r#"^I add "(?P<value>[^"]*)" to the "(?P<name>[^"]*)" request header$"#,
+        "appends another value to a request header, keeping what is already there",
     ),
     action(
         StepId::SetQueryParam,
-        r#"^the query parameter "([^"]*)" is "([^"]*)"$"#,
+        "api",
+        r#"^the query parameter "(?P<name>[^"]*)" is "(?P<value>[^"]*)"$"#,
+        "sets a query string parameter on the request being built",
     ),
-    action(StepId::SetRequestBody, r#"^the request body is:$"#),
-    action(StepId::EmptyRequestBody, r#"^the request body is empty$"#),
+    action(
+        StepId::SetRequestBody,
+        "api",
+        r#"^the request body is:$"#,
+        "sets the request body from the docstring below the step",
+    ),
+    action(
+        StepId::EmptyRequestBody,
+        "api",
+        r#"^the request body is empty$"#,
+        "clears the request body built so far",
+    ),
     action(
         StepId::SetFormParams,
+        "api",
         r#"^the request form parameters are:$"#,
+        "sends the table below as form-encoded parameters instead of a body",
     ),
     action(
         StepId::RequestPathWithMethod,
-        r#"^I request "([^"]*)" using HTTP (GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)$"#,
+        "api",
+        r#"^I request "(?P<path>[^"]*)" using HTTP (?P<method>GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)$"#,
+        "performs the request against the current API with this method",
     ),
-    action(StepId::RequestPath, r#"^I request "([^"]*)"$"#),
+    action(
+        StepId::RequestPath,
+        "api",
+        r#"^I request "(?P<path>[^"]*)"$"#,
+        "performs a GET request against the current API",
+    ),
     action(
         StepId::SignNextRequestWithHawk,
-        r#"^I sign the next request with Hawk id "([^"]*)" and key "([^"]*)"$"#,
+        "api",
+        r#"^I sign the next request with Hawk id "(?P<id>[^"]*)" and key "(?P<key>[^"]*)"$"#,
+        "signs the next request with these Hawk credentials, and every replay of it",
     ),
     action(
         StepId::ExpectEventually,
+        "general",
         r#"^I expect the next assertion to pass eventually$"#,
+        "lets the next assertion retry with the configured polling options",
     ),
     action(
         StepId::ExpectWithinEvery,
-        r#"^I expect the next assertion to pass within "(\d+)" seconds, checking every "(\d+)" milliseconds$"#,
+        "general",
+        r#"^I expect the next assertion to pass within "(?P<seconds>\d+)" seconds, checking every "(?P<milliseconds>\d+)" milliseconds$"#,
+        "lets the next assertion retry for this long, at this interval",
     ),
     action(
         StepId::ExpectWithin,
-        r#"^I expect the next assertion to pass within "(\d+)" seconds$"#,
+        "general",
+        r#"^I expect the next assertion to pass within "(?P<seconds>\d+)" seconds$"#,
+        "lets the next assertion retry for this long, at the configured interval",
     ),
     assertion(
         StepId::ResponseCode,
-        r#"^the response code is (\d+)$"#,
+        "api",
+        r#"^the response code is (?P<code>\d+)$"#,
+        "asserts the HTTP status code of the last response",
         OptionsSource::Http,
     ),
     assertion(
         StepId::ResponseBodyContainsJson,
+        "api",
         r#"^the response body contains JSON:$"#,
+        "asserts the response body contains this JSON — object subsets pass, array order is ignored",
         OptionsSource::Http,
     ),
     assertion(
         StepId::ResponseBodyEqualsJson,
+        "api",
         r#"^the response body equals JSON:$"#,
+        "asserts the response body equals this JSON exactly, key for key and element for element",
         OptionsSource::Http,
     ),
     assertion(
         StepId::ResponseArrayLength,
-        r#"^the response body is a JSON array of length (\d+)$"#,
+        "api",
+        r#"^the response body is a JSON array of length (?P<length>\d+)$"#,
+        "asserts the response body is a JSON array holding this many elements",
         OptionsSource::Http,
     ),
     assertion(
         StepId::ResponseHeader,
-        r#"^the "([^"]*)" response header is "([^"]*)"$"#,
+        "api",
+        r#"^the "(?P<name>[^"]*)" response header is "(?P<value>[^"]*)"$"#,
+        "asserts a response header holds exactly this value",
         OptionsSource::Http,
     ),
     assertion(
         StepId::JsonNodeExists,
-        r#"^the JSON node "([^"]*)" should exist$"#,
+        "api",
+        r#"^the JSON node "(?P<path>[^"]*)" should exist$"#,
+        "asserts the response body has a node at this JSON path",
         OptionsSource::Http,
     ),
     action(
         StepId::SetVariableGlobal,
-        r#"^set variable "([^"]*)" to "([^"]*)" global$"#,
+        "vars",
+        r#"^set variable "(?P<name>[^"]*)" to "(?P<value>[^"]*)" global$"#,
+        "sets a variable every scenario of this feature file can read",
     ),
     action(
         StepId::SetVariable,
-        r#"^set variable "([^"]*)" to "([^"]*)"$"#,
+        "vars",
+        r#"^set variable "(?P<name>[^"]*)" to "(?P<value>[^"]*)"$"#,
+        "sets a variable for the current scenario",
     ),
     action(
         StepId::ExtractFromJsonGlobal,
-        r#"^extract "([^"]*)" from JSON as "([^"]*)" global$"#,
+        "vars",
+        r#"^extract "(?P<path>[^"]*)" from JSON as "(?P<name>[^"]*)" global$"#,
+        "reads a JSON path of the response into a variable the whole file can see",
     ),
     action(
         StepId::ExtractFromJson,
-        r#"^extract "([^"]*)" from JSON as "([^"]*)"$"#,
+        "vars",
+        r#"^extract "(?P<path>[^"]*)" from JSON as "(?P<name>[^"]*)"$"#,
+        "reads a JSON path of the response into a variable",
     ),
     action(
         StepId::ExtractFromCookiesGlobal,
-        r#"^extract "([^"]*)" from cookies as "([^"]*)" global$"#,
+        "vars",
+        r#"^extract "(?P<cookie>[^"]*)" from cookies as "(?P<name>[^"]*)" global$"#,
+        "reads a response cookie into a variable the whole file can see",
     ),
     action(
         StepId::ExtractFromCookies,
-        r#"^extract "([^"]*)" from cookies as "([^"]*)"$"#,
+        "vars",
+        r#"^extract "(?P<cookie>[^"]*)" from cookies as "(?P<name>[^"]*)"$"#,
+        "reads a response cookie into a variable",
     ),
     assertion(
         StepId::VariableNotEquals,
-        r#"^variable "([^"]*)" should not be equal to "([^"]*)"$"#,
+        "vars",
+        r#"^variable "(?P<name>[^"]*)" should not be equal to "(?P<value>[^"]*)"$"#,
+        "asserts a variable differs from this value",
         OptionsSource::Global,
     ),
     assertion(
         StepId::VariableEquals,
-        r#"^variable "([^"]*)" should be equal to "([^"]*)"$"#,
+        "vars",
+        r#"^variable "(?P<name>[^"]*)" should be equal to "(?P<value>[^"]*)"$"#,
+        "asserts a variable holds exactly this value",
         OptionsSource::Global,
     ),
     action(
         StepId::EncryptWithAes,
-        r#"^I encrypt "([^"]*)" with AES using key "([^"]*)" as "([^"]*)"$"#,
+        "vars",
+        r#"^I encrypt "(?P<value>[^"]*)" with AES using key "(?P<key>[^"]*)" as "(?P<name>[^"]*)"$"#,
+        "encrypts a value with an AES key and stores the result in a variable",
     ),
-    action(StepId::UseApi, r#"^I use "([^"]*)" api$"#),
-    action(StepId::UseConnection, r#"^I use "([^"]*)" connection$"#),
-    action(StepId::DebugOn, r#"^I am in debug mode$"#),
-    action(StepId::DebugOff, r#"^I am not in debug mode$"#),
-    action(StepId::HaveWhere, r#"^I have "([^"]*)" where:$"#),
-    action(StepId::HaveWith, r#"^I have "([^"]*)" with "([^"]*)"$"#),
-    action(StepId::HaveMulti, r#"^I have:$"#),
+    action(
+        StepId::UseApi,
+        "api",
+        r#"^I use "(?P<name>[^"]*)" api$"#,
+        "switches to another API resource and its default headers, until the scenario ends",
+    ),
+    action(
+        StepId::UseConnection,
+        "db",
+        r#"^I use "(?P<name>[^"]*)" connection$"#,
+        "switches to another database connection, until the scenario ends",
+    ),
+    action(
+        StepId::DebugOn,
+        "debug",
+        r#"^I am in debug mode$"#,
+        "prints the generated SQL, its binds and plugin exchanges to stderr",
+    ),
+    action(
+        StepId::DebugOff,
+        "debug",
+        r#"^I am not in debug mode$"#,
+        "stops the debug output turned on earlier in the scenario",
+    ),
+    action(
+        StepId::HaveWhere,
+        "db",
+        r#"^I have "(?P<table>[^"]*)" where:$"#,
+        "inserts one row per line of the table below, its header naming the columns",
+    ),
+    action(
+        StepId::HaveWith,
+        "db",
+        r#"^I have "(?P<table>[^"]*)" with "(?P<pairs>[^"]*)"$"#,
+        "inserts one row, filling required columns the pairs omit from the table schema",
+    ),
+    action(
+        StepId::HaveMulti,
+        "db",
+        r#"^I have:$"#,
+        "inserts rows into several tables, the first column of the table below naming each one",
+    ),
     action(
         StepId::Update,
-        r#"^I update "([^"]*)" with "([^"]*)" where "([^"]*)"$"#,
+        "db",
+        r#"^I update "(?P<table>[^"]*)" with "(?P<pairs>[^"]*)" where "(?P<condition>[^"]*)"$"#,
+        "updates matching rows and stores the affected count in updated_<table>",
     ),
-    action(StepId::DeleteAll, r#"^I delete all "([^"]*)"$"#),
+    action(
+        StepId::DeleteAll,
+        "db",
+        r#"^I delete all "(?P<table>[^"]*)"$"#,
+        "wipes the whole table — no WHERE, and no awareness of files running in parallel",
+    ),
     action(
         StepId::DeleteWhere,
-        r#"^I delete "([^"]*)" where "([^"]*)"$"#,
+        "db",
+        r#"^I delete "(?P<table>[^"]*)" where "(?P<condition>[^"]*)"$"#,
+        "deletes matching rows and stores the affected count in deleted_<table>",
     ),
     action(
         StepId::ExtractFromDb,
-        r#"^I extract "([^"]*)" from "([^"]*)" with "([^"]*)" as "([^"]*)"$"#,
+        "db",
+        r#"^I extract "(?P<column>[^"]*)" from "(?P<table>[^"]*)" with "(?P<condition>[^"]*)" as "(?P<name>[^"]*)"$"#,
+        "reads a column of the first matching row into a variable",
     ),
     assertion(
         StepId::ShouldNotHaveTable,
-        r#"^I should not have "([^"]*)" with:$"#,
+        "db",
+        r#"^I should not have "(?P<table>[^"]*)" with:$"#,
+        "asserts no row matches any line of the table below",
         OptionsSource::Db,
     ),
     assertion(
         StepId::ShouldNotHaveWith,
-        r#"^I should not have "([^"]*)" with "([^"]*)"$"#,
+        "db",
+        r#"^I should not have "(?P<table>[^"]*)" with "(?P<pairs>[^"]*)"$"#,
+        "asserts no row matches these column values",
         OptionsSource::Db,
     ),
     assertion(
         StepId::ShouldHaveTable,
-        r#"^I should have "([^"]*)" with:$"#,
+        "db",
+        r#"^I should have "(?P<table>[^"]*)" with:$"#,
+        "asserts a row matches each line of the table below",
         OptionsSource::Db,
     ),
     assertion(
         StepId::ShouldHaveWith,
-        r#"^I should have "([^"]*)" with "([^"]*)"$"#,
+        "db",
+        r#"^I should have "(?P<table>[^"]*)" with "(?P<pairs>[^"]*)"$"#,
+        "asserts at least one row matches these column values",
         OptionsSource::Db,
     ),
     action(
         StepId::CallProcedure,
-        r#"^I call procedure "([^"]*)" with "([^"]*)"$"#,
+        "db",
+        r#"^I call procedure "(?P<name>[^"]*)" with "(?P<arguments>[^"]*)"$"#,
+        "calls a stored procedure with these arguments",
     ),
     action(
         StepId::CallFunction,
-        r#"^I call function "([^"]*)" with "([^"]*)" as "([^"]*)"$"#,
+        "db",
+        r#"^I call function "(?P<name>[^"]*)" with "(?P<arguments>[^"]*)" as "(?P<variable>[^"]*)"$"#,
+        "calls a function and stores its return value in a variable",
     ),
     action(
         StepId::GetSequence,
-        r#"^I get next value of sequence "([^"]*)" as "([^"]*)"$"#,
+        "db",
+        r#"^I get next value of sequence "(?P<name>[^"]*)" as "(?P<variable>[^"]*)"$"#,
+        "advances a sequence and stores the new value in a variable",
     ),
-    action(StepId::Sleep, r#"^I sleep "(\d+)" seconds$"#),
-    action(StepId::ShowAllVariables, r#"^Show all variables$"#),
-    action(StepId::ShowVariable, r#"^Show "([^"]*)" variable$"#),
-    action(StepId::PrintResponseHeaders, r#"^Print response headers$"#),
-    action(StepId::PrintResponseBody, r#"^Print response body$"#),
+    action(
+        StepId::Sleep,
+        "general",
+        r#"^I sleep "(?P<seconds>\d+)" seconds$"#,
+        "pauses the scenario — a last resort, an eventual assertion is usually what you want",
+    ),
+    action(
+        StepId::ShowAllVariables,
+        "debug",
+        r#"^Show all variables$"#,
+        "prints every variable in scope to stderr",
+    ),
+    action(
+        StepId::ShowVariable,
+        "debug",
+        r#"^Show "(?P<name>[^"]*)" variable$"#,
+        "prints one variable to stderr, failing if it is not set",
+    ),
+    action(
+        StepId::PrintResponseHeaders,
+        "debug",
+        r#"^Print response headers$"#,
+        "prints the headers of the last response to stderr",
+    ),
+    action(
+        StepId::PrintResponseBody,
+        "debug",
+        r#"^Print response body$"#,
+        "prints the body of the last response to stderr, highlighted",
+    ),
     action(
         StepId::PrintResponseBodyAsPath,
-        r#"^Print response body as "([^"]*)"$"#,
+        "debug",
+        r#"^Print response body as "(?P<path>[^"]*)"$"#,
+        "prints one JSON path or XPath selection of the last response to stderr",
     ),
     action(
         StepId::SrpVerifierWithSalt,
-        r#"^I generate an SRP verifier for "([^"]*)" with password "([^"]*)" and salt "([^"]*)" as "([^"]*)"$"#,
+        "srp",
+        r#"^I generate an SRP verifier for "(?P<username>[^"]*)" with password "(?P<password>[^"]*)" and salt "(?P<salt>[^"]*)" as "(?P<prefix>[^"]*)"$"#,
+        "computes an SRP verifier from this salt into <prefix>_salt and <prefix>_verifier",
     ),
     action(
         StepId::SrpVerifier,
-        r#"^I generate an SRP verifier for "([^"]*)" with password "([^"]*)" as "([^"]*)"$"#,
+        "srp",
+        r#"^I generate an SRP verifier for "(?P<username>[^"]*)" with password "(?P<password>[^"]*)" as "(?P<prefix>[^"]*)"$"#,
+        "computes an SRP verifier from a fresh salt into <prefix>_salt and <prefix>_verifier",
     ),
     action(
         StepId::SrpStartLogin,
-        r#"^I start an SRP login as "([^"]*)"$"#,
+        "srp",
+        r#"^I start an SRP login as "(?P<prefix>[^"]*)"$"#,
+        "starts an SRP login, storing the client values in <prefix>_a and <prefix>_A",
     ),
     action(
         StepId::SrpCompleteLogin,
-        r#"^I complete SRP login "([^"]*)" for "([^"]*)" with password "([^"]*)" salt "([^"]*)" and "([^"]*)"$"#,
+        "srp",
+        r#"^I complete SRP login "(?P<prefix>[^"]*)" for "(?P<username>[^"]*)" with password "(?P<password>[^"]*)" salt "(?P<salt>[^"]*)" and "(?P<server_public>[^"]*)"$"#,
+        "answers the server challenge into <prefix>_M1, <prefix>_M2 and <prefix>_sessionKey",
     ),
 ];
 
@@ -618,7 +804,18 @@ fn macro_pattern(template: &str) -> Vec<PatternToken> {
     tokens
 }
 
+static GROUP_NAME: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\?P?<[A-Za-z_][A-Za-z0-9_]*>").expect("constant group-name regex")
+});
+
 fn builtin_patterns(pattern: &str) -> Vec<Vec<PatternToken>> {
+    // A group name is display metadata for `bddkit steps list`, and the
+    // tokenizer below recognizes `([^"]*)`, `(\d+)` and the method alternation
+    // by their literal text. An unrecognized construct does not fail here — it
+    // degrades into literal characters, which would quietly stop a macro from
+    // conflicting with the builtin it shadows. Stripping the names first leaves
+    // the token stream exactly as it was before the table was annotated.
+    let pattern = &*GROUP_NAME.replace_all(pattern, "");
     const METHODS: &str = "(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)";
     let variants: Vec<String> = if pattern.contains(METHODS) {
         ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]
@@ -987,6 +1184,53 @@ mod tests {
             reg.find(r#"I use "x" widget.beta"#).expect("no ambiguity").is_some(),
             "the literal group name must still match"
         );
+    }
+
+    #[test]
+    fn every_builtin_declares_a_known_group_and_a_description() {
+        // The group is what `bddkit steps list` prints and filters on: a typo
+        // there hides a whole step from discovery without failing anything else.
+        const GROUPS: &[&str] = &["api", "db", "srp", "vars", "debug", "general"];
+        for def in BUILTIN_STEPS {
+            assert!(
+                GROUPS.contains(&def.group),
+                "{:?}: unknown group {:?}",
+                def.id,
+                def.group
+            );
+            assert!(
+                !def.description.is_empty(),
+                "{:?} has no description",
+                def.id
+            );
+        }
+    }
+
+    #[test]
+    fn a_macro_conflicting_with_a_named_builtin_is_still_rejected() {
+        // `builtin_patterns` recognizes `([^"]*)` by its literal text, and an
+        // unrecognized construct degrades into literal characters rather than
+        // failing. Naming the group without normalizing it first would silently
+        // stop this collision from being seen at all.
+        //
+        // The macro is deliberately parameterless: a `{param}` becomes a
+        // wildcard that swallows even unrecognized literals, so it would report
+        // a conflict either way. Here the BUILTIN's capture is the side that has
+        // to expand, which it can only do once it is recognized as a capture.
+        let path = std::env::temp_dir().join(format!(
+            "bddkit-steps-named-group-conflict-{}.yaml",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            "- step: I request \"/ping\"\n  do: [Show all variables]\n",
+        )
+        .expect("write macro file");
+        let catalog = MacroCatalog::load(std::slice::from_ref(&path)).expect("macro loads");
+        std::fs::remove_file(&path).ok();
+
+        let error = Registry::with_macros(catalog).expect_err("the macro shadows a builtin");
+        assert!(error.contains("conflicts with builtin"), "{error}");
     }
 
     #[test]

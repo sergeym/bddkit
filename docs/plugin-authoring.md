@@ -91,14 +91,19 @@ An **array** at the top level:
 
 ```json
 [
-  { "pattern": "^I upload file \"([^\"]+)\" to \"([^\"]+)\"$", "group": "s3", "kind": "action" },
-  { "pattern": "^the bucket should contain \"([^\"]+)\"$",     "group": "s3", "kind": "assertion" }
+  { "pattern": "^I upload file \"(?P<file>[^\"]+)\" to \"(?P<bucket>[^\"]+)\"$", "group": "s3", "kind": "action",
+    "description": "uploads a local file to the bucket this instance is configured for" },
+  { "pattern": "^the bucket should contain \"(?P<key>[^\"]+)\"$", "group": "s3", "kind": "assertion",
+    "description": "asserts an object with this key exists in the bucket" }
 ]
 ```
 
 - `pattern` (string, required) — a Rust `regex` crate pattern. Anchor it with `^…$`. Each capture group becomes one positional argument at dispatch, in order.
 - `group` (string, required) — must be one the manifest claims.
 - `kind` (string, required) — `"action"` or `"assertion"`. Only an assertion may answer `not_yet`, and only an assertion consumes an armed eventual-assertion modifier.
+- `description` (string, optional) — one line stating the step's effect, shown by `bddkit steps list --config <file> -v`. Localizing it is your job, not the host's: bddkit never translates a plugin's text. Omit it and the step lists without a description.
+
+**Name your capture groups.** `bddkit steps list` renders a pattern as a template by replacing each group with its name, so `(?P<bucket>[^"]+)` reads as `<bucket>` while a bare `([^"]+)` degrades to `<value1>`. Named groups stay addressable by index, so nothing about dispatch changes.
 
 **The index of a step in this array is its identity.** It is the `u32` the host passes to `bddkit_dispatch`, so the array's order is part of your plugin's internal contract with itself — dispatch on the index, and keep the `match` arms and the array in one place so they cannot drift.
 
@@ -330,7 +335,7 @@ Two files are read, and the project one overrides the user one **entry by entry,
 | project | `<directory of the --config file>/.bddkit/plugins.yaml` |
 | user | `$HOME/.config/bddkit/plugins.yaml` |
 
-The project lock is anchored to the config file's directory, not the working directory, so `bddkit --config suites/cfg.yaml` finds the same plugins from anywhere. A missing lock file means no plugins, which is the normal case. An unset `HOME` means no user lock.
+The project lock is anchored to the config file's directory, not the working directory, so `bddkit run --config suites/cfg.yaml` finds the same plugins from anywhere. A missing lock file means no plugins, which is the normal case. An unset `HOME` means no user lock.
 
 This file is **machine state and does not belong in the committed test config**: the config describes the system under test, a `.so` path describes one machine.
 

@@ -68,6 +68,12 @@ pub struct StepSpec {
     pub pattern: String,
     pub group: String,
     pub kind: StepKind,
+    /// The author's own one-line help, shown by `bddkit steps list`. Optional
+    /// and defaulted, so a plugin published before the field existed still
+    /// loads. The host never translates it: localizing a plugin is the
+    /// plugin's job, not the host's.
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 impl StepSpec {
@@ -249,6 +255,23 @@ mod tests {
         assert!(!steps[0].is_assertion());
         assert!(steps[1].is_assertion());
         assert_eq!(steps[0].group, "widget");
+    }
+
+    #[test]
+    fn a_step_description_is_optional_in_both_directions() {
+        // Plugins published before the field existed must keep loading — they
+        // simply list without a description — which is why this is additive
+        // and `ABI_VERSION` does not move.
+        let plain: Vec<StepSpec> =
+            serde_json::from_str(r#"[{"pattern":"^a$","group":"widget","kind":"action"}]"#)
+                .expect("steps parse");
+        assert!(plain[0].description.is_none());
+
+        let described: Vec<StepSpec> = serde_json::from_str(
+            r#"[{"pattern":"^a$","group":"widget","kind":"action","description":"does a"}]"#,
+        )
+        .expect("steps parse");
+        assert_eq!(described[0].description.as_deref(), Some("does a"));
     }
 
     #[test]
