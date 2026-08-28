@@ -68,6 +68,39 @@ pub fn builtin_rows(overlay: &BTreeMap<String, String>) -> Vec<StepRow> {
         .collect()
 }
 
+/// What the loaded plugins contribute, under their own group names. The
+/// group-switch step is built here the same way `Registry::add_use_group_step`
+/// builds its pattern: it exists only once a plugin claims a group, so it is
+/// not in the step table and would otherwise be undiscoverable.
+pub fn plugin_rows(
+    steps: Vec<(String, String, bool, Option<String>)>,
+    groups: &[String],
+) -> Vec<StepRow> {
+    let mut rows: Vec<StepRow> = steps
+        .into_iter()
+        .map(|(group, pattern, assertion, description)| StepRow {
+            group,
+            template: template(&pattern),
+            pattern,
+            kind: if assertion { "assertion" } else { "action" },
+            description,
+        })
+        .collect();
+    for group in groups {
+        let pattern = format!(r#"^I use "(?P<name>[^"]*)" {group}$"#);
+        rows.push(StepRow {
+            group: group.clone(),
+            template: template(&pattern),
+            pattern,
+            kind: "action",
+            description: Some(format!(
+                "switches to another {group} instance, until the scenario ends"
+            )),
+        });
+    }
+    rows
+}
+
 /// Case-insensitive substring over the template, and over the description too
 /// when it is on screen — filtering on text the caller cannot see is worse
 /// than not filtering on it at all.

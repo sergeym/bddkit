@@ -117,6 +117,20 @@ fn list_steps(args: ListArgs) -> Result<i32> {
     let overlay = steps::help::translations(&steps::help::language(args.lang.as_deref()));
     let mut rows = steps::help::builtin_rows(&overlay);
 
+    // A plugin's vocabulary lives inside its `cdylib`, so listing it means
+    // loading it — which is why `--config` is optional here and required by
+    // `run`: the common question, "what steps exist", must cost nothing.
+    if let Some(path) = &args.config {
+        let cfg = config::load(path, None)?;
+        let generator = unique::Generator::new();
+        if let Some(plugins) = load_plugins(path, &cfg, &generator)? {
+            rows.extend(steps::help::plugin_rows(
+                plugins.described_steps(),
+                &plugins.group_names(),
+            ));
+        }
+    }
+
     if let Some(resource) = &args.resource {
         // Checked before filtering, so a typo is named rather than silently
         // producing the same empty output an over-narrow filter does.

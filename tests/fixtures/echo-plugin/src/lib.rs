@@ -75,8 +75,10 @@ pub extern "C" fn bddkit_manifest() -> *mut c_char {
 pub extern "C" fn bddkit_list_steps() -> *mut c_char {
     guard("envelope", || {
         serde_json::json!([
-            { "pattern": r#"^I echo "([^"]*)" as "([^"]*)"$"#, "group": "echo", "kind": "action" },
-            { "pattern": r#"^the echo counter should reach (\d+)$"#, "group": "echo", "kind": "assertion" },
+            { "pattern": r#"^I echo "(?P<value>[^"]*)" as "(?P<variable>[^"]*)"$"#, "group": "echo", "kind": "action",
+              "description": "echoes its argument back into a variable, prefixed by the instance config" },
+            { "pattern": r#"^the echo counter should reach (?P<count>\d+)$"#, "group": "echo", "kind": "assertion",
+              "description": "asserts the instance has served this many steps" },
             { "pattern": r#"^the echo should fail$"#, "group": "echo", "kind": "assertion" }
         ])
         .to_string()

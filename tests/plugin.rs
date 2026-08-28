@@ -675,3 +675,44 @@ fn two_plugins_keep_separate_instances_and_are_both_swept() {
         "the per-file instance must be dropped when its file ends\n{stderr}"
     );
 }
+
+/// `bddkit steps list` without a config knows only the builtins — a plugin's
+/// vocabulary lives inside a `cdylib` the host has to load to see at all.
+#[test]
+fn steps_list_shows_a_plugins_group_only_once_a_config_names_it() {
+    let dir = project("steps-list", "Feature: f\n", ECHO_GROUP);
+
+    let bare = Command::new(env!("CARGO_BIN_EXE_bddkit"))
+        .args(["steps", "list"])
+        .current_dir(&dir)
+        .output()
+        .expect("run bddkit");
+    let bare_out = String::from_utf8_lossy(&bare.stdout);
+    assert_eq!(bare.status.code(), Some(0), "{bare_out}");
+    assert!(
+        !bare_out.contains("echo:"),
+        "without --config no plugin is loaded, so it has no steps to show:\n{bare_out}"
+    );
+
+    let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
+        .args(["steps", "list", "echo", "--config", "cfg.yaml", "-v"])
+        .current_dir(&dir)
+        .output()
+        .expect("run bddkit");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    assert!(stdout.contains("echo:"), "{stdout}");
+    assert!(
+        stdout.contains(r#"I echo "<value>" as "<variable>""#),
+        "a plugin's named groups render like a builtin's:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("echoes its argument"),
+        "the description the plugin declared must be shown:\n{stdout}"
+    );
+    assert!(
+        stdout.contains(r#"I use "<name>" echo"#),
+        "the group-switch step exists once a plugin claims the group:\n{stdout}"
+    );
+}
