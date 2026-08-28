@@ -2,6 +2,7 @@ pub mod api;
 pub mod assert;
 pub mod db;
 pub mod debug;
+pub mod help;
 pub mod plugin;
 pub mod srp;
 pub mod vars;
