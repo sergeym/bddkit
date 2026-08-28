@@ -60,7 +60,82 @@ struct RunArgs {
 }
 
 #[derive(Args)]
-struct StepsArgs {}
+#[command(after_help = "Examples:
+  bddkit steps list                          every builtin step, grouped by resource
+  bddkit steps list db                       only the database steps
+  bddkit steps list --filter response -v     narrow, and describe what is left
+  bddkit steps list --json                   the same listing, machine-readable
+  bddkit steps list --config suite.yaml      also the steps of that suite's plugins")]
+struct StepsArgs {
+    #[command(subcommand)]
+    command: Option<StepsCommand>,
+}
+
+#[derive(Subcommand)]
+enum StepsCommand {
+    /// List the available steps, grouped by resource
+    List(ListArgs),
+}
+
+#[derive(Args)]
+struct ListArgs {
+    /// Only this resource: api, db, srp, vars, debug, general, or a plugin group
+    resource: Option<String>,
+    /// Case-insensitive substring match on the step template
+    #[arg(long)]
+    filter: Option<String>,
+    /// Add a one-line description under each step
+    #[arg(short, long)]
+    verbose: bool,
+    /// Machine-readable output
+    #[arg(long)]
+    json: bool,
+    /// Also list the steps of the plugins this config loads
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// Description language (default: $BDDKIT_LANG, else en)
+    #[arg(long)]
+    lang: Option<String>,
+}
+
+/// Bare `bddkit steps` is a signpost, not an error: it prints what the family
+/// can do and how, which is the question someone typing it is asking.
+fn steps_command(args: StepsArgs) -> Result<i32> {
+    let Some(StepsCommand::List(args)) = args.command else {
+        use clap::CommandFactory;
+        Cli::command()
+            .find_subcommand_mut("steps")
+            .expect("the steps subcommand is declared")
+            .print_help()?;
+        println!();
+        return Ok(0);
+    };
+    list_steps(args)
+}
+
+fn list_steps(args: ListArgs) -> Result<i32> {
+    let overlay = steps::help::translations(&steps::help::language(args.lang.as_deref()));
+    let mut rows = steps::help::builtin_rows(&overlay);
+
+    if let Some(resource) = &args.resource {
+        // Checked before filtering, so a typo is named rather than silently
+        // producing the same empty output an over-narrow filter does.
+        if !rows.iter().any(|row| &row.group == resource) {
+            anyhow::bail!("no such resource: {resource:?}");
+        }
+        rows.retain(|row| &row.group == resource);
+    }
+    if let Some(filter) = &args.filter {
+        rows.retain(|row| steps::help::matches_filter(row, filter, args.verbose));
+    }
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+    } else {
+        print!("{}", steps::help::render(&rows, args.verbose));
+    }
+    Ok(0)
+}
 
 /// Everything that fails before the first request must exit with code 2 (invariant 6):
 /// config loading, path traversal, building API resources and DB pools, parsing
@@ -73,7 +148,7 @@ async fn main() {
     // the user only asked for a listing.
     let (result, nothing_happened) = match cli.command {
         Command::Run(args) => (run(args).await, "run not started"),
-        Command::Steps(_) => (Ok(0), "nothing listed"),
+        Command::Steps(args) => (steps_command(args), "nothing listed"),
     };
     match result {
         Ok(code) => std::process::exit(code),

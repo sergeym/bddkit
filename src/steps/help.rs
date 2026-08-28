@@ -37,6 +37,75 @@ pub fn language(explicit: Option<&str>) -> String {
         .unwrap_or_else(|| "en".to_string())
 }
 
+/// One listed step. `pattern` is the raw regex, carried in the machine form
+/// only: the text form is read by agents, where every character costs.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct StepRow {
+    pub group: String,
+    pub template: String,
+    pub pattern: String,
+    pub kind: &'static str,
+    pub description: Option<String>,
+}
+
+/// Every builtin. Plugin rows are appended by the caller — they are the only
+/// half that needs a config to exist at all.
+pub fn builtin_rows(overlay: &BTreeMap<String, String>) -> Vec<StepRow> {
+    crate::steps::BUILTIN_STEPS
+        .iter()
+        .map(|def| StepRow {
+            group: def.group.to_string(),
+            template: template(def.pattern),
+            pattern: def.pattern.to_string(),
+            kind: match def.kind {
+                crate::steps::StepKind::Action => "action",
+                crate::steps::StepKind::Assertion(_) => "assertion",
+            },
+            description: Some(
+                describe(&format!("{:?}", def.id), def.description, overlay).to_string(),
+            ),
+        })
+        .collect()
+}
+
+/// Case-insensitive substring over the template, and over the description too
+/// when it is on screen — filtering on text the caller cannot see is worse
+/// than not filtering on it at all.
+pub fn matches_filter(row: &StepRow, filter: &str, verbose: bool) -> bool {
+    let needle = filter.to_lowercase();
+    row.template.to_lowercase().contains(&needle)
+        || (verbose
+            && row
+                .description
+                .as_deref()
+                .is_some_and(|text| text.to_lowercase().contains(&needle)))
+}
+
+/// Grouped, one step per line, the group name printed once instead of a prefix
+/// repeated on every line.
+pub fn render(rows: &[StepRow], verbose: bool) -> String {
+    let mut by_group: BTreeMap<&str, Vec<&StepRow>> = BTreeMap::new();
+    for row in rows {
+        by_group.entry(row.group.as_str()).or_default().push(row);
+    }
+    let mut out = String::new();
+    for (group, rows) in by_group {
+        out.push_str(group);
+        out.push_str(":\n");
+        for row in rows {
+            out.push_str("  ");
+            out.push_str(&row.template);
+            out.push('\n');
+            if verbose && let Some(description) = &row.description {
+                out.push_str("    ");
+                out.push_str(description);
+                out.push('\n');
+            }
+        }
+    }
+    out
+}
+
 /// A regex pattern rendered as a step template: anchors dropped, every capture
 /// group replaced by `<name>`, every other character left exactly as it is.
 ///
