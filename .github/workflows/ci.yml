@@ -76,16 +76,18 @@ jobs:
       # exist yet. MySQL and MariaDB are taken from docker-compose for exactly that
       # reason: the entrypoint applies examples/db/init-mysql.sql, which the
       # example suite needs and which no client on the runner is guaranteed to be
-      # able to apply by hand. The wait is on the database that script creates, not
-      # on the server port, so a container that is up but still initialising cannot
-      # be mistaken for a ready one.
+      # able to apply by hand. The wait is on what those scripts create, not on the
+      # server port, so a container that is up but still initialising cannot be
+      # mistaken for a ready one — and MariaDB waits on `tickets`, which comes from
+      # the second script (init-mariadb.sql), so a half-applied init directory is
+      # not mistaken for a finished one either.
       - name: Start the example containers
         run: |
           docker compose up -d smocker mysql mariadb
           timeout 180 bash -c '
             until curl -sf http://localhost:8081/mocks >/dev/null; do sleep 2; done
             until docker compose exec -T mysql mysql -uroot -proot -e "SELECT 1" apibdd_demo >/dev/null 2>&1; do sleep 2; done
-            until docker compose exec -T mariadb mariadb -uroot -proot -e "SELECT 1" apibdd_demo >/dev/null 2>&1; do sleep 2; done
+            until docker compose exec -T mariadb mariadb -uroot -proot -e "SELECT 1 FROM tickets" apibdd_demo >/dev/null 2>&1; do sleep 2; done
           '
 
       - name: Acceptance tests
@@ -126,6 +128,7 @@ jobs:
           cargo run --locked --quiet -- run --config examples/api.yaml
           cargo run --locked --quiet -- run --config examples/db.yaml
           cargo run --locked --quiet -- run --config examples/db-mysql.yaml
+          cargo run --locked --quiet -- run --config examples/db-mariadb.yaml
 
       - name: Package check
         run: cargo publish --dry-run --locked

@@ -16,7 +16,7 @@ services:
     ports:
       - "3307:3306"
     volumes:
-      - ./examples/db/init-mysql.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - ./examples/db/init-mysql.sql:/docker-entrypoint-initdb.d/10-init.sql:ro
 
   mariadb:
     image: mariadb:11
@@ -26,7 +26,10 @@ services:
     ports:
       - "3308:3306"
     volumes:
-      - ./examples/db/init-mysql.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      # Numbered: the entrypoint applies these in sorted order, and the
+      # MariaDB-only extras need apibdd_demo to exist first.
+      - ./examples/db/init-mysql.sql:/docker-entrypoint-initdb.d/10-init.sql:ro
+      - ./examples/db/init-mariadb.sql:/docker-entrypoint-initdb.d/20-mariadb.sql:ro
 
   smocker:
     image: ghcr.io/smocker-dev/smocker:v1.1.2-preview
