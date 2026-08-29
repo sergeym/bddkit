@@ -36,11 +36,7 @@ pass before the first request. Exit code `2` means "run not started", so CI
 can tell a broken suite from a failing one. Pattern collisions fail loudly
 instead of silently shadowing each other.
 
-**Checking the database shouldn't mean leaving the feature file.** DB steps
-introspect the real schema: primary keys fill themselves the way the column
-declares them, values coerce to real column types, and a missing `NOT NULL`
-column fails by name at the step rather than as a driver error. Hawk signing,
-SRP-6a, and AES are steps too, so a login handshake stays declarative.
+**Checking the database shouldn't mean leaving the feature file.** DB steps introspect the real schema — PostgreSQL, MySQL or MariaDB, the same step text on each: primary keys fill themselves the way the column declares them, values coerce to real column types, and a missing `NOT NULL` column fails by name at the step rather than as a driver error. Hawk signing, SRP-6a, and AES are steps too, so a login handshake stays declarative.
 
 **Async systems shouldn't need sleep loops.** Prefix any assertion with
 `I expect the next assertion to pass within "10" seconds` and it retries —
@@ -152,6 +148,20 @@ what an earlier one produced. Request state and the current connection reset
 per **scenario**. Files run in parallel; `@serial(name)` chains files that
 contend, `@priority(N)` moves one up the queue.
 
+## Databases
+
+PostgreSQL, MySQL 8 and MariaDB, from **MariaDB 10.5** — the release that adds `RETURNING`, which bddkit uses to read a generated key back. Nothing refuses an older MariaDB at startup; it connects, and the first insert into a table with a primary key fails with a syntax error from the server. The engine comes from the DSN scheme (`postgres://`, `mysql://`), and because MySQL and MariaDB share one scheme they are told apart by a single `SELECT VERSION()` when the pool is built. Every DB step is spelled the same on all three — `examples/db-features-mysql/db.feature` is one file that passes unchanged against both MySQL and MariaDB.
+
+What does not carry over:
+
+- **Sequences.** MySQL has none, so `I get next value of sequence` fails naming the engine. Postgres and MariaDB both have them.
+- **`search_path`.** On MySQL and MariaDB a schema *is* a database, so there is no session-level search path. The key is refused at startup rather than quietly ignored: name the database in the DSN, or qualify a table as `database.table` in the step.
+- **`binary` and `varbinary` columns**, `binary(16)` UUIDs included. This layer binds and compares everything as text, and `UUID_TO_BIN`'s `swap_flag` — which decides the byte order — is recorded nowhere in `information_schema`, so bddkit would have to guess and could write bytes the service under test disagrees with. It refuses the column instead. Store the UUID as `char(36)` and bddkit fills it client-side.
+- **A primary key filled by a server-side `DEFAULT` that is not `AUTO_INCREMENT`**, on MySQL. There is no `RETURNING` there to read the value back with, so the step fails naming the column before it inserts anything — give the value explicitly.
+- **The text a value reads back as is the engine's own.** `I extract` is portable as a step and not as a value: `now()` reads back as `2026-08-29 15:11:50.884052+00` on Postgres and `2026-08-29 15:11:50` on MySQL and MariaDB, a boolean as `true` versus `1`, a bare `numeric` as `0` where `decimal(12,2)` is `0.00`. So `I extract` followed by `variable "x" should be equal to "..."` is portable over `varchar`-ish columns and nowhere else. A `where` against those same columns is unaffected — the engine coerces the bind back into its own type; it is only the extracted value that carries the engine's spelling.
+
+`examples/README.md` has the same ground as a per-engine table, with the workaround for each row.
+
 ## Plugins
 
 `api`, `db` and `srp` are the resource kinds built into the binary. Any **other** key under `resources:` is a group served by a plugin — a shared library bddkit loads at startup — so reaching an object store, a queue or a mailbox is the same move as reaching a second database:
@@ -206,6 +216,7 @@ Writing one: [`docs/plugin-authoring.md`](docs/plugin-authoring.md) is the compl
 | Polling an assertion until it passes | `examples/features/eventual.feature` |
 | The mock API behind all of it | `examples/mocks/api-server.yaml` |
 | Every DB step, worked through | `examples/db-features/db.feature` |
+| The same on MySQL and MariaDB | `examples/db-features-mysql/db.feature` |
 | SRP handshake, Hawk signing | `tests/features/` |
 | Config schema | `src/config.rs` |
 | Writing a plugin | `docs/plugin-authoring.md`, `tests/fixtures/echo-plugin/` |
@@ -240,11 +251,7 @@ by hand.
 cargo test
 ```
 
-Some tests need PostgreSQL; `docker-compose.yml` brings one up and
-`examples/db/init.sql` creates the schema. The same file brings up
-[Smocker](https://github.com/smocker-dev/smocker) as the HTTP example's mock
-API — it seeds `examples/mocks/api-server.yaml` at startup and serves it on
-`localhost:8080` (web UI on `localhost:8081`).
+Some tests need a database; `docker-compose.yml` brings up all three — PostgreSQL on `:5433` (schema from `examples/db/init.sql`), MySQL on `:3307` and MariaDB on `:3308` (both from `examples/db/init-mysql.sql`). The DB suite runs against Postgres by default; `BDDKIT_TEST_ENGINE=mysql` or `=mariadb` points it at the other two, and CI runs all three. The same file brings up [Smocker](https://github.com/smocker-dev/smocker) as the HTTP example's mock API — it seeds `examples/mocks/api-server.yaml` at startup and serves it on `localhost:8080` (web UI on `localhost:8081`).
 
 ## License
 

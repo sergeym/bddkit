@@ -1,73 +1,178 @@
 pub mod introspect;
 pub mod ops;
 pub mod plan;
+pub mod platform;
 pub mod reference;
 pub mod value;
 
 use crate::config::Connection;
+use crate::db::platform::{MARIADB, MYSQL, PG, Platform};
+use crate::db::reference::TableRef;
 use crate::options::Options;
 use plan::TableSchema;
-use sqlx::PgPool;
-use sqlx::postgres::PgPoolOptions;
+use sqlx::AnyPool;
+use sqlx::any::{AnyArguments, AnyPoolOptions, AnyRow};
+use sqlx::{Any, ColumnIndex, Row, query::Query};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
-/// Pools for all declared connections + the introspection cache. One per run:
-/// a connection belongs to the system under test, not to a test set.
+/// Binds text parameters (`Option<String>`). Every value crosses the wire as
+/// text; the SQL string itself carries the type, through whatever
+/// `Platform::bind` produced — a `$N::type` cast on Postgres, a bare `?` on
+/// MySQL and MariaDB, which coerce implicitly. Shared by step execution
+/// (`ops`) and introspection (`introspect`).
+pub fn bind_all<'q>(
+    mut q: Query<'q, Any, AnyArguments<'q>>,
+    binds: &'q [Option<String>],
+) -> Query<'q, Any, AnyArguments<'q>> {
+    for b in binds {
+        q = q.bind(b);
+    }
+    q
+}
+
+/// Reads a column as text, tolerating a driver that reports it as a blob
+/// instead of text — proven live: `information_schema.DATA_TYPE` comes back
+/// as a blob on MySQL 8, and `CAST(x AS CHAR)` on a plain `TEXT` column comes
+/// back as a blob on MariaDB. `sqlx::Any`'s `String` decode rejects a blob
+/// outright, so on that failure this falls back to `Vec<u8>` (which `Any`
+/// does decode from a blob, per `sqlx-core`'s `any/types/blob.rs`) and
+/// converts with `String::from_utf8`. Shared by introspection and `ops`.
+pub fn text_col<I>(row: &AnyRow, index: I) -> Result<Option<String>, String>
+where
+    I: ColumnIndex<AnyRow> + Copy,
+{
+    if let Ok(v) = row.try_get::<Option<String>, I>(index) {
+        return Ok(v);
+    }
+    let bytes: Option<Vec<u8>> = row
+        .try_get(index)
+        .map_err(|e| format!("reading {index:?}: {e}"))?;
+    match bytes {
+        None => Ok(None),
+        Some(b) => String::from_utf8(b)
+            .map(Some)
+            .map_err(|e| format!("reading {index:?}: not valid UTF-8: {e}")),
+    }
+}
+
+/// Picks the platform family from the DSN scheme alone. That is enough to
+/// configure `after_connect` and to validate `search_path` before any network
+/// round trip: MySQL and MariaDB share the `mysql://` scheme and have
+/// identical `session_setup` behavior (a schema is a database in both), so
+/// telling them apart needs a live connection — done later, in `Db::connect`,
+/// by probing `SELECT VERSION()`.
+fn family_for_scheme(dsn: &str) -> Result<&'static dyn Platform, String> {
+    match dsn.split("://").next().unwrap_or("") {
+        "postgres" | "postgresql" => Ok(&PG),
+        // sqlx's MySQL driver answers to both schemes, so refusing "mariadb"
+        // here would reject a DSN the driver itself would have connected.
+        "mysql" | "mariadb" => Ok(&MYSQL),
+        other => Err(format!(
+            "unknown database scheme {other:?} (expected postgres, postgresql, mysql or mariadb)"
+        )),
+    }
+}
+
+/// Everything one connection needs to run and plan a query.
+pub(crate) struct ConnectionState {
+    pool: AnyPool,
+    platform: &'static dyn Platform,
+    options: Options,
+}
+
+/// Connections + the introspection cache. One per run: a connection belongs
+/// to the system under test, not to a test set.
 pub struct Db {
-    pools: HashMap<String, PgPool>,
-    options: HashMap<String, Options>,
+    connections: HashMap<String, ConnectionState>,
     cache: Mutex<HashMap<(String, String), Arc<TableSchema>>>,
 }
 
 impl Db {
     pub async fn connect(conns: &BTreeMap<String, Connection>, max: u32) -> Result<Db, String> {
-        let mut pools = HashMap::new();
-        let mut options = HashMap::new();
+        let mut connections = HashMap::new();
         for (name, c) in conns {
-            let opts = PgPoolOptions::new().max_connections(max.max(1));
-            let pool = if c.search_path.is_empty() {
+            let opts = AnyPoolOptions::new().max_connections(max.max(1));
+            let family = family_for_scheme(&c.dsn).map_err(|e| format!("connection {name}: {e}"))?;
+            let stmts = family
+                .session_setup(&c.search_path)
+                .map_err(|e| format!("connection {name}: {e}"))?;
+            let pool = if stmts.is_empty() {
                 opts.connect(&c.dsn).await
             } else {
-                let stmt = format!("SET search_path TO {}", c.search_path.join(", "));
                 opts.after_connect(move |conn, _meta| {
-                    let stmt = stmt.clone();
-                    Box::pin(async move { sqlx::query(&stmt).execute(conn).await.map(|_| ()) })
+                    let stmts = stmts.clone();
+                    Box::pin(async move {
+                        for stmt in &stmts {
+                            sqlx::query(stmt).execute(&mut *conn).await?;
+                        }
+                        Ok(())
+                    })
                 })
                 .connect(&c.dsn)
                 .await
             };
             let pool = pool.map_err(|e| format!("connection {name}: {e}"))?;
-            pools.insert(name.clone(), pool);
-            options.insert(name.clone(), c.effective_options.clone());
+
+            // Postgres's scheme already fully determines it; MySQL and
+            // MariaDB share one scheme, so only there is a probe needed.
+            let platform: &'static dyn Platform = if family.name() == "postgres" {
+                family
+            } else {
+                let row = sqlx::query("SELECT VERSION()")
+                    .fetch_one(&pool)
+                    .await
+                    .map_err(|e| format!("connection {name}: detecting the vendor: {e}"))?;
+                let version = text_col(&row, 0)
+                    .map_err(|e| format!("connection {name}: detecting the vendor: {e}"))?
+                    .unwrap_or_default();
+                if version.contains("MariaDB") {
+                    &MARIADB
+                } else {
+                    &MYSQL
+                }
+            };
+            connections.insert(
+                name.clone(),
+                ConnectionState {
+                    pool,
+                    platform,
+                    options: c.effective_options.clone(),
+                },
+            );
         }
         Ok(Db {
-            pools,
-            options,
+            connections,
             cache: Mutex::new(HashMap::new()),
         })
     }
 
-    pub fn pool(&self, name: &str) -> Result<&PgPool, String> {
-        self.pools
+    /// The single place that knows "not declared" for a connection name.
+    pub(crate) fn connection(&self, name: &str) -> Result<&ConnectionState, String> {
+        self.connections
             .get(name)
             .ok_or_else(|| format!("connection {name:?} is not declared in resources.db"))
     }
 
     pub fn options(&self, name: &str) -> Result<&Options, String> {
-        self.options
-            .get(name)
-            .ok_or_else(|| format!("connection {name:?} is not declared in resources.db"))
+        Ok(&self.connection(name)?.options)
+    }
+
+    /// The resolved platform for one connection: the vendor `Db::connect`
+    /// settled on, not just the scheme family it started from.
+    #[allow(dead_code)] // only tests read it, same as HttpState::current
+    pub(crate) fn platform(&self, name: &str) -> Result<&'static dyn Platform, String> {
+        Ok(self.connection(name)?.platform)
     }
 
     /// Introspection with caching. std::Mutex is NOT held across an await.
-    pub async fn schema(&self, conn: &str, sql_name: &str) -> Result<Arc<TableSchema>, String> {
-        let key = (conn.to_string(), sql_name.to_string());
+    pub async fn schema(&self, conn: &str, tref: &TableRef) -> Result<Arc<TableSchema>, String> {
+        let key = (conn.to_string(), tref.sql_name());
         if let Some(s) = self.cache.lock().expect("cache mutex").get(&key) {
             return Ok(s.clone());
         }
-        let pool = self.pool(conn)?;
-        let schema = Arc::new(introspect::introspect(pool, sql_name).await?);
+        let state = self.connection(conn)?;
+        let schema = Arc::new(introspect::introspect(&state.pool, state.platform, tref).await?);
         self.cache
             .lock()
             .expect("cache mutex")
@@ -108,7 +213,7 @@ impl DbHandle {
     }
 
     pub fn set_current(&mut self, name: &str) -> Result<(), String> {
-        self.resources()?.pool(name)?; // check that the connection exists
+        self.resources()?.connection(name)?; // check that the connection exists
         self.current = name.to_string();
         Ok(())
     }
@@ -146,5 +251,65 @@ mod tests {
         h.current = "audit".to_string();
         h.reset();
         assert_eq!(h.current(), "main");
+    }
+
+    #[test]
+    fn family_for_scheme_picks_by_dsn_prefix() {
+        assert_eq!(
+            family_for_scheme("postgres://x/y").unwrap().name(),
+            "postgres"
+        );
+        assert_eq!(
+            family_for_scheme("postgresql://x/y").unwrap().name(),
+            "postgres"
+        );
+        // MariaDB shares the mysql:// scheme; the exact vendor is only
+        // settled after connecting (see Db::connect), so this is the family.
+        assert_eq!(family_for_scheme("mysql://x/y").unwrap().name(), "mysql");
+        // sqlx-mysql declares URL_SCHEMES = ["mysql", "mariadb"], so a DSN the
+        // driver accepts must not be refused a layer above it.
+        assert_eq!(family_for_scheme("mariadb://x/y").unwrap().name(), "mysql");
+        let err = match family_for_scheme("mssql://x/y") {
+            Ok(_) => panic!("an unknown scheme must be refused"),
+            Err(e) => e,
+        };
+        assert!(err.contains("mssql"), "{err}");
+    }
+
+    #[test]
+    fn platform_reports_the_same_not_declared_error_as_connection() {
+        let db = Db {
+            connections: HashMap::new(),
+            cache: Mutex::new(HashMap::new()),
+        };
+        let err = match db.platform("x") {
+            Ok(_) => panic!("an undeclared connection must be refused"),
+            Err(e) => e,
+        };
+        assert!(err.contains("x"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_scheme_is_refused_by_name() {
+        sqlx::any::install_default_drivers();
+        let mut conns = BTreeMap::new();
+        conns.insert(
+            "primary".to_string(),
+            Connection {
+                dsn: "mssql://x/y".to_string(),
+                ..Default::default()
+            },
+        );
+        let err = match Db::connect(&conns, 1).await {
+            Ok(_) => panic!("connecting to an unknown scheme should fail"),
+            Err(e) => e,
+        };
+        // A bare substring of "connection" (e.g. "c") would pass on any error
+        // at all, since Db::connect wraps every failure with
+        // "connection {name}: ...". "primary" pins that the name survives,
+        // and "mssql" pins the actual behavior under Any: the scheme is
+        // rejected at parse time, not dialed as a hostname and failed on DNS.
+        assert!(err.contains("primary"), "{err}");
+        assert!(err.contains("mssql"), "{err}");
     }
 }

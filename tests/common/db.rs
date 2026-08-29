@@ -1,14 +1,14 @@
 //! Helpers for DB integration tests: recreating the fixture schema and running
 //! the compiled binary against a temporary config (like the M1 acceptance tests).
 
-use sqlx::PgPool;
+use sqlx::AnyPool;
 use std::process::{Command, Output};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, MutexGuard};
 
 /// The `apibdd_it` schema is shared across all tests; serialize them so that
 /// one test recreating the fixture does not collide with another.
-static DB_LOCK: Mutex<()> = Mutex::const_new(());
+pub(crate) static DB_LOCK: Mutex<()> = Mutex::const_new(());
 
 #[derive(Clone, Copy, Default)]
 struct TimingRow {
@@ -47,12 +47,95 @@ pub struct Setup {
     timings: TimingRow,
 }
 
-pub fn test_dsn() -> String {
-    std::env::var("BDDKIT_TEST_DSN")
-        .unwrap_or_else(|_| "postgres://postgres:postgres@127.0.0.1:5433/postgres".to_string())
+/// The engine the DB suite runs against, chosen by `BDDKIT_TEST_ENGINE`.
+/// Postgres by default, so a plain `cargo test` keeps the behavior — and the
+/// DSN — it had before the suite became engine-aware. CI runs the job once
+/// per value.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Engine {
+    Postgres,
+    MySql,
+    MariaDb,
 }
 
-/// Recreates the `apibdd_it` schema with tables for every PK case.
+pub fn engine() -> Engine {
+    match std::env::var("BDDKIT_TEST_ENGINE").unwrap_or_default().as_str() {
+        "" | "postgres" => Engine::Postgres,
+        "mysql" => Engine::MySql,
+        "mariadb" => Engine::MariaDb,
+        other => panic!("unknown BDDKIT_TEST_ENGINE {other:?} (expected postgres, mysql or mariadb)"),
+    }
+}
+
+/// Each engine keeps the DSN variable it already had elsewhere in the suite
+/// (`tests/db_engines.rs`, `tests/db_mysql_insert.rs`), so one exported DSN
+/// serves every test binary.
+pub fn test_dsn() -> String {
+    let (var, default) = match engine() {
+        Engine::Postgres => (
+            "BDDKIT_TEST_DSN",
+            "postgres://postgres:postgres@127.0.0.1:5433/postgres",
+        ),
+        Engine::MySql => (
+            "BDDKIT_TEST_MYSQL_DSN",
+            "mysql://root:root@127.0.0.1:3307/apibdd_it",
+        ),
+        Engine::MariaDb => (
+            "BDDKIT_TEST_MARIADB_DSN",
+            "mysql://root:root@127.0.0.1:3308/apibdd_it",
+        ),
+    };
+    std::env::var(var).unwrap_or_else(|_| default.to_string())
+}
+
+/// The fixture DDL: the same three tables and one sequence everywhere, each
+/// spelled the way its engine spells it. `users.id` is the point of the set —
+/// `uuid`, `char(36)` and MariaDB's native `UUID` are the three branches of
+/// `Platform::wants_client_uuid`, reached from one unchanged feature source.
+fn fixture_ddl() -> Vec<&'static str> {
+    match engine() {
+        Engine::Postgres => vec![
+            "DROP SCHEMA IF EXISTS apibdd_it CASCADE",
+            "CREATE SCHEMA apibdd_it",
+            "CREATE TABLE apibdd_it.companies (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, \
+             slug text NOT NULL, name text, created_at timestamptz NOT NULL DEFAULT now())",
+            "CREATE TABLE apibdd_it.users (id uuid PRIMARY KEY, email text NOT NULL, \
+             name text, created_at timestamptz NOT NULL, deleted_at timestamptz)",
+            "CREATE TABLE apibdd_it.pair (a int NOT NULL, b int NOT NULL, note text, PRIMARY KEY (a, b))",
+            "CREATE SEQUENCE apibdd_it.thing_seq",
+        ],
+        // On MySQL/MariaDB a schema IS the connection's own database, already
+        // created by docker-compose, so the tables are dropped one by one
+        // instead of the whole schema. MySQL has no sequences at all — the
+        // step is expected to fail there, and that is what the suite asserts.
+        Engine::MySql => vec![
+            "DROP TABLE IF EXISTS companies",
+            "DROP TABLE IF EXISTS users",
+            "DROP TABLE IF EXISTS pair",
+            "CREATE TABLE companies (id int AUTO_INCREMENT PRIMARY KEY, \
+             slug varchar(255) NOT NULL, name varchar(255), \
+             created_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP)",
+            "CREATE TABLE users (id char(36) PRIMARY KEY, email varchar(255) NOT NULL, \
+             name varchar(255), created_at datetime NOT NULL, deleted_at datetime)",
+            "CREATE TABLE pair (a int NOT NULL, b int NOT NULL, note varchar(255), PRIMARY KEY (a, b))",
+        ],
+        Engine::MariaDb => vec![
+            "DROP TABLE IF EXISTS companies",
+            "DROP TABLE IF EXISTS users",
+            "DROP TABLE IF EXISTS pair",
+            "DROP SEQUENCE IF EXISTS thing_seq",
+            "CREATE TABLE companies (id int AUTO_INCREMENT PRIMARY KEY, \
+             slug varchar(255) NOT NULL, name varchar(255), \
+             created_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP)",
+            "CREATE TABLE users (id UUID PRIMARY KEY, email varchar(255) NOT NULL, \
+             name varchar(255), created_at datetime NOT NULL, deleted_at datetime)",
+            "CREATE TABLE pair (a int NOT NULL, b int NOT NULL, note varchar(255), PRIMARY KEY (a, b))",
+            "CREATE SEQUENCE thing_seq",
+        ],
+    }
+}
+
+/// Recreates the fixture (tables for every PK case) on the engine under test.
 /// Returns a guard: hold it until the end of the test for isolation.
 pub async fn setup() -> Setup {
     let started = Instant::now();
@@ -60,28 +143,19 @@ pub async fn setup() -> Setup {
     let guard = DB_LOCK.lock().await;
     let lock = phase.elapsed();
     let phase = Instant::now();
-    let pool = PgPool::connect(&test_dsn())
+    // This test binary is a separate process from `bddkit` and builds its own
+    // pool, so it needs its own driver installation (AnyPool panics without it).
+    sqlx::any::install_default_drivers();
+    let pool = AnyPool::connect(&test_dsn())
         .await
         .expect("no connection to the test DB; run `docker compose up -d`");
     let connect = phase.elapsed();
     let phase = Instant::now();
-    sqlx::query("DROP SCHEMA IF EXISTS apibdd_it CASCADE")
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query("CREATE SCHEMA apibdd_it")
-        .execute(&pool)
-        .await
-        .unwrap();
-    for stmt in [
-        "CREATE TABLE apibdd_it.companies (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, \
-         slug text NOT NULL, name text, created_at timestamptz NOT NULL DEFAULT now())",
-        "CREATE TABLE apibdd_it.users (id uuid PRIMARY KEY, email text NOT NULL, \
-         name text, created_at timestamptz NOT NULL, deleted_at timestamptz)",
-        "CREATE TABLE apibdd_it.pair (a int NOT NULL, b int NOT NULL, note text, PRIMARY KEY (a, b))",
-        "CREATE SEQUENCE apibdd_it.thing_seq",
-    ] {
-        sqlx::query(stmt).execute(&pool).await.unwrap();
+    for stmt in fixture_ddl() {
+        sqlx::query(stmt)
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("{stmt}: {e}"));
     }
     let schema = phase.elapsed();
     let phase = Instant::now();
@@ -99,8 +173,8 @@ pub async fn setup() -> Setup {
     }
 }
 
-/// Writes a temporary config (connection `default` → test DB, search_path
-/// `apibdd_it`) and returns a configured binary command.
+/// Writes a temporary config (connection `default` → the test DB of the
+/// engine under test) and returns a configured binary command.
 pub fn feature_command(feature_src: &str) -> Command {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -115,9 +189,15 @@ pub fn feature_command(feature_src: &str) -> Command {
         .display()
         .to_string()
         .replace('\\', "/");
+    // On MySQL/MariaDB a schema is a database — the DSN already names
+    // `apibdd_it`, and a search_path there is refused at startup by design.
+    let search_path = match engine() {
+        Engine::Postgres => "      search_path: [apibdd_it]\n",
+        Engine::MySql | Engine::MariaDb => "",
+    };
     let cfg = format!(
         "paths: [{features_path}]\nresources:\n  api:\n    stub:\n      base_url: http://127.0.0.1:1\n  \
-         db:\n    default:\n      dsn: {}\n      search_path: [apibdd_it]\n",
+         db:\n    default:\n      dsn: {}\n{search_path}",
         test_dsn()
     );
     let cfg_path = dir.join("cfg.yaml");

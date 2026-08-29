@@ -1,8 +1,19 @@
-/// A table column from introspection data. `type_name` is `typname` (for `::type`).
+use super::platform::Platform;
+
+/// A table column from introspection data, as reported by the current
+/// platform's `Platform::introspect` query. `type_name` is the platform's
+/// native type name, as consumed by `Platform::bind`/`returning`.
 #[derive(Debug, Clone)]
 pub struct Column {
     pub name: String,
     pub type_name: String,
+    /// Declared length/precision (e.g. `char(36)`), where the platform needs
+    /// it to tell columns of the same `type_name` apart. NULL where it never
+    /// matters — Postgres always returns NULL here.
+    // Read by the MySQL dialect only; still unread from live code until
+    // Db::connect selects a platform by vendor (next task).
+    #[allow(dead_code)]
+    pub length: Option<i64>,
     pub not_null: bool,
     pub has_default: bool,
     pub is_identity: bool,
@@ -23,33 +34,55 @@ impl TableSchema {
     }
 }
 
-/// Types that get filled with `now()` for NOT NULL columns with no value.
-pub fn is_timestamplike(type_name: &str) -> bool {
-    matches!(type_name, "timestamp" | "timestamptz" | "date")
+/// Where the text value of one PK column's `last_insert_*` variable comes
+/// from. Only consulted when the platform produced no `RETURNING` clause —
+/// `ops::insert` reads the row back for that instead. See `Platform::returning`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PkSource {
+    /// The text value is already known before the INSERT runs: given in the
+    /// step, or a client-generated UUIDv7 (`build_insert` step 2).
+    Known(String),
+    /// Not known yet — read it off the INSERT's own result
+    /// (`AnyQueryResult::last_insert_id`), never a second query.
+    AutoIncrement,
+    /// No source exists: a server-side default that is not auto-increment,
+    /// or (composite PK) one part filled that way. Carries the column name
+    /// so the caller can fail naming it. `build_insert` already refuses this
+    /// case itself when there is no RETURNING (see below) — a variant this
+    /// well-typed still beats an early bailout with no trace of why.
+    Unknown(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct InsertPlan {
     pub sql: String,
     pub binds: Vec<Option<String>>,
-    pub var_names: Vec<String>,
     pub logs: Vec<String>,
+    /// Whether `sql` ends in a `RETURNING`-equivalent clause.
+    pub has_returning: bool,
+    /// One entry per PK column, `(last_insert_* variable name, where its
+    /// value comes from)` — one `Vec`, not two zipped by position, so
+    /// misalignment between a name and its source cannot compile in one
+    /// column being renamed and not the other.
+    pub pk_vars: Vec<(String, PkSource)>,
 }
 
 /// Builds an INSERT: applies the PK and NOT NULL fill rules from spec §8.
 /// `values` are the pairs given in the step (`None` = SQL NULL). `index` is the
 /// variable-name suffix for the table form (`Some(0)` → `_0`).
 pub fn build_insert(
+    platform: &dyn Platform,
     schema: &TableSchema,
     sql_name: &str,
     bare: &str,
     values: &[(String, Option<String>)],
     index: Option<usize>,
 ) -> Result<InsertPlan, String> {
-    // Given columns must exist.
+    // Given columns must exist and be bindable.
     for (col, _) in values {
-        if schema.col(col).is_none() {
-            return Err(format!("column {col:?} is missing from table {sql_name}"));
+        match schema.col(col) {
+            None => return Err(format!("column {col:?} is missing from table {sql_name}")),
+            Some(c) => platform.check_bindable(c)?,
         }
     }
     let given: std::collections::HashSet<&str> = values.iter().map(|(c, _)| c.as_str()).collect();
@@ -59,12 +92,15 @@ pub fn build_insert(
     let mut binds: Vec<Option<String>> = Vec::new();
     let mut logs: Vec<String> = Vec::new();
     let mut param = 1usize;
+    // PK column name -> its client-generated UUIDv7, for pk_vars below.
+    let mut generated_uuids: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
 
     // 1. Given values — as-is, cast to the column's type.
     for (col, val) in values {
         let ty = &schema.col(col).expect("checked above").type_name;
         cols.push(col.clone());
-        exprs.push(format!("${param}::{ty}"));
+        exprs.push(platform.bind(param, ty));
         binds.push(val.clone());
         param += 1;
     }
@@ -75,14 +111,15 @@ pub fn build_insert(
             continue;
         }
         if pk.has_default || pk.is_identity {
-            continue; // Postgres will generate it itself.
+            continue; // the platform will generate it itself (default or identity/auto-increment).
         }
-        if pk.type_name == "uuid" {
+        if platform.wants_client_uuid(pk) {
             let id = uuid::Uuid::now_v7().to_string();
             logs.push(format!("PK {} := {id} (UUIDv7)", pk.name));
             cols.push(pk.name.clone());
-            exprs.push(format!("${param}::uuid"));
-            binds.push(Some(id));
+            exprs.push(platform.bind(param, &pk.type_name));
+            binds.push(Some(id.clone()));
+            generated_uuids.insert(pk.name.clone(), id);
             param += 1;
         } else {
             return Err(format!(
@@ -97,9 +134,11 @@ pub fn build_insert(
         if given.contains(c.name.as_str()) || c.is_pk || c.has_default || !c.not_null {
             continue;
         }
-        if is_timestamplike(&c.type_name) {
+        if platform.is_timestamplike(&c.type_name) {
             logs.push(format!("{} := now()", c.name));
             cols.push(c.name.clone());
+            // "now()" is portable across Postgres, MySQL and MariaDB — no need
+            // to route it through Platform.
             exprs.push("now()".to_string());
         } else {
             return Err(format!(
@@ -111,12 +150,8 @@ pub fn build_insert(
 
     // 4. Assemble the SQL.
     let pk_cols = schema.pk_columns();
-    let returning: Vec<String> = pk_cols
-        .iter()
-        .map(|c| format!("({})::text", c.name))
-        .collect();
     let body = if cols.is_empty() {
-        format!("INSERT INTO {sql_name} DEFAULT VALUES")
+        platform.insert_no_columns(sql_name)
     } else {
         format!(
             "INSERT INTO {sql_name} ({}) VALUES ({})",
@@ -124,34 +159,78 @@ pub fn build_insert(
             exprs.join(", ")
         )
     };
-    let sql = if returning.is_empty() {
-        body
-    } else {
-        format!("{body} RETURNING {}", returning.join(", "))
+    let returning_clause = platform.returning(&pk_cols);
+    let has_returning = returning_clause.is_some();
+    let sql = match returning_clause {
+        Some(clause) => format!("{body} {clause}"),
+        None => body,
     };
 
-    // 5. Variable names for RETURNING.
+    // 5. One (variable name, source) pair per PK column, in `pk_cols` order —
+    // built in a single pass so the name and its source can never drift apart.
     let suffix = index.map(|i| format!("_{i}")).unwrap_or_default();
-    let var_names: Vec<String> = if pk_cols.len() == 1 {
-        vec![format!("last_insert_id_{bare}{suffix}")]
-    } else {
-        pk_cols
-            .iter()
-            .map(|c| format!("last_insert_{bare}_{}{suffix}", c.name))
-            .collect()
-    };
+    let single = pk_cols.len() == 1;
+    let pk_vars: Vec<(String, PkSource)> = pk_cols
+        .iter()
+        .map(|pk| {
+            let name = if single {
+                format!("last_insert_id_{bare}{suffix}")
+            } else {
+                format!("last_insert_{bare}_{}{suffix}", pk.name)
+            };
+            // A value already given (Some or explicit NULL) always wins over
+            // how the column would otherwise have been filled — matching
+            // step 2 above, which also skips a given column outright.
+            let source = if let Some((_, v)) = values.iter().find(|(c, _)| c == &pk.name) {
+                match v {
+                    Some(s) => PkSource::Known(s.clone()),
+                    // Given <<null>>: MySQL/MariaDB treat NULL into an
+                    // AUTO_INCREMENT column the same as omitting it, so it
+                    // still generates — anything else given as NULL has
+                    // nothing to report.
+                    None if pk.is_identity => PkSource::AutoIncrement,
+                    None => PkSource::Unknown(pk.name.clone()),
+                }
+            } else if pk.is_identity {
+                PkSource::AutoIncrement
+            } else if let Some(id) = generated_uuids.get(&pk.name) {
+                PkSource::Known(id.clone())
+            } else {
+                // has_default but not identity: a server-side DEFAULT we
+                // cannot read back without RETURNING.
+                PkSource::Unknown(pk.name.clone())
+            };
+            (name, source)
+        })
+        .collect();
+
+    // Refuse before the INSERT runs, not after: a platform with no RETURNING
+    // and a PK column with no source would otherwise commit the row and only
+    // then report failure (invariant 1 — check everything checkable first).
+    if !has_returning
+        && let Some((_, PkSource::Unknown(col))) =
+            pk_vars.iter().find(|(_, s)| matches!(s, PkSource::Unknown(_)))
+    {
+        return Err(format!(
+            "primary key {col} is server-generated (a DEFAULT that is not auto-increment) \
+             and this platform has no RETURNING to read it back with — give the value explicitly"
+        ));
+    }
 
     Ok(InsertPlan {
         sql,
         binds,
-        var_names,
         logs,
+        has_returning,
+        pk_vars,
     })
 }
 
-/// Builds `col = $N::type AND …`. NULL → `col IS NULL` with no bind. Parameter
-/// numbering starts at `start` (for UPDATE, where SET takes the first $N).
+/// Builds `col = <bind> AND …`, in the platform's own bind syntax. NULL →
+/// `col IS NULL` with no bind. Parameter numbering starts at `start` (for
+/// UPDATE, where SET takes the first parameter).
 pub fn build_where(
+    platform: &dyn Platform,
     schema: &TableSchema,
     pairs: &[(String, Option<String>)],
     start: usize,
@@ -163,10 +242,11 @@ pub fn build_where(
         let c = schema
             .col(col)
             .ok_or_else(|| format!("column {col:?} is missing from the table"))?;
+        platform.check_bindable(c)?;
         match val {
             None => parts.push(format!("{col} IS NULL")),
             Some(_) => {
-                parts.push(format!("{col} = ${param}::{}", c.type_name));
+                parts.push(format!("{col} = {}", platform.bind(param, &c.type_name)));
                 binds.push(val.clone());
                 param += 1;
             }
@@ -176,6 +256,7 @@ pub fn build_where(
 }
 
 pub fn build_update(
+    platform: &dyn Platform,
     schema: &TableSchema,
     sql_name: &str,
     set: &[(String, Option<String>)],
@@ -191,11 +272,12 @@ pub fn build_update(
         let c = schema
             .col(col)
             .ok_or_else(|| format!("column {col:?} is missing from the table"))?;
-        sets.push(format!("{col} = ${param}::{}", c.type_name));
+        platform.check_bindable(c)?;
+        sets.push(format!("{col} = {}", platform.bind(param, &c.type_name)));
         binds.push(val.clone());
         param += 1;
     }
-    let (where_sql, where_binds) = build_where(schema, where_, param)?;
+    let (where_sql, where_binds) = build_where(platform, schema, where_, param)?;
     binds.extend(where_binds);
     Ok((
         format!(
@@ -207,6 +289,7 @@ pub fn build_update(
 }
 
 pub fn build_delete(
+    platform: &dyn Platform,
     schema: &TableSchema,
     sql_name: &str,
     where_: &[(String, Option<String>)],
@@ -214,7 +297,7 @@ pub fn build_delete(
     if where_.is_empty() {
         return Err("DELETE without WHERE is forbidden; use the \"I delete all\" step for a full wipe".into());
     }
-    let (where_sql, binds) = build_where(schema, where_, 1)?;
+    let (where_sql, binds) = build_where(platform, schema, where_, 1)?;
     Ok((format!("DELETE FROM {sql_name} WHERE {where_sql}"), binds))
 }
 
@@ -223,6 +306,7 @@ pub fn build_delete_all(sql_name: &str) -> String {
 }
 
 pub fn build_exists(
+    platform: &dyn Platform,
     schema: &TableSchema,
     sql_name: &str,
     where_: &[(String, Option<String>)],
@@ -230,7 +314,7 @@ pub fn build_exists(
     if where_.is_empty() {
         return Err("an existence check requires a condition".into());
     }
-    let (where_sql, binds) = build_where(schema, where_, 1)?;
+    let (where_sql, binds) = build_where(platform, schema, where_, 1)?;
     Ok((
         format!("SELECT 1 FROM {sql_name} WHERE {where_sql} LIMIT 1"),
         binds,
@@ -239,7 +323,12 @@ pub fn build_exists(
 
 #[cfg(test)]
 mod tests {
+    use super::super::platform::{MARIADB, MYSQL, PG};
     use super::*;
+
+    fn names(p: &InsertPlan) -> Vec<&str> {
+        p.pk_vars.iter().map(|(n, _)| n.as_str()).collect()
+    }
 
     fn col(
         name: &str,
@@ -252,6 +341,7 @@ mod tests {
         Column {
             name: name.into(),
             type_name: ty.into(),
+            length: None,
             not_null,
             has_default,
             is_identity,
@@ -273,6 +363,7 @@ mod tests {
     #[test]
     fn generates_uuid_pk_and_fills_timestamp() {
         let p = build_insert(
+            &PG,
             &users_uuid(),
             "users",
             "users",
@@ -292,7 +383,7 @@ mod tests {
         assert_eq!(p.binds.len(), 2);
         assert_eq!(p.binds[0], Some("a@b.net".to_string()));
         assert!(uuid::Uuid::parse_str(p.binds[1].as_ref().unwrap()).is_ok());
-        assert_eq!(p.var_names, vec!["last_insert_id_users"]);
+        assert_eq!(names(&p), vec!["last_insert_id_users"]);
     }
 
     #[test]
@@ -305,6 +396,7 @@ mod tests {
             ],
         };
         let p = build_insert(
+            &PG,
             &s,
             "companies",
             "companies",
@@ -316,7 +408,7 @@ mod tests {
             p.sql,
             "INSERT INTO companies (slug) VALUES ($1::text) RETURNING (id)::text"
         );
-        assert_eq!(p.var_names, vec!["last_insert_id_companies"]);
+        assert_eq!(names(&p), vec!["last_insert_id_companies"]);
     }
 
     #[test]
@@ -327,13 +419,14 @@ mod tests {
                 col("qty", "int4", true, false, false, false),
             ],
         };
-        let err = build_insert(&s, "t", "t", &[], None).unwrap_err();
+        let err = build_insert(&PG, &s, "t", "t", &[], None).unwrap_err();
         assert!(err.contains("qty"), "{err}");
     }
 
     #[test]
     fn unknown_column_is_error() {
         let err = build_insert(
+            &PG,
             &users_uuid(),
             "users",
             "users",
@@ -352,7 +445,7 @@ mod tests {
                 col("deleted_at", "timestamptz", false, false, false, false),
             ],
         };
-        let p = build_insert(&s, "t", "t", &[("deleted_at".into(), None)], None).unwrap();
+        let p = build_insert(&PG, &s, "t", "t", &[("deleted_at".into(), None)], None).unwrap();
         assert_eq!(p.binds, vec![None]);
         assert!(p.sql.contains("$1::timestamptz"), "{}", p.sql);
     }
@@ -366,6 +459,7 @@ mod tests {
             ],
         };
         let p = build_insert(
+            &PG,
             &s,
             "pair",
             "pair",
@@ -376,10 +470,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(
-            p.var_names,
-            vec!["last_insert_pair_a", "last_insert_pair_b"]
-        );
+        assert_eq!(names(&p), vec!["last_insert_pair_a", "last_insert_pair_b"]);
         assert!(
             p.sql.ends_with("RETURNING (a)::text, (b)::text"),
             "{}",
@@ -390,6 +481,7 @@ mod tests {
     #[test]
     fn table_index_suffixes_var_name() {
         let p = build_insert(
+            &PG,
             &users_uuid(),
             "users",
             "users",
@@ -397,7 +489,7 @@ mod tests {
             Some(3),
         )
         .unwrap();
-        assert_eq!(p.var_names, vec!["last_insert_id_users_3"]);
+        assert_eq!(names(&p), vec!["last_insert_id_users_3"]);
     }
 
     fn companies() -> TableSchema {
@@ -413,6 +505,7 @@ mod tests {
     #[test]
     fn where_uses_typed_casts_and_is_null() {
         let (sql, binds) = build_where(
+            &PG,
             &companies(),
             &[
                 ("slug".into(), Some("x".into())),
@@ -427,18 +520,19 @@ mod tests {
 
     #[test]
     fn where_param_numbering_respects_start() {
-        let (sql, _) = build_where(&companies(), &[("slug".into(), Some("x".into()))], 4).unwrap();
+        let (sql, _) = build_where(&PG, &companies(), &[("slug".into(), Some("x".into()))], 4).unwrap();
         assert_eq!(sql, "slug = $4::text");
     }
 
     #[test]
     fn where_unknown_column_is_error() {
-        assert!(build_where(&companies(), &[("nope".into(), Some("1".into()))], 1).is_err());
+        assert!(build_where(&PG, &companies(), &[("nope".into(), Some("1".into()))], 1).is_err());
     }
 
     #[test]
     fn update_sets_then_where_numbering() {
         let (sql, binds) = build_update(
+            &PG,
             &companies(),
             "companies",
             &[("slug".into(), Some("new".into()))],
@@ -456,6 +550,7 @@ mod tests {
     fn update_requires_where() {
         assert!(
             build_update(
+                &PG,
                 &companies(),
                 "companies",
                 &[("slug".into(), Some("x".into()))],
@@ -467,7 +562,7 @@ mod tests {
 
     #[test]
     fn delete_requires_where() {
-        assert!(build_delete(&companies(), "companies", &[]).is_err());
+        assert!(build_delete(&PG, &companies(), "companies", &[]).is_err());
     }
 
     #[test]
@@ -478,11 +573,148 @@ mod tests {
     #[test]
     fn exists_selects_one() {
         let (sql, _) = build_exists(
+            &PG,
             &companies(),
             "companies",
             &[("slug".into(), Some("x".into()))],
         )
         .unwrap();
         assert_eq!(sql, "SELECT 1 FROM companies WHERE slug = $1::text LIMIT 1");
+    }
+
+    // companies(id int auto_increment pk, slug text not null) — MySQL/MariaDB shape:
+    // is_identity true, has_default false (auto_increment is its own thing, not a
+    // DEFAULT in information_schema's sense).
+    fn mysql_companies() -> TableSchema {
+        TableSchema {
+            columns: vec![
+                col("id", "int", true, false, true, true),
+                col("slug", "text", true, false, false, false),
+            ],
+        }
+    }
+
+    #[test]
+    fn no_returning_and_no_value_reads_the_pk_off_auto_increment() {
+        let p = build_insert(
+            &MYSQL,
+            &mysql_companies(),
+            "companies",
+            "companies",
+            &[("slug".into(), Some("x".into()))],
+            None,
+        )
+        .unwrap();
+        assert!(!p.has_returning);
+        assert_eq!(
+            p.pk_vars,
+            vec![("last_insert_id_companies".into(), PkSource::AutoIncrement)]
+        );
+    }
+
+    #[test]
+    fn no_returning_and_a_given_value_is_known_even_on_an_identity_column() {
+        let p = build_insert(
+            &MYSQL,
+            &mysql_companies(),
+            "companies",
+            "companies",
+            &[
+                ("id".into(), Some("5".into())),
+                ("slug".into(), Some("x".into())),
+            ],
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            p.pk_vars,
+            vec![("last_insert_id_companies".into(), PkSource::Known("5".into()))]
+        );
+    }
+
+    #[test]
+    fn no_returning_and_an_explicit_null_on_an_identity_column_is_still_auto_increment() {
+        // <<null>> given for id: MySQL/MariaDB generate on NULL into
+        // AUTO_INCREMENT exactly as they do when the column is omitted —
+        // reported as Unknown here would be both the wrong diagnosis and
+        // wrong advice ("give the value explicitly" on a column that just did).
+        let p = build_insert(
+            &MYSQL,
+            &mysql_companies(),
+            "companies",
+            "companies",
+            &[("id".into(), None), ("slug".into(), Some("x".into()))],
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            p.pk_vars,
+            vec![("last_insert_id_companies".into(), PkSource::AutoIncrement)]
+        );
+    }
+
+    #[test]
+    fn no_returning_and_a_client_uuid_is_known_before_the_insert_runs() {
+        // A lone char(36) PK with no default: MySQL's wants_client_uuid is
+        // true for it, so build_insert generates the value up front — it is
+        // Known, not AutoIncrement, even with no RETURNING to fall back on.
+        let s = TableSchema {
+            columns: vec![Column {
+                name: "id".into(),
+                type_name: "char".into(),
+                length: Some(36),
+                not_null: true,
+                has_default: false,
+                is_identity: false,
+                is_pk: true,
+            }],
+        };
+        let p = build_insert(&MYSQL, &s, "users", "users", &[], None).unwrap();
+        assert!(!p.has_returning);
+        let (name, source) = &p.pk_vars[0];
+        assert_eq!(name, "last_insert_id_users");
+        match source {
+            PkSource::Known(id) => assert!(uuid::Uuid::parse_str(id).is_ok(), "{id}"),
+            other => panic!("expected a client-generated uuid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_returning_and_a_non_identity_default_pk_is_refused_before_the_insert_runs() {
+        // A server-side DEFAULT that is not AUTO_INCREMENT: has_default true,
+        // is_identity false. MySQL has no RETURNING to read it back with, so
+        // build_insert must refuse — before returning a plan, per invariant 1.
+        let s = TableSchema {
+            columns: vec![
+                col("id", "int", true, true, false, true),
+                col("tag", "text", true, false, false, false),
+            ],
+        };
+        let err = build_insert(&MYSQL, &s, "defaulted", "defaulted", &[("tag".into(), Some("x".into()))], None)
+            .unwrap_err();
+        assert!(err.contains("id"), "{err}");
+        assert!(err.contains("server-generated"), "{err}");
+    }
+
+    #[test]
+    fn the_same_non_identity_default_pk_is_fine_under_returning() {
+        // Identical schema, MariaDB instead: RETURNING exists, so the same
+        // "no source" shape that MySQL must refuse is simply read back.
+        let s = TableSchema {
+            columns: vec![
+                col("id", "int", true, true, false, true),
+                col("tag", "text", true, false, false, false),
+            ],
+        };
+        let p = build_insert(
+            &MARIADB,
+            &s,
+            "defaulted",
+            "defaulted",
+            &[("tag".into(), Some("x".into()))],
+            None,
+        )
+        .unwrap();
+        assert!(p.has_returning);
     }
 }
