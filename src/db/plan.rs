@@ -1,4 +1,8 @@
-/// A table column from introspection data. `type_name` is `typname` (for `::type`).
+use super::platform::Platform;
+
+/// A table column from introspection data, as reported by the current
+/// platform's `Platform::introspect` query. `type_name` is the platform's
+/// native type name, as consumed by `Platform::bind`/`returning`.
 #[derive(Debug, Clone)]
 pub struct Column {
     pub name: String,
@@ -23,11 +27,6 @@ impl TableSchema {
     }
 }
 
-/// Types that get filled with `now()` for NOT NULL columns with no value.
-pub fn is_timestamplike(type_name: &str) -> bool {
-    matches!(type_name, "timestamp" | "timestamptz" | "date")
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct InsertPlan {
     pub sql: String,
@@ -40,6 +39,7 @@ pub struct InsertPlan {
 /// `values` are the pairs given in the step (`None` = SQL NULL). `index` is the
 /// variable-name suffix for the table form (`Some(0)` → `_0`).
 pub fn build_insert(
+    platform: &dyn Platform,
     schema: &TableSchema,
     sql_name: &str,
     bare: &str,
@@ -64,7 +64,7 @@ pub fn build_insert(
     for (col, val) in values {
         let ty = &schema.col(col).expect("checked above").type_name;
         cols.push(col.clone());
-        exprs.push(format!("${param}::{ty}"));
+        exprs.push(platform.bind(param, ty));
         binds.push(val.clone());
         param += 1;
     }
@@ -75,13 +75,13 @@ pub fn build_insert(
             continue;
         }
         if pk.has_default || pk.is_identity {
-            continue; // Postgres will generate it itself.
+            continue; // the platform will generate it itself (default or identity/auto-increment).
         }
-        if pk.type_name == "uuid" {
+        if platform.wants_client_uuid(pk) {
             let id = uuid::Uuid::now_v7().to_string();
             logs.push(format!("PK {} := {id} (UUIDv7)", pk.name));
             cols.push(pk.name.clone());
-            exprs.push(format!("${param}::uuid"));
+            exprs.push(platform.bind(param, &pk.type_name));
             binds.push(Some(id));
             param += 1;
         } else {
@@ -97,9 +97,11 @@ pub fn build_insert(
         if given.contains(c.name.as_str()) || c.is_pk || c.has_default || !c.not_null {
             continue;
         }
-        if is_timestamplike(&c.type_name) {
+        if platform.is_timestamplike(&c.type_name) {
             logs.push(format!("{} := now()", c.name));
             cols.push(c.name.clone());
+            // "now()" is portable across Postgres, MySQL and MariaDB — no need
+            // to route it through Platform.
             exprs.push("now()".to_string());
         } else {
             return Err(format!(
@@ -111,12 +113,8 @@ pub fn build_insert(
 
     // 4. Assemble the SQL.
     let pk_cols = schema.pk_columns();
-    let returning: Vec<String> = pk_cols
-        .iter()
-        .map(|c| format!("({})::text", c.name))
-        .collect();
     let body = if cols.is_empty() {
-        format!("INSERT INTO {sql_name} DEFAULT VALUES")
+        platform.insert_no_columns(sql_name)
     } else {
         format!(
             "INSERT INTO {sql_name} ({}) VALUES ({})",
@@ -124,10 +122,9 @@ pub fn build_insert(
             exprs.join(", ")
         )
     };
-    let sql = if returning.is_empty() {
-        body
-    } else {
-        format!("{body} RETURNING {}", returning.join(", "))
+    let sql = match platform.returning(&pk_cols) {
+        Some(clause) => format!("{body} {clause}"),
+        None => body,
     };
 
     // 5. Variable names for RETURNING.
@@ -149,9 +146,11 @@ pub fn build_insert(
     })
 }
 
-/// Builds `col = $N::type AND …`. NULL → `col IS NULL` with no bind. Parameter
-/// numbering starts at `start` (for UPDATE, where SET takes the first $N).
+/// Builds `col = <bind> AND …`, in the platform's own bind syntax. NULL →
+/// `col IS NULL` with no bind. Parameter numbering starts at `start` (for
+/// UPDATE, where SET takes the first parameter).
 pub fn build_where(
+    platform: &dyn Platform,
     schema: &TableSchema,
     pairs: &[(String, Option<String>)],
     start: usize,
@@ -166,7 +165,7 @@ pub fn build_where(
         match val {
             None => parts.push(format!("{col} IS NULL")),
             Some(_) => {
-                parts.push(format!("{col} = ${param}::{}", c.type_name));
+                parts.push(format!("{col} = {}", platform.bind(param, &c.type_name)));
                 binds.push(val.clone());
                 param += 1;
             }
@@ -176,6 +175,7 @@ pub fn build_where(
 }
 
 pub fn build_update(
+    platform: &dyn Platform,
     schema: &TableSchema,
     sql_name: &str,
     set: &[(String, Option<String>)],
@@ -191,11 +191,11 @@ pub fn build_update(
         let c = schema
             .col(col)
             .ok_or_else(|| format!("column {col:?} is missing from the table"))?;
-        sets.push(format!("{col} = ${param}::{}", c.type_name));
+        sets.push(format!("{col} = {}", platform.bind(param, &c.type_name)));
         binds.push(val.clone());
         param += 1;
     }
-    let (where_sql, where_binds) = build_where(schema, where_, param)?;
+    let (where_sql, where_binds) = build_where(platform, schema, where_, param)?;
     binds.extend(where_binds);
     Ok((
         format!(
@@ -207,6 +207,7 @@ pub fn build_update(
 }
 
 pub fn build_delete(
+    platform: &dyn Platform,
     schema: &TableSchema,
     sql_name: &str,
     where_: &[(String, Option<String>)],
@@ -214,7 +215,7 @@ pub fn build_delete(
     if where_.is_empty() {
         return Err("DELETE without WHERE is forbidden; use the \"I delete all\" step for a full wipe".into());
     }
-    let (where_sql, binds) = build_where(schema, where_, 1)?;
+    let (where_sql, binds) = build_where(platform, schema, where_, 1)?;
     Ok((format!("DELETE FROM {sql_name} WHERE {where_sql}"), binds))
 }
 
@@ -223,6 +224,7 @@ pub fn build_delete_all(sql_name: &str) -> String {
 }
 
 pub fn build_exists(
+    platform: &dyn Platform,
     schema: &TableSchema,
     sql_name: &str,
     where_: &[(String, Option<String>)],
@@ -230,7 +232,7 @@ pub fn build_exists(
     if where_.is_empty() {
         return Err("an existence check requires a condition".into());
     }
-    let (where_sql, binds) = build_where(schema, where_, 1)?;
+    let (where_sql, binds) = build_where(platform, schema, where_, 1)?;
     Ok((
         format!("SELECT 1 FROM {sql_name} WHERE {where_sql} LIMIT 1"),
         binds,
@@ -239,6 +241,7 @@ pub fn build_exists(
 
 #[cfg(test)]
 mod tests {
+    use super::super::platform::PG;
     use super::*;
 
     fn col(
@@ -273,6 +276,7 @@ mod tests {
     #[test]
     fn generates_uuid_pk_and_fills_timestamp() {
         let p = build_insert(
+            &PG,
             &users_uuid(),
             "users",
             "users",
@@ -305,6 +309,7 @@ mod tests {
             ],
         };
         let p = build_insert(
+            &PG,
             &s,
             "companies",
             "companies",
@@ -327,13 +332,14 @@ mod tests {
                 col("qty", "int4", true, false, false, false),
             ],
         };
-        let err = build_insert(&s, "t", "t", &[], None).unwrap_err();
+        let err = build_insert(&PG, &s, "t", "t", &[], None).unwrap_err();
         assert!(err.contains("qty"), "{err}");
     }
 
     #[test]
     fn unknown_column_is_error() {
         let err = build_insert(
+            &PG,
             &users_uuid(),
             "users",
             "users",
@@ -352,7 +358,7 @@ mod tests {
                 col("deleted_at", "timestamptz", false, false, false, false),
             ],
         };
-        let p = build_insert(&s, "t", "t", &[("deleted_at".into(), None)], None).unwrap();
+        let p = build_insert(&PG, &s, "t", "t", &[("deleted_at".into(), None)], None).unwrap();
         assert_eq!(p.binds, vec![None]);
         assert!(p.sql.contains("$1::timestamptz"), "{}", p.sql);
     }
@@ -366,6 +372,7 @@ mod tests {
             ],
         };
         let p = build_insert(
+            &PG,
             &s,
             "pair",
             "pair",
@@ -390,6 +397,7 @@ mod tests {
     #[test]
     fn table_index_suffixes_var_name() {
         let p = build_insert(
+            &PG,
             &users_uuid(),
             "users",
             "users",
@@ -413,6 +421,7 @@ mod tests {
     #[test]
     fn where_uses_typed_casts_and_is_null() {
         let (sql, binds) = build_where(
+            &PG,
             &companies(),
             &[
                 ("slug".into(), Some("x".into())),
@@ -427,18 +436,19 @@ mod tests {
 
     #[test]
     fn where_param_numbering_respects_start() {
-        let (sql, _) = build_where(&companies(), &[("slug".into(), Some("x".into()))], 4).unwrap();
+        let (sql, _) = build_where(&PG, &companies(), &[("slug".into(), Some("x".into()))], 4).unwrap();
         assert_eq!(sql, "slug = $4::text");
     }
 
     #[test]
     fn where_unknown_column_is_error() {
-        assert!(build_where(&companies(), &[("nope".into(), Some("1".into()))], 1).is_err());
+        assert!(build_where(&PG, &companies(), &[("nope".into(), Some("1".into()))], 1).is_err());
     }
 
     #[test]
     fn update_sets_then_where_numbering() {
         let (sql, binds) = build_update(
+            &PG,
             &companies(),
             "companies",
             &[("slug".into(), Some("new".into()))],
@@ -456,6 +466,7 @@ mod tests {
     fn update_requires_where() {
         assert!(
             build_update(
+                &PG,
                 &companies(),
                 "companies",
                 &[("slug".into(), Some("x".into()))],
@@ -467,7 +478,7 @@ mod tests {
 
     #[test]
     fn delete_requires_where() {
-        assert!(build_delete(&companies(), "companies", &[]).is_err());
+        assert!(build_delete(&PG, &companies(), "companies", &[]).is_err());
     }
 
     #[test]
@@ -478,6 +489,7 @@ mod tests {
     #[test]
     fn exists_selects_one() {
         let (sql, _) = build_exists(
+            &PG,
             &companies(),
             "companies",
             &[("slug".into(), Some("x".into()))],
