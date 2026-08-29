@@ -2,10 +2,20 @@ use crate::db::bind_all;
 use crate::db::plan::{Column, TableSchema};
 use crate::db::platform::Platform;
 use crate::db::reference::TableRef;
-use sqlx::{PgPool, Row};
+use sqlx::any::AnyRow;
+use sqlx::{AnyPool, Row};
+
+/// The four boolean columns come back as `int` (see `Platform::introspect`):
+/// `AnyRow`'s `bool` decoding differs per driver, and a later engine's
+/// `information_schema` returns a different boolean representation again —
+/// reading an integer and comparing `!= 0` is portable across both.
+fn flag(r: &AnyRow, col: &str) -> Result<bool, String> {
+    let v: i32 = r.try_get(col).map_err(|e| format!("reading {col}: {e}"))?;
+    Ok(v != 0)
+}
 
 pub async fn introspect(
-    pool: &PgPool,
+    pool: &AnyPool,
     platform: &dyn Platform,
     tref: &TableRef,
 ) -> Result<TableSchema, String> {
@@ -17,16 +27,18 @@ pub async fn introspect(
     if rows.is_empty() {
         return Err(format!("table {} not found or inaccessible", tref.sql_name()));
     }
-    let columns = rows
-        .iter()
-        .map(|r| Column {
-            name: r.get("name"),
-            type_name: r.get("type_name"),
-            not_null: r.get("not_null"),
-            has_default: r.get("has_default"),
-            is_identity: r.get("is_identity"),
-            is_pk: r.get("is_pk"),
-        })
-        .collect();
+    let mut columns = Vec::with_capacity(rows.len());
+    for r in &rows {
+        columns.push(Column {
+            name: r.try_get("name").map_err(|e| format!("reading name: {e}"))?,
+            type_name: r
+                .try_get("type_name")
+                .map_err(|e| format!("reading type_name: {e}"))?,
+            not_null: flag(r, "not_null")?,
+            has_default: flag(r, "has_default")?,
+            is_identity: flag(r, "is_identity")?,
+            is_pk: flag(r, "is_pk")?,
+        });
+    }
     Ok(TableSchema { columns })
 }

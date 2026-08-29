@@ -21,14 +21,14 @@ pub trait Platform: Send + Sync {
 
     /// The introspection query for one table, plus its binds. `db/introspect.rs`
     /// reads the result set by column name, with no compile-time check that the
-    /// query actually produces them — a wrong alias here is a runtime panic
-    /// there. The query MUST return exactly these six aliases:
+    /// query actually produces them — a wrong alias here is an `Err` naming the
+    /// column, from `try_get`, there. The query MUST return exactly these six aliases:
     /// - `name` (text) — column name
     /// - `type_name` (text) — the platform's native type name, as used by `bind`/`returning`
-    /// - `not_null` (bool)
-    /// - `has_default` (bool)
-    /// - `is_identity` (bool)
-    /// - `is_pk` (bool)
+    /// - `not_null` (int, 0/1) — `AnyRow`'s `bool` decoding differs per driver
+    /// - `has_default` (int, 0/1)
+    /// - `is_identity` (int, 0/1)
+    /// - `is_pk` (int, 0/1)
     fn introspect(&self, tref: &TableRef) -> (String, Vec<Option<String>>);
 
     fn next_sequence(&self, seq: &str) -> Option<(String, Vec<Option<String>>)>;

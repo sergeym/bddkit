@@ -4,7 +4,9 @@ use crate::db::platform::Platform;
 use crate::db::reference::TableRef;
 use crate::db::value;
 use crate::world::World;
-use sqlx::{PgPool, Postgres, Row, postgres::PgArguments, query::Query};
+use sqlx::AnyPool;
+use sqlx::any::AnyArguments;
+use sqlx::{Any, Row, query::Query};
 use std::sync::Arc;
 
 /// Prints the SQL and parameters if debug mode is enabled (§8).
@@ -23,7 +25,7 @@ pub fn log_sql(w: &World, sql: &str, binds: &[Option<String>], logs: &[String]) 
 pub async fn resolve<'a>(
     w: &'a World,
     raw_table: &str,
-) -> Result<(&'a PgPool, &'static dyn Platform, Arc<plan::TableSchema>, TableRef), String> {
+) -> Result<(&'a AnyPool, &'static dyn Platform, Arc<plan::TableSchema>, TableRef), String> {
     let tref = TableRef::parse(raw_table)?;
     let conn = tref
         .conn
@@ -189,9 +191,9 @@ pub async fn delete_all(w: &mut World, raw_table: &str) -> Result<(), String> {
 
 /// Binds typed arguments for a procedure/function call.
 fn bind_args<'q>(
-    mut q: Query<'q, Postgres, PgArguments>,
+    mut q: Query<'q, Any, AnyArguments<'q>>,
     args: &'q [value::Arg],
-) -> Query<'q, Postgres, PgArguments> {
+) -> Query<'q, Any, AnyArguments<'q>> {
     for a in args {
         q = match a {
             value::Arg::Null => q.bind(Option::<String>::None),
@@ -204,8 +206,8 @@ fn bind_args<'q>(
     q
 }
 
-/// `p1, p2, ...` — one per positional argument, in the platform's own
-/// placeholder syntax.
+/// Joins `n` placeholders in the platform's own syntax (e.g. `$1, $2, $3`),
+/// for use in a `CALL`/`SELECT` argument list.
 fn placeholder_list(p: &dyn Platform, n: usize) -> String {
     (1..=n)
         .map(|i| p.placeholder(i))
@@ -275,7 +277,7 @@ pub async fn next_sequence(w: &mut World, seq: &str, var: &str) -> Result<(), St
     let row = bind_all(sqlx::query(&sql), &binds)
         .fetch_one(&state.pool)
         .await
-        .map_err(|e| format!("nextval({seq}): {e}"))?;
+        .map_err(|e| format!("next value of sequence {seq:?}: {e}"))?;
     let v: String = row
         .try_get(0)
         .map_err(|e| format!("reading sequence: {e}"))?;

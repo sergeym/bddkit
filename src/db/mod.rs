@@ -10,9 +10,9 @@ use crate::db::platform::{PG, Platform};
 use crate::db::reference::TableRef;
 use crate::options::Options;
 use plan::TableSchema;
-use sqlx::PgPool;
-use sqlx::postgres::PgPoolOptions;
-use sqlx::{Postgres, postgres::PgArguments, query::Query};
+use sqlx::AnyPool;
+use sqlx::any::{AnyArguments, AnyPoolOptions};
+use sqlx::{Any, query::Query};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
@@ -21,9 +21,9 @@ use std::sync::{Arc, Mutex};
 /// `$N::type` cast (a future MySQL platform builds placeholders with no such
 /// cast). Shared by step execution (`ops`) and introspection (`introspect`).
 pub fn bind_all<'q>(
-    mut q: Query<'q, Postgres, PgArguments>,
+    mut q: Query<'q, Any, AnyArguments<'q>>,
     binds: &'q [Option<String>],
-) -> Query<'q, Postgres, PgArguments> {
+) -> Query<'q, Any, AnyArguments<'q>> {
     for b in binds {
         q = q.bind(b);
     }
@@ -32,7 +32,7 @@ pub fn bind_all<'q>(
 
 /// Everything one connection needs to run and plan a query.
 pub(crate) struct ConnectionState {
-    pool: PgPool,
+    pool: AnyPool,
     platform: &'static dyn Platform,
     options: Options,
 }
@@ -48,7 +48,7 @@ impl Db {
     pub async fn connect(conns: &BTreeMap<String, Connection>, max: u32) -> Result<Db, String> {
         let mut connections = HashMap::new();
         for (name, c) in conns {
-            let opts = PgPoolOptions::new().max_connections(max.max(1));
+            let opts = AnyPoolOptions::new().max_connections(max.max(1));
             let platform: &'static dyn Platform = &PG; // vendor detection is a later task
             let stmts = platform
                 .session_setup(&c.search_path)
@@ -89,10 +89,6 @@ impl Db {
         self.connections
             .get(name)
             .ok_or_else(|| format!("connection {name:?} is not declared in resources.db"))
-    }
-
-    pub fn pool(&self, name: &str) -> Result<&PgPool, String> {
-        Ok(&self.connection(name)?.pool)
     }
 
     pub fn options(&self, name: &str) -> Result<&Options, String> {
@@ -147,7 +143,7 @@ impl DbHandle {
     }
 
     pub fn set_current(&mut self, name: &str) -> Result<(), String> {
-        self.resources()?.pool(name)?; // check that the connection exists
+        self.resources()?.connection(name)?; // check that the connection exists
         self.current = name.to_string();
         Ok(())
     }
@@ -185,5 +181,29 @@ mod tests {
         h.current = "audit".to_string();
         h.reset();
         assert_eq!(h.current(), "main");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_scheme_is_refused_by_name() {
+        sqlx::any::install_default_drivers();
+        let mut conns = BTreeMap::new();
+        conns.insert(
+            "primary".to_string(),
+            Connection {
+                dsn: "mssql://x/y".to_string(),
+                ..Default::default()
+            },
+        );
+        let err = match Db::connect(&conns, 1).await {
+            Ok(_) => panic!("connecting to an unknown scheme should fail"),
+            Err(e) => e,
+        };
+        // A bare substring of "connection" (e.g. "c") would pass on any error
+        // at all, since Db::connect wraps every failure with
+        // "connection {name}: ...". "primary" pins that the name survives,
+        // and "mssql" pins the actual behavior under Any: the scheme is
+        // rejected at parse time, not dialed as a hostname and failed on DNS.
+        assert!(err.contains("primary"), "{err}");
+        assert!(err.contains("mssql"), "{err}");
     }
 }

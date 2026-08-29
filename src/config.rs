@@ -77,7 +77,7 @@ pub struct ApiConfig {
     pub effective_options: Options,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct Connection {
     pub dsn: String,
     #[serde(default)]

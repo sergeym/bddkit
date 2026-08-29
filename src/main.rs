@@ -165,6 +165,9 @@ fn list_steps(args: ListArgs) -> Result<i32> {
 /// a failed scenario.
 #[tokio::main]
 async fn main() {
+    // Every path that can build a pool runs through here first — `AnyPool`
+    // panics rather than erroring if a driver is not installed.
+    sqlx::any::install_default_drivers();
     let cli = Cli::parse();
     // Each command names what did not happen: "run not started" is a lie when
     // the user only asked for a listing.
@@ -313,8 +316,8 @@ async fn run(cli: RunArgs) -> Result<i32> {
     }
     let apis = Arc::new(http::Apis::new(by_name, cfg.resolve_default_api()?)?);
 
-    // Pools are created once per run. The runner is sequential;
-    // max_connections is set with headroom for M5.
+    // Pools are created once per run, sized to the worker pool's own
+    // concurrency so every worker can hold a connection at once.
     let db = if cfg.resources.db.is_empty() {
         None
     } else {

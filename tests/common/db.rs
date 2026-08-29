@@ -1,7 +1,7 @@
 //! Helpers for DB integration tests: recreating the fixture schema and running
 //! the compiled binary against a temporary config (like the M1 acceptance tests).
 
-use sqlx::PgPool;
+use sqlx::AnyPool;
 use std::process::{Command, Output};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, MutexGuard};
@@ -60,7 +60,10 @@ pub async fn setup() -> Setup {
     let guard = DB_LOCK.lock().await;
     let lock = phase.elapsed();
     let phase = Instant::now();
-    let pool = PgPool::connect(&test_dsn())
+    // This test binary is a separate process from `bddkit` and builds its own
+    // pool, so it needs its own driver installation (AnyPool panics without it).
+    sqlx::any::install_default_drivers();
+    let pool = AnyPool::connect(&test_dsn())
         .await
         .expect("no connection to the test DB; run `docker compose up -d`");
     let connect = phase.elapsed();
