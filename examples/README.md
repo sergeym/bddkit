@@ -1,6 +1,6 @@
 # Running the examples
 
-Two suites, two configs. Both need `cargo build --release` first (or use `cargo run --release --` in place of `./target/release/bddkit`).
+Three suites, three configs. Both need `cargo build --release` first (or use `cargo run --release --` in place of `./target/release/bddkit`).
 
 ## HTTP suite — `examples/api.yaml`
 
@@ -31,7 +31,30 @@ docker compose up -d db                          # Postgres on :5433, schema fro
 ./target/release/bddkit run --config examples/db.yaml
 ```
 
-`db-features/db.feature` walks through every DB step: inserts (one-liner, table, multi-table), update, delete, extraction into a variable, row-presence assertions, procedures, functions, sequences, and a second connection.
+`db-features/db.feature` walks through every DB step: inserts (one-liner, table, multi-table), update, delete, extraction into a variable, row-presence assertions, procedures, functions, sequences, and a second connection. It is deliberately Postgres-only — see the portability table below for what that costs.
+
+## Database suite on MySQL and MariaDB — `examples/db-mysql.yaml`
+
+```bash
+docker compose up -d mysql mariadb            # schema from examples/db/init-mysql.sql
+./target/release/bddkit run --config examples/db-mysql.yaml
+```
+
+The config points at MySQL on `:3307`; MariaDB is the same config on `:3308`, and `db-features-mysql/db.feature` passes against both unchanged. That is the file's purpose — it uses only the vocabulary that is portable: the three insert forms (one-liner, data table, multi-table wide form), update, delete, `I extract`, both row-presence assertions, and a connection switch.
+
+The init script only runs on a container's first start with an empty data directory. If the containers already exist, `docker compose down -v && docker compose up -d` to apply it.
+
+### What does not port
+
+| Feature | Postgres | MySQL | MariaDB | Why |
+|---|---|---|---|---|
+| `I get next value of sequence` | yes | no | yes | MySQL has no sequences at all; MariaDB does, so the step works there — but a file using it is no longer engine-neutral |
+| `search_path` in `resources.db` | yes | no | no | A schema *is* a database here, so there is no session-level search path. bddkit refuses it at startup instead of ignoring it — name the database in the DSN, or qualify a step's table as `database.table` |
+| `binary(16)` UUID columns | n/a | no | no | `UUID_TO_BIN(uuid, swap_flag)` reorders bytes depending on a flag that `information_schema` does not record, so bddkit cannot know which layout the service under test reads. It refuses rather than write disagreeing bytes. Use `char(36)` — as `examples/db/init-mysql.sql` does — and bddkit fills it with a client-side UUIDv7. Every other `binary`/`varbinary` column is refused too: this layer binds and compares as text, so a WHERE against one would match nothing |
+| The *text* an `I extract` yields | — | — | — | Portable as a step, not as a value. Every engine renders its own types: `now()` is `2026-08-29 15:11:50.884052+00` on Postgres and `2026-08-29 15:11:50` on both others, a boolean is `true` vs `1`, and a bare `numeric` is `0` where `decimal(12,2)` is `0.00`. So `variable "x" should be equal to "..."` on an extracted timestamp or boolean is engine-specific even though the steps around it are not — the example only extracts from `varchar` columns for that reason |
+| `I call procedure` / `I call function` | yes | yes | yes | The *steps* are portable; the routine *bodies* are not. The Postgres example's are `LANGUAGE sql` with `nextval()` and `\|\|`, which is why they are absent here rather than translated |
+
+Everything else in the DB vocabulary behaves identically on all three.
 
 ## Narrowing a run
 
