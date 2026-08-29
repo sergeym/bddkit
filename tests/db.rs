@@ -1,7 +1,7 @@
 mod common;
 
-use common::db::{combined, feature_command, run_feature, setup, test_dsn};
-use sqlx::PgPool;
+use common::db::{Engine, combined, engine, feature_command, run_feature, setup, test_dsn};
+use sqlx::AnyPool;
 use std::{
     io::{BufRead, BufReader, Read},
     process::{Output, Stdio},
@@ -200,13 +200,31 @@ Feature: extract
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sequence_and_builtin_function() {
     let _g = setup().await;
-    // nextval increases; upper() is a builtin function taking a text argument.
+    // nextval increases — on the engines that have sequences at all. MySQL has
+    // none, and the message it refuses with is a user-facing contract.
     let src = "\
 Feature: routines
-  Scenario: sequence and function
+  Scenario: sequence
     Given I get next value of sequence \"apibdd_it.thing_seq\" as \"first\"
     And I get next value of sequence \"apibdd_it.thing_seq\" as \"second\"
     Then variable \"second\" should not be equal to \"<<first>>\"
+";
+    let out = run_feature(src, &_g);
+    if engine() == Engine::MySql {
+        assert!(!out.status.success(), "{}", combined(&out));
+        assert!(
+            combined(&out).contains("sequences are not supported on mysql"),
+            "{}",
+            combined(&out)
+        );
+    } else {
+        assert!(out.status.success(), "{}", combined(&out));
+    }
+
+    // upper() is a builtin function taking a text argument — on every engine.
+    let src = "\
+Feature: routines
+  Scenario: function
     When I call function \"upper\" with \"s: abc\" as \"up\"
     Then variable \"up\" should be equal to \"ABC\"
 ";
@@ -231,7 +249,17 @@ Feature: eventual database assertion
         combined(&without_polling)
     );
 
-    let delayed = PgPool::connect(&test_dsn())
+    // The debug line the assertion prints is dialect-specific: Postgres casts
+    // its binds, MySQL/MariaDB use a bare `?`. It is the oneshot trigger below,
+    // so a hardcoded one would not fail the test — it would hang to timeout.
+    let probe = format!(
+        "SQL: SELECT 1 FROM companies WHERE slug = {} LIMIT 1",
+        match engine() {
+            Engine::Postgres => "$1::text",
+            Engine::MySql | Engine::MariaDb => "?",
+        }
+    );
+    let delayed = AnyPool::connect(&test_dsn())
         .await
         .expect("connect delayed inserter");
     let (first_query, first_query_seen) = oneshot::channel();
@@ -268,12 +296,13 @@ Feature: eventual database assertion
             .expect("read bddkit stdout");
         stdout_bytes
     });
+    let probe_line = probe.clone();
     let reader = std::thread::spawn(move || {
         let mut stderr_bytes = Vec::new();
         let mut first_query = Some(first_query);
         for line in BufReader::new(stderr).split(b'\n') {
             let line = line.expect("read bddkit stderr");
-            if line == b"SQL: SELECT 1 FROM companies WHERE slug = $1::text LIMIT 1"
+            if line == probe_line.as_bytes()
                 && let Some(first_query) = first_query.take()
             {
                 first_query
@@ -295,10 +324,7 @@ Feature: eventual database assertion
     let output = combined(&with_polling);
     assert!(with_polling.status.success(), "{output}");
     assert!(
-        output
-            .matches("SQL: SELECT 1 FROM companies WHERE slug = $1::text LIMIT 1")
-            .count()
-            >= 2,
+        output.matches(probe.as_str()).count() >= 2,
         "polling assertion did not make an initial miss and retry: {output}"
     );
 }
