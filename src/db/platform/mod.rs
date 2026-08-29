@@ -1,6 +1,7 @@
 mod mysql;
 mod postgres;
 
+pub use mysql::{MARIADB, MYSQL};
 pub use postgres::PG;
 
 use crate::db::plan::Column;

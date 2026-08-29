@@ -6,7 +6,7 @@ pub mod reference;
 pub mod value;
 
 use crate::config::Connection;
-use crate::db::platform::{PG, Platform};
+use crate::db::platform::{MARIADB, MYSQL, PG, Platform};
 use crate::db::reference::TableRef;
 use crate::options::Options;
 use plan::TableSchema;
@@ -55,6 +55,24 @@ where
     }
 }
 
+/// Picks the platform family from the DSN scheme alone. That is enough to
+/// configure `after_connect` and to validate `search_path` before any network
+/// round trip: MySQL and MariaDB share the `mysql://` scheme and have
+/// identical `session_setup` behavior (a schema is a database in both), so
+/// telling them apart needs a live connection — done later, in `Db::connect`,
+/// by probing `SELECT VERSION()`.
+fn family_for_scheme(dsn: &str) -> Result<&'static dyn Platform, String> {
+    match dsn.split("://").next().unwrap_or("") {
+        "postgres" | "postgresql" => Ok(&PG),
+        // sqlx's MySQL driver answers to both schemes, so refusing "mariadb"
+        // here would reject a DSN the driver itself would have connected.
+        "mysql" | "mariadb" => Ok(&MYSQL),
+        other => Err(format!(
+            "unknown database scheme {other:?} (expected postgres, postgresql, mysql or mariadb)"
+        )),
+    }
+}
+
 /// Everything one connection needs to run and plan a query.
 pub(crate) struct ConnectionState {
     pool: AnyPool,
@@ -74,8 +92,8 @@ impl Db {
         let mut connections = HashMap::new();
         for (name, c) in conns {
             let opts = AnyPoolOptions::new().max_connections(max.max(1));
-            let platform: &'static dyn Platform = &PG; // vendor detection is a later task
-            let stmts = platform
+            let family = family_for_scheme(&c.dsn).map_err(|e| format!("connection {name}: {e}"))?;
+            let stmts = family
                 .session_setup(&c.search_path)
                 .map_err(|e| format!("connection {name}: {e}"))?;
             let pool = if stmts.is_empty() {
@@ -94,6 +112,25 @@ impl Db {
                 .await
             };
             let pool = pool.map_err(|e| format!("connection {name}: {e}"))?;
+
+            // Postgres's scheme already fully determines it; MySQL and
+            // MariaDB share one scheme, so only there is a probe needed.
+            let platform: &'static dyn Platform = if family.name() == "postgres" {
+                family
+            } else {
+                let row = sqlx::query("SELECT VERSION()")
+                    .fetch_one(&pool)
+                    .await
+                    .map_err(|e| format!("connection {name}: detecting the vendor: {e}"))?;
+                let version = text_col(&row, 0)
+                    .map_err(|e| format!("connection {name}: detecting the vendor: {e}"))?
+                    .unwrap_or_default();
+                if version.contains("MariaDB") {
+                    &MARIADB
+                } else {
+                    &MYSQL
+                }
+            };
             connections.insert(
                 name.clone(),
                 ConnectionState {
@@ -118,6 +155,13 @@ impl Db {
 
     pub fn options(&self, name: &str) -> Result<&Options, String> {
         Ok(&self.connection(name)?.options)
+    }
+
+    /// The resolved platform for one connection: the vendor `Db::connect`
+    /// settled on, not just the scheme family it started from.
+    #[allow(dead_code)] // only tests read it, same as HttpState::current
+    pub(crate) fn platform(&self, name: &str) -> Result<&'static dyn Platform, String> {
+        Ok(self.connection(name)?.platform)
     }
 
     /// Introspection with caching. std::Mutex is NOT held across an await.
@@ -206,6 +250,42 @@ mod tests {
         h.current = "audit".to_string();
         h.reset();
         assert_eq!(h.current(), "main");
+    }
+
+    #[test]
+    fn family_for_scheme_picks_by_dsn_prefix() {
+        assert_eq!(
+            family_for_scheme("postgres://x/y").unwrap().name(),
+            "postgres"
+        );
+        assert_eq!(
+            family_for_scheme("postgresql://x/y").unwrap().name(),
+            "postgres"
+        );
+        // MariaDB shares the mysql:// scheme; the exact vendor is only
+        // settled after connecting (see Db::connect), so this is the family.
+        assert_eq!(family_for_scheme("mysql://x/y").unwrap().name(), "mysql");
+        // sqlx-mysql declares URL_SCHEMES = ["mysql", "mariadb"], so a DSN the
+        // driver accepts must not be refused a layer above it.
+        assert_eq!(family_for_scheme("mariadb://x/y").unwrap().name(), "mysql");
+        let err = match family_for_scheme("mssql://x/y") {
+            Ok(_) => panic!("an unknown scheme must be refused"),
+            Err(e) => e,
+        };
+        assert!(err.contains("mssql"), "{err}");
+    }
+
+    #[test]
+    fn platform_reports_the_same_not_declared_error_as_connection() {
+        let db = Db {
+            connections: HashMap::new(),
+            cache: Mutex::new(HashMap::new()),
+        };
+        let err = match db.platform("x") {
+            Ok(_) => panic!("an undeclared connection must be refused"),
+            Err(e) => e,
+        };
+        assert!(err.contains("x"), "{err}");
     }
 
     #[tokio::test]

@@ -1,8 +1,3 @@
-// Every static defined here is unused until the next task wires vendor
-// detection into `Db::connect` — the dialect itself is complete and
-// unit-tested in this file.
-#![allow(dead_code)]
-
 use super::Platform;
 use crate::db::plan::Column;
 use crate::db::reference::TableRef;
