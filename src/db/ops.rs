@@ -1,12 +1,11 @@
-use crate::db::bind_all;
 use crate::db::plan::{self, InsertPlan};
 use crate::db::platform::Platform;
 use crate::db::reference::TableRef;
-use crate::db::value;
+use crate::db::{bind_all, text_col, value};
 use crate::world::World;
 use sqlx::AnyPool;
 use sqlx::any::AnyArguments;
-use sqlx::{Any, Row, query::Query};
+use sqlx::{Any, query::Query};
 use std::sync::Arc;
 
 /// Prints the SQL and parameters if debug mode is enabled (§8).
@@ -67,9 +66,9 @@ pub async fn insert(
     // PK values come back as text, per Platform::returning, in var_names order.
     let mut assignments: Vec<(String, String)> = Vec::new();
     for (i, name) in var_names.iter().enumerate() {
-        let v: String = row
-            .try_get(i)
-            .map_err(|e| format!("reading RETURNING: {e}"))?;
+        let v = text_col(&row, i)
+            .map_err(|e| format!("reading RETURNING: {e}"))?
+            .ok_or_else(|| "reading RETURNING: unexpected NULL".to_string())?;
         assignments.push((name.clone(), v));
     }
     // The pool borrow has ended — now it's safe to write variables.
@@ -144,12 +143,10 @@ pub async fn extract(
     var: &str,
 ) -> Result<(), String> {
     let (pool, platform, schema, tref) = resolve(w, raw_table).await?;
-    if schema.col(column).is_none() {
-        return Err(format!(
-            "column {column:?} is missing from {}",
-            tref.sql_name()
-        ));
-    }
+    let col = schema.col(column).ok_or_else(|| {
+        format!("column {column:?} is missing from {}", tref.sql_name())
+    })?;
+    platform.check_bindable(col)?;
     let where_pairs = value::parse_oneliner(where_str)?;
     let (where_sql, binds) = plan::build_where(platform, &schema, &where_pairs, 1)?;
     let sql = format!(
@@ -163,9 +160,7 @@ pub async fn extract(
         .await
         .map_err(|e| format!("SELECT {}: {e}", tref.sql_name()))?
         .ok_or_else(|| format!("no row in {} matched the condition", tref.sql_name()))?;
-    let v: Option<String> = row
-        .try_get(0)
-        .map_err(|e| format!("reading value: {e}"))?;
+    let v = text_col(&row, 0).map_err(|e| format!("reading value: {e}"))?;
     let value = v.unwrap_or_default();
     w.vars.set(var, value);
     Ok(())
@@ -255,9 +250,7 @@ pub async fn call_function(
         .fetch_one(&state.pool)
         .await
         .map_err(|e| format!("SELECT {name}(...): {e}"))?;
-    let v: Option<String> = row
-        .try_get(0)
-        .map_err(|e| format!("reading function result: {e}"))?;
+    let v = text_col(&row, 0).map_err(|e| format!("reading function result: {e}"))?;
     let value = v.unwrap_or_default();
     w.vars.set(var, value);
     Ok(())
@@ -278,9 +271,9 @@ pub async fn next_sequence(w: &mut World, seq: &str, var: &str) -> Result<(), St
         .fetch_one(&state.pool)
         .await
         .map_err(|e| format!("next value of sequence {seq:?}: {e}"))?;
-    let v: String = row
-        .try_get(0)
-        .map_err(|e| format!("reading sequence: {e}"))?;
+    let v = text_col(&row, 0)
+        .map_err(|e| format!("reading sequence: {e}"))?
+        .unwrap_or_default();
     w.vars.set(var, v);
     Ok(())
 }

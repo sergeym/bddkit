@@ -7,6 +7,13 @@ use super::platform::Platform;
 pub struct Column {
     pub name: String,
     pub type_name: String,
+    /// Declared length/precision (e.g. `char(36)`), where the platform needs
+    /// it to tell columns of the same `type_name` apart. NULL where it never
+    /// matters — Postgres always returns NULL here.
+    // Read by the MySQL dialect only; still unread from live code until
+    // Db::connect selects a platform by vendor (next task).
+    #[allow(dead_code)]
+    pub length: Option<i64>,
     pub not_null: bool,
     pub has_default: bool,
     pub is_identity: bool,
@@ -46,10 +53,11 @@ pub fn build_insert(
     values: &[(String, Option<String>)],
     index: Option<usize>,
 ) -> Result<InsertPlan, String> {
-    // Given columns must exist.
+    // Given columns must exist and be bindable.
     for (col, _) in values {
-        if schema.col(col).is_none() {
-            return Err(format!("column {col:?} is missing from table {sql_name}"));
+        match schema.col(col) {
+            None => return Err(format!("column {col:?} is missing from table {sql_name}")),
+            Some(c) => platform.check_bindable(c)?,
         }
     }
     let given: std::collections::HashSet<&str> = values.iter().map(|(c, _)| c.as_str()).collect();
@@ -162,6 +170,7 @@ pub fn build_where(
         let c = schema
             .col(col)
             .ok_or_else(|| format!("column {col:?} is missing from the table"))?;
+        platform.check_bindable(c)?;
         match val {
             None => parts.push(format!("{col} IS NULL")),
             Some(_) => {
@@ -191,6 +200,7 @@ pub fn build_update(
         let c = schema
             .col(col)
             .ok_or_else(|| format!("column {col:?} is missing from the table"))?;
+        platform.check_bindable(c)?;
         sets.push(format!("{col} = {}", platform.bind(param, &c.type_name)));
         binds.push(val.clone());
         param += 1;
@@ -255,6 +265,7 @@ mod tests {
         Column {
             name: name.into(),
             type_name: ty.into(),
+            length: None,
             not_null,
             has_default,
             is_identity,

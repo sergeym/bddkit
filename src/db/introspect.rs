@@ -1,7 +1,7 @@
-use crate::db::bind_all;
 use crate::db::plan::{Column, TableSchema};
 use crate::db::platform::Platform;
 use crate::db::reference::TableRef;
+use crate::db::{bind_all, text_col};
 use sqlx::any::AnyRow;
 use sqlx::{AnyPool, Row};
 
@@ -30,10 +30,13 @@ pub async fn introspect(
     let mut columns = Vec::with_capacity(rows.len());
     for r in &rows {
         columns.push(Column {
-            name: r.try_get("name").map_err(|e| format!("reading name: {e}"))?,
-            type_name: r
-                .try_get("type_name")
-                .map_err(|e| format!("reading type_name: {e}"))?,
+            name: text_col(r, "name")?
+                .ok_or_else(|| "reading name: unexpected NULL".to_string())?,
+            type_name: text_col(r, "type_name")?
+                .ok_or_else(|| "reading type_name: unexpected NULL".to_string())?,
+            length: r
+                .try_get("length")
+                .map_err(|e| format!("reading length: {e}"))?,
             not_null: flag(r, "not_null")?,
             has_default: flag(r, "has_default")?,
             is_identity: flag(r, "is_identity")?,

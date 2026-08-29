@@ -1,3 +1,4 @@
+mod mysql;
 mod postgres;
 
 pub use postgres::PG;
@@ -16,15 +17,16 @@ pub trait Platform: Send + Sync {
     fn returning(&self, pk: &[&Column]) -> Option<String>;
     fn is_timestamplike(&self, ty: &str) -> bool;
     fn wants_client_uuid(&self, col: &Column) -> bool;
-    #[allow(dead_code)] // unused until MySQL, which refuses binary columns
     fn check_bindable(&self, col: &Column) -> Result<(), String>;
 
     /// The introspection query for one table, plus its binds. `db/introspect.rs`
     /// reads the result set by column name, with no compile-time check that the
     /// query actually produces them — a wrong alias here is an `Err` naming the
-    /// column, from `try_get`, there. The query MUST return exactly these six aliases:
+    /// column, from `try_get`, there. The query MUST return exactly these seven aliases:
     /// - `name` (text) — column name
     /// - `type_name` (text) — the platform's native type name, as used by `bind`/`returning`
+    /// - `length` (int, nullable) — declared length/precision, e.g. `char(36)`;
+    ///   NULL where the platform never needs it (Postgres has a real `uuid` type)
     /// - `not_null` (int, 0/1) — `AnyRow`'s `bool` decoding differs per driver
     /// - `has_default` (int, 0/1)
     /// - `is_identity` (int, 0/1)

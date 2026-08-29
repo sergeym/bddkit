@@ -11,8 +11,8 @@ use crate::db::reference::TableRef;
 use crate::options::Options;
 use plan::TableSchema;
 use sqlx::AnyPool;
-use sqlx::any::{AnyArguments, AnyPoolOptions};
-use sqlx::{Any, query::Query};
+use sqlx::any::{AnyArguments, AnyPoolOptions, AnyRow};
+use sqlx::{Any, ColumnIndex, Row, query::Query};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
@@ -28,6 +28,31 @@ pub fn bind_all<'q>(
         q = q.bind(b);
     }
     q
+}
+
+/// Reads a column as text, tolerating a driver that reports it as a blob
+/// instead of text — proven live: `information_schema.DATA_TYPE` comes back
+/// as a blob on MySQL 8, and `CAST(x AS CHAR)` on a plain `TEXT` column comes
+/// back as a blob on MariaDB. `sqlx::Any`'s `String` decode rejects a blob
+/// outright, so on that failure this falls back to `Vec<u8>` (which `Any`
+/// does decode from a blob, per `sqlx-core`'s `any/types/blob.rs`) and
+/// converts with `String::from_utf8`. Shared by introspection and `ops`.
+pub fn text_col<I>(row: &AnyRow, index: I) -> Result<Option<String>, String>
+where
+    I: ColumnIndex<AnyRow> + Copy,
+{
+    if let Ok(v) = row.try_get::<Option<String>, I>(index) {
+        return Ok(v);
+    }
+    let bytes: Option<Vec<u8>> = row
+        .try_get(index)
+        .map_err(|e| format!("reading {index:?}: {e}"))?;
+    match bytes {
+        None => Ok(None),
+        Some(b) => String::from_utf8(b)
+            .map(Some)
+            .map_err(|e| format!("reading {index:?}: not valid UTF-8: {e}")),
+    }
 }
 
 /// Everything one connection needs to run and plan a query.

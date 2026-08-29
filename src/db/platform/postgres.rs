@@ -7,6 +7,7 @@ use crate::db::reference::TableRef;
 const INTROSPECT_SQL: &str = "\
 SELECT a.attname::text AS name,
        t.typname::text AS type_name,
+       NULL::int AS length,
        a.attnotnull::int AS not_null,
        (a.atthasdef OR a.attidentity <> '')::int AS has_default,
        (a.attidentity <> '')::int AS is_identity,
@@ -94,6 +95,7 @@ mod tests {
         Column {
             name: name.into(),
             type_name: ty.into(),
+            length: None,
             not_null: false,
             has_default: false,
             is_identity: false,
@@ -124,7 +126,10 @@ mod tests {
         let p = &PG;
         assert_eq!(p.returning(&[]), None);
         let id = col("id", "int4");
-        assert_eq!(p.returning(&[&id]), Some("RETURNING (id)::text".to_string()));
+        assert_eq!(
+            p.returning(&[&id]),
+            Some("RETURNING (id)::text".to_string())
+        );
         let a = col("a", "int4");
         let b = col("b", "int4");
         assert_eq!(
