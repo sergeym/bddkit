@@ -17,9 +17,10 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 /// Binds text parameters (`Option<String>`). Every value crosses the wire as
-/// text; the SQL string itself carries the type, via a Postgres-specific
-/// `$N::type` cast (a future MySQL platform builds placeholders with no such
-/// cast). Shared by step execution (`ops`) and introspection (`introspect`).
+/// text; the SQL string itself carries the type, through whatever
+/// `Platform::bind` produced — a `$N::type` cast on Postgres, a bare `?` on
+/// MySQL and MariaDB, which coerce implicitly. Shared by step execution
+/// (`ops`) and introspection (`introspect`).
 pub fn bind_all<'q>(
     mut q: Query<'q, Any, AnyArguments<'q>>,
     binds: &'q [Option<String>],
