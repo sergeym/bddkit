@@ -34,12 +34,37 @@ impl TableSchema {
     }
 }
 
+/// Where the text value of one PK column's `last_insert_*` variable comes
+/// from. Only consulted when the platform produced no `RETURNING` clause —
+/// `ops::insert` reads the row back for that instead. See `Platform::returning`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PkSource {
+    /// The text value is already known before the INSERT runs: given in the
+    /// step, or a client-generated UUIDv7 (`build_insert` step 2).
+    Known(String),
+    /// Not known yet — read it off the INSERT's own result
+    /// (`AnyQueryResult::last_insert_id`), never a second query.
+    AutoIncrement,
+    /// No source exists: a server-side default that is not auto-increment,
+    /// or (composite PK) one part filled that way. Carries the column name
+    /// so the caller can fail naming it. `build_insert` already refuses this
+    /// case itself when there is no RETURNING (see below) — a variant this
+    /// well-typed still beats an early bailout with no trace of why.
+    Unknown(String),
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct InsertPlan {
     pub sql: String,
     pub binds: Vec<Option<String>>,
-    pub var_names: Vec<String>,
     pub logs: Vec<String>,
+    /// Whether `sql` ends in a `RETURNING`-equivalent clause.
+    pub has_returning: bool,
+    /// One entry per PK column, `(last_insert_* variable name, where its
+    /// value comes from)` — one `Vec`, not two zipped by position, so
+    /// misalignment between a name and its source cannot compile in one
+    /// column being renamed and not the other.
+    pub pk_vars: Vec<(String, PkSource)>,
 }
 
 /// Builds an INSERT: applies the PK and NOT NULL fill rules from spec §8.
@@ -67,6 +92,9 @@ pub fn build_insert(
     let mut binds: Vec<Option<String>> = Vec::new();
     let mut logs: Vec<String> = Vec::new();
     let mut param = 1usize;
+    // PK column name -> its client-generated UUIDv7, for pk_vars below.
+    let mut generated_uuids: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
 
     // 1. Given values — as-is, cast to the column's type.
     for (col, val) in values {
@@ -90,7 +118,8 @@ pub fn build_insert(
             logs.push(format!("PK {} := {id} (UUIDv7)", pk.name));
             cols.push(pk.name.clone());
             exprs.push(platform.bind(param, &pk.type_name));
-            binds.push(Some(id));
+            binds.push(Some(id.clone()));
+            generated_uuids.insert(pk.name.clone(), id);
             param += 1;
         } else {
             return Err(format!(
@@ -130,27 +159,70 @@ pub fn build_insert(
             exprs.join(", ")
         )
     };
-    let sql = match platform.returning(&pk_cols) {
+    let returning_clause = platform.returning(&pk_cols);
+    let has_returning = returning_clause.is_some();
+    let sql = match returning_clause {
         Some(clause) => format!("{body} {clause}"),
         None => body,
     };
 
-    // 5. Variable names for RETURNING.
+    // 5. One (variable name, source) pair per PK column, in `pk_cols` order —
+    // built in a single pass so the name and its source can never drift apart.
     let suffix = index.map(|i| format!("_{i}")).unwrap_or_default();
-    let var_names: Vec<String> = if pk_cols.len() == 1 {
-        vec![format!("last_insert_id_{bare}{suffix}")]
-    } else {
-        pk_cols
-            .iter()
-            .map(|c| format!("last_insert_{bare}_{}{suffix}", c.name))
-            .collect()
-    };
+    let single = pk_cols.len() == 1;
+    let pk_vars: Vec<(String, PkSource)> = pk_cols
+        .iter()
+        .map(|pk| {
+            let name = if single {
+                format!("last_insert_id_{bare}{suffix}")
+            } else {
+                format!("last_insert_{bare}_{}{suffix}", pk.name)
+            };
+            // A value already given (Some or explicit NULL) always wins over
+            // how the column would otherwise have been filled — matching
+            // step 2 above, which also skips a given column outright.
+            let source = if let Some((_, v)) = values.iter().find(|(c, _)| c == &pk.name) {
+                match v {
+                    Some(s) => PkSource::Known(s.clone()),
+                    // Given <<null>>: MySQL/MariaDB treat NULL into an
+                    // AUTO_INCREMENT column the same as omitting it, so it
+                    // still generates — anything else given as NULL has
+                    // nothing to report.
+                    None if pk.is_identity => PkSource::AutoIncrement,
+                    None => PkSource::Unknown(pk.name.clone()),
+                }
+            } else if pk.is_identity {
+                PkSource::AutoIncrement
+            } else if let Some(id) = generated_uuids.get(&pk.name) {
+                PkSource::Known(id.clone())
+            } else {
+                // has_default but not identity: a server-side DEFAULT we
+                // cannot read back without RETURNING.
+                PkSource::Unknown(pk.name.clone())
+            };
+            (name, source)
+        })
+        .collect();
+
+    // Refuse before the INSERT runs, not after: a platform with no RETURNING
+    // and a PK column with no source would otherwise commit the row and only
+    // then report failure (invariant 1 — check everything checkable first).
+    if !has_returning
+        && let Some((_, PkSource::Unknown(col))) =
+            pk_vars.iter().find(|(_, s)| matches!(s, PkSource::Unknown(_)))
+    {
+        return Err(format!(
+            "primary key {col} is server-generated (a DEFAULT that is not auto-increment) \
+             and this platform has no RETURNING to read it back with — give the value explicitly"
+        ));
+    }
 
     Ok(InsertPlan {
         sql,
         binds,
-        var_names,
         logs,
+        has_returning,
+        pk_vars,
     })
 }
 
@@ -251,8 +323,12 @@ pub fn build_exists(
 
 #[cfg(test)]
 mod tests {
-    use super::super::platform::PG;
+    use super::super::platform::{MARIADB, MYSQL, PG};
     use super::*;
+
+    fn names(p: &InsertPlan) -> Vec<&str> {
+        p.pk_vars.iter().map(|(n, _)| n.as_str()).collect()
+    }
 
     fn col(
         name: &str,
@@ -307,7 +383,7 @@ mod tests {
         assert_eq!(p.binds.len(), 2);
         assert_eq!(p.binds[0], Some("a@b.net".to_string()));
         assert!(uuid::Uuid::parse_str(p.binds[1].as_ref().unwrap()).is_ok());
-        assert_eq!(p.var_names, vec!["last_insert_id_users"]);
+        assert_eq!(names(&p), vec!["last_insert_id_users"]);
     }
 
     #[test]
@@ -332,7 +408,7 @@ mod tests {
             p.sql,
             "INSERT INTO companies (slug) VALUES ($1::text) RETURNING (id)::text"
         );
-        assert_eq!(p.var_names, vec!["last_insert_id_companies"]);
+        assert_eq!(names(&p), vec!["last_insert_id_companies"]);
     }
 
     #[test]
@@ -394,10 +470,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(
-            p.var_names,
-            vec!["last_insert_pair_a", "last_insert_pair_b"]
-        );
+        assert_eq!(names(&p), vec!["last_insert_pair_a", "last_insert_pair_b"]);
         assert!(
             p.sql.ends_with("RETURNING (a)::text, (b)::text"),
             "{}",
@@ -416,7 +489,7 @@ mod tests {
             Some(3),
         )
         .unwrap();
-        assert_eq!(p.var_names, vec!["last_insert_id_users_3"]);
+        assert_eq!(names(&p), vec!["last_insert_id_users_3"]);
     }
 
     fn companies() -> TableSchema {
@@ -507,5 +580,141 @@ mod tests {
         )
         .unwrap();
         assert_eq!(sql, "SELECT 1 FROM companies WHERE slug = $1::text LIMIT 1");
+    }
+
+    // companies(id int auto_increment pk, slug text not null) — MySQL/MariaDB shape:
+    // is_identity true, has_default false (auto_increment is its own thing, not a
+    // DEFAULT in information_schema's sense).
+    fn mysql_companies() -> TableSchema {
+        TableSchema {
+            columns: vec![
+                col("id", "int", true, false, true, true),
+                col("slug", "text", true, false, false, false),
+            ],
+        }
+    }
+
+    #[test]
+    fn no_returning_and_no_value_reads_the_pk_off_auto_increment() {
+        let p = build_insert(
+            &MYSQL,
+            &mysql_companies(),
+            "companies",
+            "companies",
+            &[("slug".into(), Some("x".into()))],
+            None,
+        )
+        .unwrap();
+        assert!(!p.has_returning);
+        assert_eq!(
+            p.pk_vars,
+            vec![("last_insert_id_companies".into(), PkSource::AutoIncrement)]
+        );
+    }
+
+    #[test]
+    fn no_returning_and_a_given_value_is_known_even_on_an_identity_column() {
+        let p = build_insert(
+            &MYSQL,
+            &mysql_companies(),
+            "companies",
+            "companies",
+            &[
+                ("id".into(), Some("5".into())),
+                ("slug".into(), Some("x".into())),
+            ],
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            p.pk_vars,
+            vec![("last_insert_id_companies".into(), PkSource::Known("5".into()))]
+        );
+    }
+
+    #[test]
+    fn no_returning_and_an_explicit_null_on_an_identity_column_is_still_auto_increment() {
+        // <<null>> given for id: MySQL/MariaDB generate on NULL into
+        // AUTO_INCREMENT exactly as they do when the column is omitted —
+        // reported as Unknown here would be both the wrong diagnosis and
+        // wrong advice ("give the value explicitly" on a column that just did).
+        let p = build_insert(
+            &MYSQL,
+            &mysql_companies(),
+            "companies",
+            "companies",
+            &[("id".into(), None), ("slug".into(), Some("x".into()))],
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            p.pk_vars,
+            vec![("last_insert_id_companies".into(), PkSource::AutoIncrement)]
+        );
+    }
+
+    #[test]
+    fn no_returning_and_a_client_uuid_is_known_before_the_insert_runs() {
+        // A lone char(36) PK with no default: MySQL's wants_client_uuid is
+        // true for it, so build_insert generates the value up front — it is
+        // Known, not AutoIncrement, even with no RETURNING to fall back on.
+        let s = TableSchema {
+            columns: vec![Column {
+                name: "id".into(),
+                type_name: "char".into(),
+                length: Some(36),
+                not_null: true,
+                has_default: false,
+                is_identity: false,
+                is_pk: true,
+            }],
+        };
+        let p = build_insert(&MYSQL, &s, "users", "users", &[], None).unwrap();
+        assert!(!p.has_returning);
+        let (name, source) = &p.pk_vars[0];
+        assert_eq!(name, "last_insert_id_users");
+        match source {
+            PkSource::Known(id) => assert!(uuid::Uuid::parse_str(id).is_ok(), "{id}"),
+            other => panic!("expected a client-generated uuid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_returning_and_a_non_identity_default_pk_is_refused_before_the_insert_runs() {
+        // A server-side DEFAULT that is not AUTO_INCREMENT: has_default true,
+        // is_identity false. MySQL has no RETURNING to read it back with, so
+        // build_insert must refuse — before returning a plan, per invariant 1.
+        let s = TableSchema {
+            columns: vec![
+                col("id", "int", true, true, false, true),
+                col("tag", "text", true, false, false, false),
+            ],
+        };
+        let err = build_insert(&MYSQL, &s, "defaulted", "defaulted", &[("tag".into(), Some("x".into()))], None)
+            .unwrap_err();
+        assert!(err.contains("id"), "{err}");
+        assert!(err.contains("server-generated"), "{err}");
+    }
+
+    #[test]
+    fn the_same_non_identity_default_pk_is_fine_under_returning() {
+        // Identical schema, MariaDB instead: RETURNING exists, so the same
+        // "no source" shape that MySQL must refuse is simply read back.
+        let s = TableSchema {
+            columns: vec![
+                col("id", "int", true, true, false, true),
+                col("tag", "text", true, false, false, false),
+            ],
+        };
+        let p = build_insert(
+            &MARIADB,
+            &s,
+            "defaulted",
+            "defaulted",
+            &[("tag".into(), Some("x".into()))],
+            None,
+        )
+        .unwrap();
+        assert!(p.has_returning);
     }
 }

@@ -8,7 +8,7 @@ use tokio::sync::{Mutex, MutexGuard};
 
 /// The `apibdd_it` schema is shared across all tests; serialize them so that
 /// one test recreating the fixture does not collide with another.
-static DB_LOCK: Mutex<()> = Mutex::const_new(());
+pub(crate) static DB_LOCK: Mutex<()> = Mutex::const_new(());
 
 #[derive(Clone, Copy, Default)]
 struct TimingRow {

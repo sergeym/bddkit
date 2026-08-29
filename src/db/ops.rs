@@ -1,4 +1,4 @@
-use crate::db::plan::{self, InsertPlan};
+use crate::db::plan::{self, InsertPlan, PkSource};
 use crate::db::platform::Platform;
 use crate::db::reference::TableRef;
 use crate::db::{bind_all, text_col, value};
@@ -47,30 +47,70 @@ pub async fn insert(
     let InsertPlan {
         sql,
         binds,
-        var_names,
         logs,
+        has_returning,
+        pk_vars,
     } = plan::build_insert(platform, &schema, &tref.sql_name(), &tref.table, values, index)?;
     log_sql(w, &sql, &binds, &logs);
 
-    if var_names.is_empty() {
+    if pk_vars.is_empty() {
         bind_all(sqlx::query(&sql), &binds)
             .execute(pool)
             .await
             .map_err(|e| format!("INSERT into {}: {e}", tref.sql_name()))?;
         return Ok(());
     }
-    let row = bind_all(sqlx::query(&sql), &binds)
-        .fetch_one(pool)
-        .await
-        .map_err(|e| format!("INSERT into {}: {e}", tref.sql_name()))?;
-    // PK values come back as text, per Platform::returning, in var_names order.
-    let mut assignments: Vec<(String, String)> = Vec::new();
-    for (i, name) in var_names.iter().enumerate() {
-        let v = text_col(&row, i)
-            .map_err(|e| format!("reading RETURNING: {e}"))?
-            .ok_or_else(|| "reading RETURNING: unexpected NULL".to_string())?;
-        assignments.push((name.clone(), v));
-    }
+
+    let assignments: Vec<(String, String)> = if has_returning {
+        let row = bind_all(sqlx::query(&sql), &binds)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| format!("INSERT into {}: {e}", tref.sql_name()))?;
+        // PK values come back as text, per Platform::returning, in pk_vars order.
+        let mut assignments = Vec::new();
+        for (i, (name, _)) in pk_vars.iter().enumerate() {
+            let v = text_col(&row, i)
+                .map_err(|e| format!("reading RETURNING: {e}"))?
+                .ok_or_else(|| "reading RETURNING: unexpected NULL".to_string())?;
+            assignments.push((name.clone(), v));
+        }
+        assignments
+    } else {
+        // No RETURNING (MySQL): a plain INSERT. build_insert has already
+        // refused any PkSource::Unknown here, so only Known/AutoIncrement
+        // reach this match — reading an auto-increment id off the INSERT's
+        // own AnyQueryResult, never a second query: that query would run over
+        // a pooled connection that hands the next statement to whichever
+        // connection is free, and under concurrency that is normally another
+        // file's id, not rarely.
+        let result = bind_all(sqlx::query(&sql), &binds)
+            .execute(pool)
+            .await
+            .map_err(|e| format!("INSERT into {}: {e}", tref.sql_name()))?;
+        let mut assignments = Vec::new();
+        for (name, source) in &pk_vars {
+            let v = match source {
+                PkSource::Known(v) => v.clone(),
+                PkSource::AutoIncrement => result
+                    .last_insert_id()
+                    // 0 is what MySQL's OK packet carries when nothing was
+                    // generated — not a real id, so it must not become one.
+                    .filter(|id| *id > 0)
+                    .ok_or_else(|| {
+                        format!(
+                            "INSERT into {}: expected an auto-increment id in the INSERT result, got none",
+                            tref.sql_name()
+                        )
+                    })?
+                    .to_string(),
+                PkSource::Unknown(col) => unreachable!(
+                    "build_insert refuses PkSource::Unknown ({col}) before returning a plan when has_returning is false"
+                ),
+            };
+            assignments.push((name.clone(), v));
+        }
+        assignments
+    };
     // The pool borrow has ended — now it's safe to write variables.
     for (name, v) in assignments {
         w.vars.set(&name, v);
