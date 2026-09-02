@@ -31,6 +31,7 @@ pub struct Library {
     dispatch: DispatchFn,
     drop_instance: HandleFn,
     reset_scenario: Option<HandleFn>,
+    probe_config: Option<JsonFn>,
     free_string: FreeFn,
     _library: libloading::Library,
 }
@@ -114,6 +115,11 @@ impl Library {
         let reset_scenario: Option<HandleFn> = unsafe { library.get(b"bddkit_reset_scenario\0") }
             .ok()
             .map(|symbol| *symbol);
+        // Optional in the same way: a plugin that cannot check reachability
+        // simply has no live check, which is reported as "not available".
+        let probe_config: Option<JsonFn> = unsafe { library.get(b"bddkit_probe_config\0") }
+            .ok()
+            .map(|symbol| *symbol);
 
         // SAFETY: `manifest_fn` takes no arguments, and the pointer it returns
         // is handed straight back to this same plugin's `free_string` inside
@@ -151,6 +157,7 @@ impl Library {
             dispatch,
             drop_instance,
             reset_scenario,
+            probe_config,
             free_string,
             _library: ManuallyDrop::into_inner(library),
         })
@@ -161,10 +168,21 @@ impl Library {
     }
 
     pub fn validate_config(&self, request: &str) -> Result<Result<(), String>> {
-        let reply = self.call_json(self.validate_config, request, "validate_config")?;
-        let envelope: Envelope = serde_json::from_str(&reply)
-            .with_context(|| self.malformed("validate_config", &reply))?;
-        Ok(envelope.into_result())
+        self.envelope_call(self.validate_config, request, "validate_config")
+    }
+
+    /// `None` means the plugin exports no probe at all — "not available",
+    /// never a failure. `reset_scenario` can answer `Ok` when it is absent
+    /// because "no per-scenario state to clear" genuinely is success; a
+    /// reachability check that never ran has proved nothing, so the caller
+    /// must be able to tell the two apart.
+    ///
+    /// Called by nothing in the host yet: the CLI surface that asks the
+    /// question is separate work, and the ABI half belongs here regardless.
+    #[allow(dead_code)]
+    pub fn probe_config(&self, request: &str) -> Option<Result<Result<(), String>>> {
+        let function = self.probe_config?;
+        Some(self.envelope_call(function, request, "probe_config"))
     }
 
     pub fn init_instance(&self, request: &str) -> Result<Result<u64, String>> {
@@ -201,6 +219,19 @@ impl Library {
         let reply = self.call_handle(function, handle, "reset_scenario")?;
         let envelope: Envelope = serde_json::from_str(&reply)
             .with_context(|| self.malformed("reset_scenario", &reply))?;
+        Ok(envelope.into_result())
+    }
+
+    /// The shared body of the two `JsonFn` calls that reply with an envelope.
+    fn envelope_call(
+        &self,
+        function: JsonFn,
+        request: &str,
+        what: &str,
+    ) -> Result<Result<(), String>> {
+        let reply = self.call_json(function, request, what)?;
+        let envelope: Envelope =
+            serde_json::from_str(&reply).with_context(|| self.malformed(what, &reply))?;
         Ok(envelope.into_result())
     }
 
@@ -475,5 +506,37 @@ mod tests {
     #[test]
     fn a_plugin_without_a_reset_loads_at_any_concurrency() {
         check_reset_scenario("echo", Concurrency::Shared, false, 8).expect("allowed");
+    }
+
+    #[test]
+    fn probe_config_reaches_the_plugin() {
+        let lib = Library::load("echo", &fixture()).expect("loads");
+        let ok = lib
+            .probe_config(r#"{"group":"echo","instance":"a","config":{"prefix":"p-"}}"#)
+            .expect("the fixture exports a probe")
+            .expect("call succeeds");
+        assert!(ok.is_ok(), "{ok:?}");
+
+        let bad = lib
+            .probe_config(
+                r#"{"group":"echo","instance":"a","config":{"prefix":"p-","probe_error":"endpoint refused the connection"}}"#,
+            )
+            .expect("the fixture exports a probe")
+            .expect("call succeeds");
+        assert_eq!(bad.unwrap_err(), "endpoint refused the connection");
+    }
+
+    #[test]
+    fn a_plugin_without_a_probe_reports_no_probe_rather_than_a_failure() {
+        // The distinction is the whole point of the outer Option: an absent
+        // live check is "not available", never "the configuration is broken".
+        // `reset_scenario` can answer Ok when absent because "nothing to
+        // reset" really is success; a probe that never ran proved nothing.
+        let mut lib = Library::load("echo", &fixture()).expect("loads");
+        lib.probe_config = None;
+        assert!(
+            lib.probe_config(r#"{"group":"echo","instance":"a","config":{}}"#)
+                .is_none()
+        );
     }
 }

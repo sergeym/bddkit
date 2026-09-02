@@ -54,6 +54,37 @@ pub struct Manifest {
     pub groups: Vec<String>,
     #[serde(default)]
     pub concurrency: Concurrency,
+    /// What the `resources.<group>` body of each claimed group takes, keyed by
+    /// group because one manifest may claim several. Optional and defaulted:
+    /// a plugin that describes nothing stays fully supported, which is why
+    /// `ABI_VERSION` does not move for it.
+    ///
+    /// Read by nothing in the host yet — the CLI surface that prints it is
+    /// separate work — but deserialised on every load, so the shape both
+    /// sides implement against is pinned here and not only in the document.
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub fields: BTreeMap<String, Vec<ConfigField>>,
+}
+
+/// One key of a group's instance config, as the plugin describes it.
+///
+/// Deliberately **not** JSON Schema: no types, no nesting, no constraints, no
+/// validation semantics. The host prints these and interprets none of them.
+/// Anything richer would make the host reason about plugin config, which is
+/// the boundary `bddkit_validate_config` exists to keep — and since the
+/// enforcing half already exists, a second, weaker copy in the manifest could
+/// only ever disagree with it.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConfigField {
+    pub name: String,
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub example: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -402,5 +433,37 @@ mod tests {
         )
         .expect("a newer plugin's extra keys do not break an older host");
         assert_eq!(manifest.name, "widget");
+    }
+
+    #[test]
+    fn a_manifest_declares_the_config_fields_of_each_group() {
+        // The host prints these and interprets none of them: `fields` is
+        // documentation the plugin owns, never a second, weaker copy of the
+        // check `validate_config` already enforces.
+        let m: Manifest = serde_json::from_str(
+            r#"{"name":"s3","version":"1.2.0","groups":["s3"],"fields":{
+                "s3":[{"name":"bucket","required":true,
+                       "description":"bucket the steps read and write","example":"acceptance"},
+                      {"name":"endpoint","description":"S3-compatible endpoint; omit for AWS"}]}}"#,
+        )
+        .expect("manifest parses");
+        let s3 = &m.fields["s3"];
+        assert_eq!(s3[0].name, "bucket");
+        assert!(s3[0].required);
+        assert_eq!(s3[0].description.as_deref(), Some("bucket the steps read and write"));
+        assert_eq!(s3[0].example.as_deref(), Some("acceptance"));
+        assert_eq!(s3[1].name, "endpoint");
+        assert!(!s3[1].required, "required defaults to false");
+        assert!(s3[1].example.is_none());
+    }
+
+    #[test]
+    fn a_manifest_without_fields_parses_to_an_empty_map() {
+        // Additive, so `ABI_VERSION` does not move: a plugin published before
+        // the key existed keeps loading and simply describes nothing.
+        let m: Manifest =
+            serde_json::from_str(r#"{"name":"x","version":"0.1.0","groups":["x"]}"#)
+                .expect("manifest parses");
+        assert!(m.fields.is_empty());
     }
 }

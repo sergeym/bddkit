@@ -32,7 +32,7 @@ serde_json = "1.0"
 
 The build produces `libbddkit_s3.so` (Linux), `libbddkit_s3.dylib` (macOS) or `bddkit_s3.dll` (Windows) in `target/<profile>/`. That file's path is what goes into the lock file in section 7.
 
-**`tests/fixtures/echo-plugin/` in the bddkit repository is a complete, working plugin — 230 lines, every export, every reply shape, the panic guard, the NUL handling.** Copy it and replace the body. It is also what the host's own test suite runs against, so it cannot rot: a change to the ABI that the fixture does not follow turns the suite red.
+**`tests/fixtures/echo-plugin/` in the bddkit repository is a complete, working plugin — 260 lines, every export, every reply shape, the panic guard, the NUL handling.** Copy it and replace the body. It is also what the host's own test suite runs against, so it cannot rot: a change to the ABI that the fixture does not follow turns the suite red.
 
 For a plugin that does real work rather than echoing its arguments back, read
 [`sergeym/bddkit-s3`](https://github.com/sergeym/bddkit-s3): an S3/MinIO plugin
@@ -57,11 +57,20 @@ inside it, and refusing a file name that arrived from a `.feature` file.
 | `bddkit_dispatch` | `(u64, u32, *const c_char) -> *mut c_char` | yes |
 | `bddkit_drop_instance` | `(u64) -> *mut c_char` | yes |
 | `bddkit_reset_scenario` | `(u64) -> *mut c_char` | no |
+| `bddkit_probe_config` | `(*const c_char) -> *mut c_char` | no |
 | `bddkit_free_string` | `(*mut c_char)` | yes |
 
 A missing required symbol fails the load with a message naming the symbol. **Returning NULL from any of the string-returning exports is an error**, reported as "plugin `<name>` returned nothing from `<call>`" — there is no reply shape that means "nothing to say"; say it with an envelope.
 
 At load the host does, in order: `dlopen`; call `bddkit_abi_version` and refuse anything but `1`; resolve every required symbol, then `bddkit_reset_scenario` if it is exported; call `bddkit_manifest`; refuse a manifest whose `name` differs from the lock entry's name, or whose `groups` is empty, or whose `concurrency` is a value outside the closed set of section 6; call `bddkit_list_steps`; refuse any step whose `group` the manifest does not claim; refuse a plugin that declares `shared`, exports `bddkit_reset_scenario`, and meets a run whose `concurrency` is greater than 1 (see that export below). Nothing else is called until a scenario reaches a step.
+
+Three questions can be asked about a `resources.<group>` entry, and each has its own mechanism. Together they state the boundary this document draws: the host knows *that* a group has a config, the plugin knows *what* it means, and only the plugin can find out whether it works.
+
+| Question | Mechanism | Opens a connection |
+|---|---|---|
+| What keys does this group take? | `fields` in the manifest | no |
+| Is this config well-formed? | `bddkit_validate_config` | no |
+| Does it actually reach anything? | `bddkit_probe_config` | yes |
 
 ### `bddkit_abi_version`
 
@@ -74,7 +83,13 @@ Returns `1`. This is the one call made before the version is known, so it is an 
   "name": "s3",
   "version": "1.2.0",
   "groups": ["s3"],
-  "concurrency": "shared"
+  "concurrency": "shared",
+  "fields": {
+    "s3": [
+      { "name": "bucket",   "required": true,  "description": "bucket the steps read and write", "example": "acceptance" },
+      { "name": "endpoint", "required": false, "description": "S3-compatible endpoint; omit for AWS" }
+    ]
+  }
 }
 ```
 
@@ -82,8 +97,15 @@ Returns `1`. This is the one call made before the version is known, so it is an 
 - `version` (string, required) — required so a manifest without one is a load failure; the host does not otherwise compare it against anything.
 - `groups` (array of strings, required, non-empty) — the `resources.<group>` sections this plugin serves. Two loaded plugins may not claim the same group, and section 8 lists the names that are reserved.
 - `concurrency` (string, optional, default `"shared"`) — see section 6.
+- `fields` (object, optional) — what each group's `resources.<group>.<instance>` body accepts, keyed by group because one manifest may claim several. Describe only groups this manifest claims. Describing nothing is fine, and is what a plugin written before this key existed does.
 
-Unknown keys are ignored, so a newer plugin can add fields without breaking an older host.
+Each entry is `{ "name", "required", "description", "example" }`. `name` is the only required one; `required` defaults to `false`, and `description` and `example` default to absent. **`example` is always a string**, including for a key whose value is a boolean or a number — write `"example": "true"`, never `"example": true`. A non-string fails the parse of the whole manifest, and the plugin then does not load at all, with a message about a malformed manifest that does not mention `example`. It is a hint for whoever writes the config, not a value a tool pastes in: the config for that key still takes `true`.
+
+This is deliberately **not** JSON Schema: no types, no nesting, no constraints, no validation semantics. The host prints these and interprets none of them. Enforcement is `bddkit_validate_config`'s job, which is the boundary this whole document keeps — a second, weaker copy of the rules here could only ever disagree with the first. Carry what the four keys cannot express in `description`: that a key is a boolean, that it has a default, that it needs a scheme.
+
+Describing a key you do not accept, or accepting one you do not describe, is a bug of exactly the kind the `bddkit_list_steps` index note warns about. If your `validate_config` checks the config against a list of known keys, derive one list from the other or keep them adjacent, so a key added to one cannot be missed in the other.
+
+Unknown keys are ignored, so a newer plugin can add manifest keys without breaking an older host.
 
 ### `bddkit_list_steps`
 
@@ -139,6 +161,22 @@ Reply — the **envelope**, shared with `drop_instance` and `reset_scenario`:
 ```
 
 `error` is optional; if it is missing on a failure the host substitutes "the plugin reported a failure with no message" rather than losing the failure. Always send one — the host prefixes it with `resources.<group>.<instance>: `, so write the part after the colon.
+
+### `bddkit_probe_config`
+
+Optional, and the live counterpart of `validate_config`: the one call that is allowed to open a connection. A plugin that does not export it simply has no live check, and that is reported as **not available** — never as a failure. This is where a probe differs from `bddkit_reset_scenario`, which the host treats as `ok` when it is absent: having no per-scenario state to clear really is success, while a reachability check that never ran has proved nothing.
+
+Request: identical to `validate_config`. Reply: the same envelope.
+
+**Stateless.** There is no handle, no `init_instance` beforehand and no `drop_instance` after: build whatever client you need, answer, and tear it down before you reply. A handle-based probe would make every caller run a three-call lifecycle and own the cleanup on each error path, for a call that happens once and holds nothing.
+
+**Never called during a run.** No scenario probes. This is asked by a person or a script that wants to know whether a configuration reaches anything, so it is allowed to be slow and allowed to need the network — the two things `validate_config` must never be.
+
+The split from `validate_config` is the point of having both. `validate_config` runs eagerly at startup for every declared instance, which is what turns a config typo into exit code 2 before the first request; that only works because it connects to nothing and cannot hang. Do not "strengthen" it into a reachability check. Put the reachability check here.
+
+Say what failed, not which layer failed: an endpoint that does not answer, a bucket that does not exist and credentials the server rejected are three different problems, and the error text is the entire value of this call.
+
+The `echo` fixture is the exception that proves the shape rather than the substance: it has nothing to reach, so its probe just returns whatever `probe_error` holds in the instance config. Copy its structure — the guard, the parse, the envelope — and put your client where its `match` is.
 
 ### `bddkit_init_instance`
 

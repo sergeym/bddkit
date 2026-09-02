@@ -67,7 +67,16 @@ pub extern "C" fn bddkit_manifest() -> *mut c_char {
     // guarded" is an invariant a reader can check, "this one happens to be
     // safe" is a judgement each future edit has to make again.
     guard("envelope", || {
-        r#"{"name":"echo","version":"0.1.0","groups":["echo"],"concurrency":"shared"}"#.to_string()
+        serde_json::json!({
+            "name": "echo", "version": "0.1.0", "groups": ["echo"], "concurrency": "shared",
+            "fields": {"echo": [
+                {"name": "prefix", "required": true,
+                 "description": "prepended to every echoed value", "example": "p-"},
+                {"name": "probe_error",
+                 "description": "message bddkit_probe_config answers with; omit to probe clean"}
+            ]}
+        })
+        .to_string()
     })
 }
 
@@ -96,6 +105,26 @@ pub extern "C" fn bddkit_validate_config(request: *const c_char) -> *mut c_char 
         match value["config"]["prefix"].as_str() {
             Some(_) => r#"{"ok":true}"#.to_string(),
             None => r#"{"ok":false,"error":"echo instance requires a string \"prefix\""}"#.to_string(),
+        }
+    })
+}
+
+/// Optional: the live half of the config contract. `validate_config` above is
+/// pure and offline because the host runs it eagerly for every declared
+/// instance; this one is allowed to be slow and to open a connection, and runs
+/// only when somebody asks. Echo has nothing to reach, so the failure branch
+/// is config-driven — a real plugin puts its client here.
+#[unsafe(no_mangle)]
+pub extern "C" fn bddkit_probe_config(request: *const c_char) -> *mut c_char {
+    guard("envelope", move || {
+        let raw = input(request);
+        let value: serde_json::Value = match serde_json::from_str(&raw) {
+            Ok(v) => v,
+            Err(e) => return serde_json::json!({"ok": false, "error": e.to_string()}).to_string(),
+        };
+        match value["config"]["probe_error"].as_str() {
+            Some(error) => serde_json::json!({"ok": false, "error": error}).to_string(),
+            None => r#"{"ok":true}"#.to_string(),
         }
     })
 }
