@@ -115,7 +115,7 @@ APP_ENV: dev
 static checks only — pass --live to also probe the resources
 ```
 
-A bare `doctor` opens no socket: it is fast, offline and deterministic, so it works on a train and a `base_url` pointing at a closed port is not a finding. `--live` adds the one class of check a run does not have — whether the resources the config names actually answer: a `GET` at each `base_url` (any status means reachable) and a real connection to each database, named individually so one dead DSN says which.
+A bare `doctor` opens no socket: it is fast, offline and deterministic, so it works on a train and a `base_url` pointing at a closed port is not a finding. `--live` adds the one class of check a run does not have — whether the resources the config names actually answer: a `GET` at each `base_url` (any status means reachable), a real connection to each database, and each declared plugin instance asked to probe its own resource, every one named individually so one dead DSN says which. A plugin that exports no probe is reported as skipped, never as a failure — a check that never ran has proved nothing.
 
 `bddkit doctor` flags: `--config` (required), `--env` to pick a `.env.<name>` layer, `--live`, `--json`. Exit codes: `0` clean, `1` anything was reported — never `2`, so a script's rule is simply "0 or fix something".
 
@@ -148,6 +148,20 @@ api:
 ```
 
 `--json` emits the same listing machine-readably, with the raw pattern included. `--config <file>` also loads that suite's plugins, so their steps appear under their own groups. Descriptions follow `--lang`, else `$BDDKIT_LANG`, else English; `ru` and `lv` ship with the binary, and an untranslated step falls back to English rather than to a blank line.
+
+## What a resource's config takes
+
+`bddkit resource fields` prints the keys each kind of `resources` entry accepts, which key is mandatory, and what it is for:
+
+```console
+$ bddkit resource fields db
+db:
+  dsn               required  connection string; its scheme selects the engine (postgres://, mysql://)
+  search_path                 Postgres schema search path; refused on MySQL and MariaDB, which have no session equivalent
+  options                     polling.timeout_secs / polling.interval_ms for eventual assertions against this connection
+```
+
+Narrow it with a positional kind (`api`, `db`, `srp`, or a plugin's group). `--config <file>` also loads that suite's plugins, so the groups they serve are described too — by the plugins themselves, since only a plugin knows what its own group takes. A plugin whose manifest describes nothing says so and is not an error. `--json` emits the same listing machine-readably.
 
 ## Config
 

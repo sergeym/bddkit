@@ -62,7 +62,7 @@ inside it, and refusing a file name that arrived from a `.feature` file.
 
 A missing required symbol fails the load with a message naming the symbol. **Returning NULL from any of the string-returning exports is an error**, reported as "plugin `<name>` returned nothing from `<call>`" — there is no reply shape that means "nothing to say"; say it with an envelope.
 
-At load the host does, in order: `dlopen`; call `bddkit_abi_version` and refuse anything but `1`; resolve every required symbol, then `bddkit_reset_scenario` if it is exported; call `bddkit_manifest`; refuse a manifest whose `name` differs from the lock entry's name, or whose `groups` is empty, or whose `concurrency` is a value outside the closed set of section 6; call `bddkit_list_steps`; refuse any step whose `group` the manifest does not claim; refuse a plugin that declares `shared`, exports `bddkit_reset_scenario`, and meets a run whose `concurrency` is greater than 1 (see that export below). Nothing else is called until a scenario reaches a step.
+At load the host does, in order: `dlopen`; call `bddkit_abi_version` and refuse anything but `1`; resolve every required symbol, then `bddkit_reset_scenario` if it is exported; call `bddkit_manifest`; refuse a manifest whose `name` differs from the lock entry's name, or whose `groups` is empty, or whose `concurrency` is a value outside the closed set of section 6; refuse a manifest that describes the config of a group it does not claim; call `bddkit_list_steps`; refuse any step whose `group` the manifest does not claim; refuse a plugin that declares `shared`, exports `bddkit_reset_scenario`, and meets a run whose `concurrency` is greater than 1 (see that export below). Nothing else is called until a scenario reaches a step.
 
 Three questions can be asked about a `resources.<group>` entry, and each has its own mechanism. Together they state the boundary this document draws: the host knows *that* a group has a config, the plugin knows *what* it means, and only the plugin can find out whether it works.
 
@@ -97,7 +97,7 @@ Returns `1`. This is the one call made before the version is known, so it is an 
 - `version` (string, required) — required so a manifest without one is a load failure; the host does not otherwise compare it against anything.
 - `groups` (array of strings, required, non-empty) — the `resources.<group>` sections this plugin serves. Two loaded plugins may not claim the same group, and section 8 lists the names that are reserved.
 - `concurrency` (string, optional, default `"shared"`) — see section 6.
-- `fields` (object, optional) — what each group's `resources.<group>.<instance>` body accepts, keyed by group because one manifest may claim several. Describe only groups this manifest claims. Describing nothing is fine, and is what a plugin written before this key existed does.
+- `fields` (object, optional) — what each group's `resources.<group>.<instance>` body accepts, keyed by group because one manifest may claim several. A key naming a group this manifest does not claim fails the load, for the same reason an unclaimed step group does: it would shadow the description of whichever plugin legitimately owns it. Describing nothing is fine, and is what a plugin written before this key existed does. This is what `bddkit resource fields --config <suite>` prints, beside the keys the host's own `api`, `db` and `srp` entries take.
 
 Each entry is `{ "name", "required", "description", "example" }`. `name` is the only required one; `required` defaults to `false`, and `description` and `example` default to absent. **`example` is always a string**, including for a key whose value is a boolean or a number — write `"example": "true"`, never `"example": true`. A non-string fails the parse of the whole manifest, and the plugin then does not load at all, with a message about a malformed manifest that does not mention `example`. It is a hint for whoever writes the config, not a value a tool pastes in: the config for that key still takes `true`.
 
@@ -167,6 +167,8 @@ Reply — the **envelope**, shared with `drop_instance` and `reset_scenario`:
 Optional, and the live counterpart of `validate_config`: the one call that is allowed to open a connection. A plugin that does not export it simply has no live check, and that is reported as **not available** — never as a failure. This is where a probe differs from `bddkit_reset_scenario`, which the host treats as `ok` when it is absent: having no per-scenario state to clear really is success, while a reachability check that never ran has proved nothing.
 
 Request: identical to `validate_config`. Reply: the same envelope.
+
+Called by `bddkit doctor --live`, once per declared instance of your groups. A plugin that does not export it gets a `skipped` row saying so, not a failed one.
 
 **Stateless.** There is no handle, no `init_instance` beforehand and no `drop_instance` after: build whatever client you need, answer, and tear it down before you reply. A handle-based probe would make every caller run a three-call lifecycle and own the cleanup on each error path, for a call that happens once and holds nothing.
 

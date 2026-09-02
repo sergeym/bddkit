@@ -59,10 +59,10 @@ pub struct Manifest {
     /// a plugin that describes nothing stays fully supported, which is why
     /// `ABI_VERSION` does not move for it.
     ///
-    /// Read by nothing in the host yet — the CLI surface that prints it is
-    /// separate work — but deserialised on every load, so the shape both
-    /// sides implement against is pinned here and not only in the document.
-    #[allow(dead_code)]
+    ///
+    /// A key naming a group the manifest does not claim is a load error
+    /// (`library::check_field_groups`), for the same reason an unclaimed step
+    /// group is.
     #[serde(default)]
     pub fields: BTreeMap<String, Vec<ConfigField>>,
 }
@@ -75,7 +75,6 @@ pub struct Manifest {
 /// the boundary `bddkit_validate_config` exists to keep — and since the
 /// enforcing half already exists, a second, weaker copy in the manifest could
 /// only ever disagree with it.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct ConfigField {
     pub name: String,

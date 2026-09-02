@@ -160,6 +160,50 @@ impl Plugins {
         self.groups.keys().cloned().collect()
     }
 
+    /// What a group's `resources.<group>.<instance>` body takes, as the plugin
+    /// that serves it describes it. `None` for a group nothing serves and for
+    /// one whose manifest describes nothing — the two are told apart by
+    /// `group_names`, because "no plugin serves this" is the caller's error and
+    /// "this plugin describes nothing" is not an error at all.
+    pub fn fields_for(&self, group: &str) -> Option<&[abi::ConfigField]> {
+        let lib = &self.libs[*self.groups.get(group)?];
+        lib.manifest.fields.get(group).map(Vec::as_slice)
+    }
+
+    /// Every `(group, instance)` the config declared.
+    pub fn declared_instances(&self) -> Vec<(String, String)> {
+        self.declared.keys().cloned().collect()
+    }
+
+    /// The live half of the config contract: does this instance's config reach
+    /// anything. `None` means the plugin exports no `bddkit_probe_config`,
+    /// which is "not available" and never a failure — a check that never ran
+    /// has proved nothing either way. So is a group nothing serves, which
+    /// `load` has already refused for a declared instance. Everything else
+    /// that goes wrong (an undeclared instance, an encode failure, a malformed
+    /// reply) comes back as `Err`, because to the caller they are all "this
+    /// instance could not be probed".
+    ///
+    /// Blocking, like `call_step`: FFI happens here.
+    pub fn probe_config(&self, group: &str, instance: &str) -> Option<Result<(), String>> {
+        let lib = &self.libs[*self.groups.get(group)?];
+        if !lib.has_probe_config() {
+            return None;
+        }
+        let spec = match self.declared.get(&(group.to_string(), instance.to_string())) {
+            Some(spec) => spec,
+            None => return Some(Err(undeclared(group, instance))),
+        };
+        let request = match self.init_request(spec) {
+            Ok(request) => request,
+            Err(error) => return Some(Err(format!("{error:#}"))),
+        };
+        Some(match lib.probe_config(&request)? {
+            Ok(result) => result,
+            Err(error) => Err(format!("{error:#}")),
+        })
+    }
+
     /// `(lib index, step index, pattern, is assertion)` for registry loading.
     pub fn steps(&self) -> Vec<(usize, usize, String, bool)> {
         let mut out = Vec::new();
@@ -608,6 +652,45 @@ pub(crate) mod tests {
             },
             options: Options::default(),
         }
+    }
+
+    #[test]
+    fn a_group_serves_the_fields_its_manifest_declares() {
+        let plugins = Plugins::load(vec![entry()], &[instance("a", Some("p-"))], &["echo".into()], 1)
+            .expect("loads");
+        let fields = plugins.fields_for("echo").expect("the fixture describes echo");
+        assert_eq!(fields[0].name, "prefix");
+        assert!(fields[0].required, "the fixture declares prefix required");
+        assert_eq!(fields[0].example.as_deref(), Some("p-"));
+        // A group nothing serves has no description, and that is not an error:
+        // the caller asks `group_names` whether the group exists at all.
+        assert!(plugins.fields_for("browser").is_none());
+    }
+
+    #[test]
+    fn a_declared_instance_can_be_probed_live() {
+        let plugins = Plugins::load(vec![entry()], &[instance("a", Some("p-"))], &["echo".into()], 1)
+            .expect("loads");
+        assert_eq!(
+            plugins.declared_instances(),
+            vec![("echo".to_string(), "a".to_string())]
+        );
+        assert_eq!(plugins.probe_config("echo", "a"), Some(Ok(())));
+
+        // The fixture's probe answers with whatever `probe_error` names, which
+        // is how a real plugin reports an endpoint that refused it.
+        let mut spec = instance("b", Some("p-"));
+        spec.config = serde_json::json!({"prefix": "p-", "probe_error": "bucket not found"});
+        let plugins = Plugins::load(vec![entry()], &[spec], &["echo".into()], 1).expect("loads");
+        assert_eq!(
+            plugins.probe_config("echo", "b"),
+            Some(Err("bucket not found".to_string()))
+        );
+        // An instance nothing declared cannot be probed, and says so.
+        let error = plugins
+            .probe_config("echo", "ghost")
+            .expect("the plugin has a probe");
+        assert!(error.expect_err("undeclared").contains("ghost"));
     }
 
     #[test]
