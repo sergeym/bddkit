@@ -976,6 +976,354 @@ async fn without_fail_fast_every_file_still_runs() {
     assert!(stdout.contains("files: 2"), "{stdout}");
 }
 
+/// `doctor` reaches every check a run makes before its first request, and a
+/// bare invocation opens no socket at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn doctor_reports_a_healthy_suite_and_exits_zero() {
+    let base = common::spawn().await;
+
+    let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
+        .args(["doctor", "--config", "tests/acceptance.yaml"])
+        .env("BDDKIT_STUB_URL", &base)
+        .output()
+        .expect("failed to run bddkit");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a sound suite is clean\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+    );
+    assert!(stdout.contains("APP_ENV:"), "{stdout}");
+    assert!(
+        stdout.contains("--live"),
+        "a static run must say what it did not do:\n{stdout}"
+    );
+}
+
+/// Writes a project whose config points at `base`, returning the config path.
+/// An empty `base` declares no API at all, which is how a test makes the exit
+/// code come from somewhere else. `feature` is the whole `.feature` file so a
+/// caller can plant a typo or a tag; an empty one writes no feature file at
+/// all. `extra` is appended after the API block — indented, it adds to
+/// `resources:`; at column 0 it adds a top-level key.
+fn write_doctor_project(name: &str, base: &str, feature: &str, extra: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("bddkit-{name}-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("features")).expect("mkdir");
+    let only = dir.join("features/only.feature");
+    if feature.is_empty() {
+        // A previous run of this test binary may have left one behind.
+        let _ = std::fs::remove_file(&only);
+    } else {
+        std::fs::write(&only, feature).expect("write feature");
+    }
+    let api = if base.is_empty() {
+        "  api: {}\n".to_string()
+    } else {
+        format!("  api:\n    stub:\n      base_url: {base}\n")
+    };
+    let cfg = dir.join("cfg.yaml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "paths: [{}]\nresources:\n{api}{extra}",
+            dir.join("features")
+                .display()
+                .to_string()
+                .replace('\\', "/")
+        ),
+    )
+    .expect("write config");
+    cfg
+}
+
+#[test]
+fn doctor_names_the_file_and_line_of_an_undefined_step() {
+    let cfg = write_doctor_project(
+        "doctor-step",
+        "http://127.0.0.1:1/",
+        "Feature: only\n  Scenario: one\n    When I frobnicate\n",
+        "",
+    );
+
+    let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
+        .args(["doctor", "--config", cfg.to_str().expect("path is UTF-8")])
+        .output()
+        .expect("failed to run bddkit");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "{stdout}");
+    assert!(stdout.contains("only.feature:3"), "{stdout}");
+    assert!(stdout.contains("I frobnicate"), "{stdout}");
+}
+
+/// The promise the command is built on: `doctor` without `--live` must reach a
+/// verdict on a train. The `base_url` here points at a closed port, and the
+/// static run must still come back clean.
+#[test]
+fn doctor_without_live_leaves_an_unreachable_base_url_alone() {
+    let cfg = write_doctor_project(
+        "doctor-offline",
+        "http://127.0.0.1:1/",
+        "Feature: only\n  Scenario: one\n    When I request \"/ping\"\n",
+        "  db:\n    primary:\n      dsn: postgres://u:p@127.0.0.1:1/x\n",
+    );
+
+    let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
+        .args(["doctor", "--config", cfg.to_str().expect("path is UTF-8")])
+        .output()
+        .expect("failed to run bddkit");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a closed port is not a static problem\n{stdout}"
+    );
+    assert!(stdout.contains("live probe skipped"), "{stdout}");
+}
+
+#[test]
+fn doctor_live_reports_an_unreachable_base_url() {
+    let cfg = write_doctor_project(
+        "doctor-live",
+        "http://127.0.0.1:1/",
+        "Feature: only\n  Scenario: one\n    When I request \"/ping\"\n",
+        "",
+    );
+
+    let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
+        .args([
+            "doctor",
+            "--config",
+            cfg.to_str().expect("path is UTF-8"),
+            "--live",
+        ])
+        .output()
+        .expect("failed to run bddkit");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "{stdout}");
+    assert!(stdout.contains("api stub"), "{stdout}");
+    assert!(
+        !stdout.contains("--live"),
+        "the hint belongs to a static run only:\n{stdout}"
+    );
+}
+
+/// `doctor` probes one connection at a time, so a suite with four of them
+/// learns which one is dead — and, because the full-map `Db::connect` returns
+/// at the first failure, so that a second dead DSN is still probed.
+///
+/// Asserted through `--json` and with no API declared: the static `db` row
+/// carries the same name, and an API pointed at a closed port would supply the
+/// exit code on its own, so a laxer test passes with the live probe deleted.
+#[test]
+fn doctor_live_reports_every_dead_connection_by_name() {
+    let cfg = write_doctor_project(
+        "doctor-dsn",
+        "",
+        "Feature: only\n  Scenario: one\n    When I request \"/ping\"\n",
+        "  db:\n    primary:\n      dsn: postgres://u:p@127.0.0.1:1/x\n\
+         \x20   secondary:\n      dsn: postgres://u:p@127.0.0.1:1/y\n\
+         default_db: primary\n",
+    );
+
+    let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
+        .args([
+            "doctor",
+            "--config",
+            cfg.to_str().expect("path is UTF-8"),
+            "--live",
+            "--json",
+        ])
+        .output()
+        .expect("failed to run bddkit");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "{stdout}");
+    let report: Value = serde_json::from_str(&stdout).expect("--json emits JSON only");
+    let checks = report["checks"].as_array().expect("checks is an array");
+    for name in ["primary", "secondary"] {
+        assert!(
+            checks.iter().any(|c| {
+                c["stage"] == "db"
+                    && c["target"] == name
+                    && c["status"] == "failed"
+                    && c["probe"] == true
+            }),
+            "the live probe of {name} must be reported failed:\n{stdout}"
+        );
+    }
+}
+
+/// Every declared SRP resource is validated at startup, not just the default
+/// one. Otherwise a broken `variant:` in a second block sits there until
+/// someone points `default_srp` at it — and `doctor`, which reports on every
+/// declared resource, would be stricter than the run it is meant to predict.
+#[test]
+fn run_refuses_a_malformed_srp_resource_that_is_not_the_default() {
+    let cfg = write_doctor_project(
+        "run-srp",
+        "http://127.0.0.1:1/",
+        "Feature: only\n  Scenario: one\n    When I request \"/ping\"\n",
+        "  srp:\n    good:\n      variant: hex-string\n    legacy:\n      variant: bogus\n\
+         default_srp: good\n",
+    );
+
+    let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
+        .args(["run", "--config", cfg.to_str().expect("path is UTF-8")])
+        .output()
+        .expect("failed to run bddkit");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a malformed resource is a startup failure, not a scenario failure\n{stderr}"
+    );
+    assert!(
+        stderr.contains("legacy"),
+        "the bad resource is named:\n{stderr}"
+    );
+}
+
+/// A DSN is more than its scheme, and sqlx parses the whole URL before it
+/// opens anything — so a typo past the `://` is a failure `run` reaches
+/// offline. The invariant is the pairing, not either message: whatever `run`
+/// refuses statically, a static `doctor` must refuse too.
+#[test]
+fn doctor_and_run_agree_that_a_malformed_dsn_is_a_startup_failure() {
+    let cfg = write_doctor_project(
+        "doctor-baddsn",
+        "",
+        "Feature: only\n  Scenario: one\n    When I request \"/ping\"\n",
+        "  db:\n    primary:\n      dsn: \"postgres://u:p@127.0.0.1:notaport/x\"\n",
+    );
+    let path = cfg.to_str().expect("path is UTF-8");
+
+    let doctor = Command::new(env!("CARGO_BIN_EXE_bddkit"))
+        .args(["doctor", "--config", path])
+        .output()
+        .expect("failed to run bddkit");
+    let stdout = String::from_utf8_lossy(&doctor.stdout);
+    assert_eq!(
+        doctor.status.code(),
+        Some(1),
+        "no socket is needed to see this\n{stdout}"
+    );
+    assert!(stdout.contains("db primary"), "{stdout}");
+
+    let run = Command::new(env!("CARGO_BIN_EXE_bddkit"))
+        .args(["run", "--config", path])
+        .output()
+        .expect("failed to run bddkit");
+    assert_eq!(
+        run.status.code(),
+        Some(2),
+        "the run never starts: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+}
+
+/// A scheduling tag `run` refuses to parse is a "nothing ran" failure like any
+/// other, so `doctor` has to see it. It is the one pre-run check that lives
+/// past `validate::check`, in `runner::build_chains`.
+#[test]
+fn doctor_reports_a_malformed_scheduling_tag() {
+    let cfg = write_doctor_project(
+        "doctor-tag",
+        "",
+        "Feature: only\n  @priority(soon)\n  Scenario: one\n    When I request \"/ping\"\n",
+        "",
+    );
+
+    let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
+        .args(["doctor", "--config", cfg.to_str().expect("path is UTF-8")])
+        .output()
+        .expect("failed to run bddkit");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "{stdout}");
+    assert!(stdout.contains("@priority(soon)"), "{stdout}");
+}
+
+/// `run` exits 2 on a selection with nothing in it. A green tick reading
+/// "0 file(s), every step matched" is the most misleading line the command
+/// could print, because it certifies a suite that cannot run.
+#[test]
+fn doctor_reports_a_suite_with_no_scenario_to_run() {
+    let cfg = write_doctor_project("doctor-empty", "", "", "");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
+        .args(["doctor", "--config", cfg.to_str().expect("path is UTF-8")])
+        .output()
+        .expect("failed to run bddkit");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "{stdout}");
+    assert!(stdout.contains("no scenario"), "{stdout}");
+}
+
+/// The decision a script depends on: `doctor` answers 0 or 1 and never 2, so
+/// even a config it cannot parse comes back as an ordinary finding. `run`
+/// exits 2 for the same file.
+#[test]
+fn doctor_reports_an_unparseable_config_as_an_ordinary_finding() {
+    let dir = std::env::temp_dir().join(format!("bddkit-doctor-broken-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let cfg = dir.join("cfg.yaml");
+    std::fs::write(
+        &cfg,
+        "paths: [features]\nresources:\n  api:\n    a:\n      base_url: ${BDDKIT_ABSENT_VAR}\n",
+    )
+    .expect("write config");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
+        .args(["doctor", "--config", cfg.to_str().expect("path is UTF-8")])
+        .output()
+        .expect("failed to run bddkit");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a broken config is a finding, not a different exit currency\n{stdout}"
+    );
+    assert!(stdout.contains("BDDKIT_ABSENT_VAR"), "{stdout}");
+}
+
+/// The primary caller is a script or an agent, which is what `--json` is for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn doctor_json_carries_the_env_the_status_and_every_check() {
+    let base = common::spawn().await;
+
+    let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
+        .args(["doctor", "--config", "tests/acceptance.yaml", "--json"])
+        .env("BDDKIT_STUB_URL", &base)
+        .output()
+        .expect("failed to run bddkit");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let report: Value = serde_json::from_str(&stdout).expect("--json emits JSON only");
+    assert_eq!(report["app_env"], "dev", "{stdout}");
+    assert_eq!(report["live"], false, "{stdout}");
+    let checks = report["checks"].as_array().expect("checks is an array");
+    assert!(
+        checks
+            .iter()
+            .any(|c| c["stage"] == "steps" && c["status"] == "ok"),
+        "{stdout}"
+    );
+    assert!(
+        checks
+            .iter()
+            .any(|c| c["stage"] == "api" && c["target"] == "stub" && c["status"] == "skipped"),
+        "a static run reports the probe it did not make:\n{stdout}"
+    );
+}
+
 /// The flat `bddkit --config x.yaml` form is gone: `steps` has to be a real
 /// subcommand, and clap cannot have both a positional path list at the top
 /// level and subcommands to disambiguate it against.

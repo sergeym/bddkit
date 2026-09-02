@@ -77,7 +77,11 @@ pub struct ApiConfig {
     pub effective_options: Options,
 }
 
-#[derive(Debug, Default, Deserialize)]
+/// `Clone` so `doctor` can hand `Db::connect` a one-entry map per connection.
+/// `Db::connect` already names the failing connection in its error; what it
+/// does not do is carry on, so a whole-map call would return at the first dead
+/// DSN and never probe the second.
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct Connection {
     pub dsn: String,
     #[serde(default)]
@@ -450,16 +454,26 @@ fn default_missing_message(name: &str, custom: &str) -> String {
     }
 }
 
-pub fn load(path: &Path, cli_env: Option<&str>) -> Result<Config> {
-    // path.parent() returns Some("") for a bare file name (not None) —
-    // join() with "" gives a path relative to cwd, which is what the normal
-    // case wants; unwrap_or here guards the case of a path with no parent at
-    // all (root/prefix), not the main mechanism.
+/// Which `.env` layer a load from this path would select. `doctor` states it
+/// in its header — it is the first thing that is wrong when a suite passes
+/// locally and fails in CI — and `load` below settles it the same way, so the
+/// two can never name different layers.
+///
+/// path.parent() returns Some("") for a bare file name (not None) — join()
+/// with "" gives a path relative to cwd, which is what the normal case wants;
+/// unwrap_or here guards the case of a path with no parent at all
+/// (root/prefix), not the main mechanism.
+pub fn app_env_for(path: &Path, cli_env: Option<&str>) -> Result<String> {
     let config_dir = path.parent().unwrap_or_else(|| Path::new("."));
-
     let mut base_map = BTreeMap::new();
     load_env_file(&config_dir.join(".env"), &mut base_map)?;
-    let app_env = resolve_app_env(cli_env, &base_map);
+    Ok(resolve_app_env(cli_env, &base_map))
+}
+
+pub fn load(path: &Path, cli_env: Option<&str>) -> Result<Config> {
+    let config_dir = path.parent().unwrap_or_else(|| Path::new("."));
+
+    let app_env = app_env_for(path, cli_env)?;
     let env_map = load_env_layers(config_dir, &app_env)?;
 
     let raw = std::fs::read_to_string(path)

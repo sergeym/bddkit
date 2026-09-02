@@ -106,6 +106,12 @@ impl ApiResource {
         default_headers: Vec<(String, String)>,
         options: Options,
     ) -> Result<Self> {
+        // `reqwest` accepts a zero timeout and then fails every request
+        // instantly, which reads as an unreachable service rather than as the
+        // config error it is.
+        if timeout_secs == 0 {
+            anyhow::bail!("timeout_secs is 0: every request would time out immediately");
+        }
         Ok(Self {
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(timeout_secs))
@@ -116,6 +122,19 @@ impl ApiResource {
             default_headers,
             options,
         })
+    }
+
+    /// One GET at `base_url` over this resource's own client, so the probe
+    /// carries the timeout the suite configured. Any answer means reachable —
+    /// the status is reported, not judged, because `doctor` checks that the
+    /// resource is there, not that the application routes its own root.
+    pub async fn probe(&self) -> Result<u16, String> {
+        self.client
+            .get(self.base_url.clone())
+            .send()
+            .await
+            .map(|response| response.status().as_u16())
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -473,6 +492,18 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Mutex;
 
+    #[test]
+    fn a_zero_timeout_is_refused_when_the_resource_is_built() {
+        // `reqwest` accepts a zero timeout and then times out every request
+        // instantly. Refusing it here rather than in `doctor` is what keeps the
+        // two from disagreeing about whether a config is valid.
+        let error = match ApiResource::new("http://x", 0, Vec::new(), Options::default()) {
+            Ok(_) => panic!("a zero timeout cannot serve a request"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(error.contains("timeout_secs"), "{error}");
+    }
+
     fn apis_with(name: &str, base: &str, default_headers: Vec<(String, String)>) -> Arc<Apis> {
         let mut by_name = HashMap::new();
         by_name.insert(
@@ -563,6 +594,25 @@ mod tests {
             ),
         );
         spawn_app(app).await
+    }
+
+    #[tokio::test]
+    async fn probing_a_served_base_url_reports_the_status_it_answered_with() {
+        // Any answer at all means reachable. The status is reported, never
+        // judged: `doctor` checks that the resource is there, not that the
+        // application routes its own root.
+        let (base, _server) = spawn_app(Router::new()).await;
+        let api = ApiResource::new(&base, 5, Vec::new(), Options::default()).expect("valid base");
+        let status = api.probe().await.expect("the stub answers");
+        assert_eq!(status, 404, "an empty router answers 404");
+    }
+
+    #[tokio::test]
+    async fn probing_a_closed_port_reports_the_transport_failure() {
+        let api = ApiResource::new("http://127.0.0.1:1/", 5, Vec::new(), Options::default())
+            .expect("valid base");
+        let error = api.probe().await.expect_err("port 1 is closed");
+        assert!(!error.is_empty(), "the failure must say something");
     }
 
     #[tokio::test]
