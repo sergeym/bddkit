@@ -722,3 +722,97 @@ fn steps_list_shows_a_plugins_group_only_once_a_config_names_it() {
         "a step without a description is followed by the next step, not a blank line:\n{stdout}"
     );
 }
+
+#[test]
+fn resource_fields_describes_a_plugins_group_only_with_a_config() {
+    let dir = project("resource-fields", "Feature: f\n", ECHO_GROUP);
+
+    let bare = Command::new(env!("CARGO_BIN_EXE_bddkit"))
+        .args(["resource", "fields"])
+        .current_dir(&dir)
+        .output()
+        .expect("run bddkit");
+    let bare_out = String::from_utf8_lossy(&bare.stdout);
+    assert_eq!(bare.status.code(), Some(0), "{bare_out}");
+    assert!(bare_out.contains("api:"), "{bare_out}");
+    assert!(
+        !bare_out.contains("echo:"),
+        "without --config no plugin is loaded, so it describes nothing:\n{bare_out}"
+    );
+
+    let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
+        .args(["resource", "fields", "echo", "--config", "cfg.yaml"])
+        .current_dir(&dir)
+        .output()
+        .expect("run bddkit");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    assert!(stdout.contains("echo:"), "{stdout}");
+    assert!(
+        stdout.contains("prefix") && stdout.contains("required"),
+        "the manifest's own description reaches the reader:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("(e.g. p-)"),
+        "an example is worth more than the sentence describing it:\n{stdout}"
+    );
+}
+
+#[test]
+fn doctor_probes_a_declared_instance_only_under_live() {
+    let dir = project(
+        "doctor-probe",
+        "Feature: f\n  Scenario: s\n    Given I am in debug mode\n",
+        ECHO_GROUP,
+    );
+
+    let doctor = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
+            .args(args)
+            .current_dir(&dir)
+            .output()
+            .expect("run bddkit");
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            out.status.code(),
+        )
+    };
+
+    let (static_out, code) = doctor(&["doctor", "--config", "cfg.yaml"]);
+    assert_eq!(code, Some(0), "{static_out}");
+    assert!(
+        static_out.contains("plugin echo.main") && static_out.contains("skipped"),
+        "a bare doctor must not call the plugin's probe:\n{static_out}"
+    );
+
+    let (live_out, code) = doctor(&["doctor", "--config", "cfg.yaml", "--live"]);
+    assert_eq!(code, Some(0), "{live_out}");
+    assert!(
+        live_out.contains("plugin echo.main") && live_out.contains("probed clean"),
+        "{live_out}"
+    );
+}
+
+#[test]
+fn a_plugin_that_refuses_the_probe_fails_doctor_naming_the_instance() {
+    // The fixture's probe answers with whatever `probe_error` names, which is
+    // how a real plugin reports an endpoint that would not have it.
+    let dir = project(
+        "doctor-probe-fail",
+        "Feature: f\n  Scenario: s\n    Given I am in debug mode\n",
+        "  echo:\n    main:\n      prefix: \"p-\"\n      probe_error: \"bucket acceptance does not exist\"\n",
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
+        .args(["doctor", "--config", "cfg.yaml", "--live"])
+        .current_dir(&dir)
+        .output()
+        .expect("run bddkit");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "{stdout}");
+    assert!(stdout.contains("plugin echo.main"), "{stdout}");
+    assert!(
+        stdout.contains("bucket acceptance does not exist"),
+        "{stdout}"
+    );
+}

@@ -208,18 +208,42 @@ pub async fn check(config_path: &Path, env: Option<&str>, live: bool) -> Report 
     check_apis(&mut report, &cfg, live).await;
     check_databases(&mut report, &cfg, live).await;
     check_srp(&mut report, &cfg);
-    if live && plugins.is_some() {
-        // `row` directly, not `push`: this describes a live probe that did not
-        // happen, so a consumer filtering on `probe` must see it.
-        report.row(
-            "plugin",
-            None,
-            Status::Skipped,
-            true,
-            "probing an instance needs a plugin-side bddkit_probe_config, which the ABI does not have yet",
-        );
+    if let Some(plugins) = plugins.as_ref() {
+        check_plugin_instances(&mut report, plugins, live);
     }
     report
+}
+
+/// The live half of the plugin config contract, one row per declared instance.
+/// Nothing static happens here: `validate_config` already ran for every
+/// instance in the plugins stage, and a second row saying the same thing would
+/// leave a script with two answers to one question.
+///
+/// A plugin that exports no `bddkit_probe_config` is `Skipped`, never
+/// `Failed`: the symbol is optional, and a check that never ran has proved
+/// nothing about the configuration.
+///
+/// ponytail: the FFI call blocks this thread. `doctor` runs its stages one at
+/// a time and has nothing else in flight, so `spawn_blocking` would buy
+/// nothing; it becomes worth it the day the probes run concurrently.
+fn check_plugin_instances(report: &mut Report, plugins: &crate::plugin::Plugins, live: bool) {
+    for (group, instance) in plugins.declared_instances() {
+        let target = format!("{group}.{instance}");
+        if !live {
+            report.push_live("plugin", &target, Status::Skipped, "live probe skipped");
+            continue;
+        }
+        match plugins.probe_config(&group, &instance) {
+            Some(Ok(())) => report.push_live("plugin", &target, Status::Ok, "probed clean"),
+            Some(Err(error)) => report.push_live("plugin", &target, Status::Failed, &error),
+            None => report.push_live(
+                "plugin",
+                &target,
+                Status::Skipped,
+                "the plugin exports no bddkit_probe_config",
+            ),
+        }
+    }
 }
 
 /// The two stages that read the feature files: every step matched against the

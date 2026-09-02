@@ -147,6 +147,7 @@ impl Library {
         let steps: Vec<StepSpec> = serde_json::from_str(&steps_json)
             .with_context(|| format!("plugin {name:?} returned a malformed step list"))?;
         check_step_groups(name, &manifest, &steps)?;
+        check_field_groups(name, &manifest)?;
 
         Ok(Self {
             name: name.to_string(),
@@ -167,6 +168,10 @@ impl Library {
         self.reset_scenario.is_some()
     }
 
+    pub fn has_probe_config(&self) -> bool {
+        self.probe_config.is_some()
+    }
+
     pub fn validate_config(&self, request: &str) -> Result<Result<(), String>> {
         self.envelope_call(self.validate_config, request, "validate_config")
     }
@@ -177,9 +182,6 @@ impl Library {
     /// reachability check that never ran has proved nothing, so the caller
     /// must be able to tell the two apart.
     ///
-    /// Called by nothing in the host yet: the CLI surface that asks the
-    /// question is separate work, and the ABI half belongs here regardless.
-    #[allow(dead_code)]
     pub fn probe_config(&self, request: &str) -> Option<Result<Result<(), String>>> {
         let function = self.probe_config?;
         Some(self.envelope_call(function, request, "probe_config"))
@@ -288,6 +290,22 @@ fn check_step_groups(name: &str, manifest: &Manifest, steps: &[StepSpec]) -> Res
                 step.pattern,
                 step.group
             );
+        }
+    }
+    Ok(())
+}
+
+/// A group may only be described by the plugin that serves it. Reasoned exactly
+/// as `check_step_groups`: a description of a group this plugin does not claim
+/// would shadow the description of whichever plugin legitimately owns it, and
+/// `bddkit resource fields` would print the wrong keys for it.
+///
+/// A pure predicate over the already-parsed manifest, so it is reachable from a
+/// unit test without building a cdylib per rejection case.
+fn check_field_groups(name: &str, manifest: &Manifest) -> Result<()> {
+    for group in manifest.fields.keys() {
+        if !manifest.groups.contains(group) {
+            bail!("plugin {name:?} describes the config of group {group:?}, which it does not claim");
         }
     }
     Ok(())
@@ -533,10 +551,39 @@ mod tests {
         // `reset_scenario` can answer Ok when absent because "nothing to
         // reset" really is success; a probe that never ran proved nothing.
         let mut lib = Library::load("echo", &fixture()).expect("loads");
+        assert!(lib.has_probe_config());
         lib.probe_config = None;
+        assert!(!lib.has_probe_config());
         assert!(
             lib.probe_config(r#"{"group":"echo","instance":"a","config":{}}"#)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn describing_a_group_it_does_not_claim_is_refused() {
+        // Same reason as `check_step_groups`: a plugin describing a group it
+        // does not serve would shadow the description of whichever plugin
+        // legitimately owns it.
+        let manifest: Manifest = serde_json::from_str(
+            r#"{"name":"widget","version":"1.0.0","groups":["widget"],
+                "fields":{"widget":[{"name":"selector"}],
+                          "browser":[{"name":"headless"}]}}"#,
+        )
+        .expect("manifest parses");
+        let error = check_field_groups("widget", &manifest).expect_err("refused");
+        let text = format!("{error:#}");
+        assert!(text.contains("widget"), "{text}");
+        assert!(text.contains("browser"), "{text}");
+    }
+
+    #[test]
+    fn describing_only_claimed_groups_is_fine() {
+        let manifest: Manifest = serde_json::from_str(
+            r#"{"name":"widget","version":"1.0.0","groups":["widget"],
+                "fields":{"widget":[{"name":"selector"}]}}"#,
+        )
+        .expect("manifest parses");
+        check_field_groups("widget", &manifest).expect("its own group is fine");
     }
 }

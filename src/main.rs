@@ -10,6 +10,7 @@ mod options;
 mod plugin;
 mod polling;
 mod report;
+mod resource;
 mod runner;
 mod srp;
 mod steps;
@@ -42,6 +43,85 @@ enum Command {
     Steps(StepsArgs),
     /// Check a suite's config, and with --live probe what it talks to
     Doctor(DoctorArgs),
+    /// Show what a resource's config takes
+    Resource(ResourceArgs),
+}
+
+#[derive(Args)]
+#[command(after_help = "Examples:
+  bddkit resource fields                      every resource kind bddkit serves itself
+  bddkit resource fields db                   only the database connection keys
+  bddkit resource fields --config suite.yaml  also the groups this suite's plugins serve
+  bddkit resource fields --json               the same listing, machine-readable")]
+struct ResourceArgs {
+    #[command(subcommand)]
+    command: Option<ResourceCommand>,
+}
+
+#[derive(Subcommand)]
+enum ResourceCommand {
+    /// List the keys each resource kind's config takes
+    Fields(FieldsArgs),
+}
+
+#[derive(Args)]
+struct FieldsArgs {
+    /// Only this kind: api, db, srp, or a plugin group
+    kind: Option<String>,
+    /// Also describe the groups the plugins this config loads serve
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// Machine-readable output
+    #[arg(long)]
+    json: bool,
+}
+
+/// Bare `bddkit resource` is a signpost, exactly as bare `bddkit steps` is.
+fn resource_command(args: ResourceArgs) -> Result<i32> {
+    let Some(ResourceCommand::Fields(args)) = args.command else {
+        use clap::CommandFactory;
+        let mut cli = Cli::command();
+        cli.build();
+        cli.find_subcommand_mut("resource")
+            .expect("the resource subcommand is declared")
+            .print_help()?;
+        println!();
+        return Ok(0);
+    };
+    list_fields(args)
+}
+
+fn list_fields(args: FieldsArgs) -> Result<i32> {
+    let mut kinds = resource::host_kinds();
+
+    // A plugin's field list lives inside its `cdylib`, so reading it means
+    // loading the plugin — which is why `--config` is optional here, exactly
+    // as it is for `steps list`: the common question, "what does an api entry
+    // take", must cost nothing. It is also the only way to reach the lock
+    // file, which is anchored at the config's parent directory.
+    if let Some(path) = &args.config {
+        let cfg = config::load(path, None)?;
+        let generator = unique::Generator::new();
+        if let Some(plugins) = load_plugins(path, &cfg, &generator)? {
+            kinds.extend(resource::plugin_kinds(&plugins));
+        }
+    }
+
+    if let Some(kind) = &args.kind {
+        // Checked before filtering, so a typo is named rather than silently
+        // producing an empty listing — as `steps list` does with its resource.
+        if !kinds.iter().any(|k| &k.kind == kind) {
+            anyhow::bail!("no such resource: {kind:?}");
+        }
+        kinds.retain(|k| &k.kind == kind);
+    }
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&kinds)?);
+    } else {
+        print!("{}", resource::render(&kinds));
+    }
+    Ok(0)
 }
 
 #[derive(Args)]
@@ -211,6 +291,7 @@ async fn main() {
         Command::Run(args) => (run(args).await, "run not started"),
         Command::Steps(args) => (steps_command(args), "nothing listed"),
         Command::Doctor(args) => (doctor_command(args).await, "nothing checked"),
+        Command::Resource(args) => (resource_command(args), "nothing listed"),
     };
     match result {
         Ok(code) => std::process::exit(code),

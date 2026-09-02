@@ -64,6 +64,31 @@ pub struct InstanceSpec {
     pub options: Options,
 }
 
+/// What a `resources.api.<name>` body takes: name, required, description.
+///
+/// Hand-written because Rust has no reflection to derive it from `ApiConfig`,
+/// and a `#[serde(skip)]` field is not a config key at all. `bddkit resource
+/// fields` prints these beside what a plugin says about its own group, so the
+/// three host kinds answer the same question the plugins do.
+pub const API_FIELDS: &[(&str, bool, &str)] = &[
+    ("base_url", true, "root URL every request is resolved against"),
+    (
+        "timeout_secs",
+        false,
+        "per-request timeout in seconds (default 20)",
+    ),
+    (
+        "default_headers",
+        false,
+        "headers sent with every request until a scenario replaces them",
+    ),
+    (
+        "options",
+        false,
+        "polling.timeout_secs / polling.interval_ms for eventual assertions against this API",
+    ),
+];
+
 #[derive(Debug, Deserialize)]
 pub struct ApiConfig {
     pub base_url: String,
@@ -81,6 +106,25 @@ pub struct ApiConfig {
 /// `Db::connect` already names the failing connection in its error; what it
 /// does not do is carry on, so a whole-map call would return at the first dead
 /// DSN and never probe the second.
+/// What a `resources.db.<name>` body takes. See `API_FIELDS`.
+pub const DB_FIELDS: &[(&str, bool, &str)] = &[
+    (
+        "dsn",
+        true,
+        "connection string; its scheme selects the engine (postgres://, mysql://)",
+    ),
+    (
+        "search_path",
+        false,
+        "Postgres schema search path; refused on MySQL and MariaDB, which have no session equivalent",
+    ),
+    (
+        "options",
+        false,
+        "polling.timeout_secs / polling.interval_ms for eventual assertions against this connection",
+    ),
+];
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Connection {
     pub dsn: String,
@@ -94,6 +138,23 @@ pub struct Connection {
 
 /// SRP parameters. Everything except `variant` has a sensible default: the
 /// RFC 5054 4096-bit group, generator 5, SHA-256.
+/// What a `resources.srp.<name>` body takes. See `API_FIELDS`.
+pub const SRP_FIELDS: &[(&str, bool, &str)] = &[
+    ("variant", true, "hex-string or rfc5054"),
+    (
+        "prime",
+        false,
+        "group prime in hexadecimal (default: the RFC 5054 4096-bit group)",
+    ),
+    ("generator", false, "generator as a decimal number (default 5)"),
+    ("hash", false, "sha-1, sha-256 or sha-512 (default sha-256)"),
+    (
+        "options",
+        false,
+        "polling.timeout_secs / polling.interval_ms for eventual assertions using this configuration",
+    ),
+];
+
 #[derive(Debug, Deserialize)]
 pub struct SrpConfig {
     pub variant: String,
@@ -511,6 +572,77 @@ resources:
       base_url: http://billing.local
       timeout_secs: 5
 ";
+
+    /// A hand-written field table can drift from the struct it describes, and
+    /// this checks the drift that matters: a renamed field, and a `required`
+    /// flag flipped the wrong way. `doc` spells one value per table entry, in
+    /// the table's own order, so a renamed or added entry fails here until the
+    /// document follows it.
+    ///
+    /// What it deliberately does not catch is a field added to the struct and
+    /// forgotten in the table — the benign direction: the key still works, it
+    /// is only undocumented.
+    fn check_table<T: serde::de::DeserializeOwned + std::fmt::Debug>(
+        table: &[(&str, bool, &str)],
+        doc: &[(&str, &str)],
+    ) {
+        let names: Vec<&str> = table.iter().map(|(name, _, _)| *name).collect();
+        let keys: Vec<&str> = doc.iter().map(|(key, _)| *key).collect();
+        assert_eq!(names, keys, "the table and this test's document disagree");
+        let render = |omit: &str| -> String {
+            doc.iter()
+                .filter(|(key, _)| *key != omit)
+                .map(|(key, value)| format!("{key}: {value}\n"))
+                .collect()
+        };
+        serde_yaml_ng::from_str::<T>(&render("")).expect("every field together deserializes");
+        for (name, required, _) in table {
+            if !required {
+                continue;
+            }
+            serde_yaml_ng::from_str::<T>(&render(name))
+                .expect_err("a field the table calls required cannot be omitted");
+        }
+    }
+
+    #[test]
+    fn the_api_field_table_matches_the_api_struct() {
+        check_table::<ApiConfig>(
+            API_FIELDS,
+            &[
+                ("base_url", "http://localhost:1"),
+                ("timeout_secs", "5"),
+                ("default_headers", "{ Accept: application/json }"),
+                ("options", "{ polling: { timeout_secs: 3 } }"),
+            ],
+        );
+    }
+
+    #[test]
+    fn the_db_field_table_matches_the_connection_struct() {
+        check_table::<Connection>(
+            DB_FIELDS,
+            &[
+                ("dsn", "postgres://localhost/app"),
+                ("search_path", "[public]"),
+                ("options", "{ polling: { timeout_secs: 3 } }"),
+            ],
+        );
+    }
+
+    #[test]
+    fn the_srp_field_table_matches_the_srp_struct() {
+        check_table::<SrpConfig>(
+            SRP_FIELDS,
+            &[
+                ("variant", "hex-string"),
+                ("prime", "\"ff\""),
+                ("generator", "\"5\""),
+                ("hash", "sha-256"),
+                ("options", "{ polling: { timeout_secs: 3 } }"),
+            ],
+        );
+    }
 
     fn parse(src: &str) -> Result<Config> {
         let expanded = expand_env(src, &BTreeMap::new())?;
