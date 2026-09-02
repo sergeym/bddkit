@@ -90,6 +90,39 @@ and how to narrow a run to one file or one tag.
 
 `bddkit run` flags: `--config` (required), positional paths to override the config's, `--tag` (repeatable), `--env` to pick a `.env.<name>` layer, `--fail-fast`. Exit codes: `0` passed, `1` a scenario failed, `2` the run never started.
 
+## Checking a suite before running it
+
+`bddkit doctor` runs every check a run makes before its first request — config parse, `${VAR}` expansion, ambiguous `default_*`, the plugin lock file and ABI versions, macro conflicts and cycles, undefined steps, malformed `@priority`/`@serial` tags, a `paths` that selects nothing, and a DSN the driver cannot parse — and reports all of them at once instead of stopping at the first:
+
+```console
+$ bddkit doctor --config suite.yaml
+config: suite.yaml
+APP_ENV: dev
+
+  ✓ config                parsed, ${VAR} expanded, defaults resolved
+  ✓ plugins               none installed
+  ✓ macros                loaded, no conflict or cycle
+  ✗ steps
+      features/auth.feature:12
+        unknown step: "I frobnicate"
+  ✓ scheduling            4 chain(s)
+  ✓ api main              https://api.example.test (20s timeout)
+  - api main              live probe skipped
+  ✓ db primary            postgres
+  - db primary            live probe skipped
+
+1 problem(s)
+static checks only — pass --live to also probe the resources
+```
+
+A bare `doctor` opens no socket: it is fast, offline and deterministic, so it works on a train and a `base_url` pointing at a closed port is not a finding. `--live` adds the one class of check a run does not have — whether the resources the config names actually answer: a `GET` at each `base_url` (any status means reachable) and a real connection to each database, named individually so one dead DSN says which.
+
+`bddkit doctor` flags: `--config` (required), `--env` to pick a `.env.<name>` layer, `--live`, `--json`. Exit codes: `0` clean, `1` anything was reported — never `2`, so a script's rule is simply "0 or fix something".
+
+The header states which `APP_ENV` layer was selected, which is the first thing that is wrong when a suite passes locally and fails in CI. `--json` emits the same report machine-readably, one object per check with a `probe` flag separating a resource's static row from its live one.
+
+`doctor` never fixes what it finds, and every static stage is a function `run` itself calls — if the two ever disagree about whether a config is valid, that is a bug in `doctor`.
+
 ## What steps exist
 
 `bddkit steps list` prints the whole vocabulary as templates, grouped by resource, with no config and no regex:

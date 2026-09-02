@@ -74,6 +74,23 @@ fn family_for_scheme(dsn: &str) -> Result<&'static dyn Platform, String> {
     }
 }
 
+/// The half of `Db::connect` that opens no socket: the DSN's scheme names a
+/// known platform, and the session setup that platform would run is legal for
+/// it. Returns the platform family's name — on the `mysql://` family that is
+/// still "mysql", because MySQL and MariaDB are only told apart by a query.
+pub fn check_dsn(c: &Connection) -> Result<&'static str, String> {
+    let family = family_for_scheme(&c.dsn)?;
+    family.session_setup(&c.search_path)?;
+    // The scheme is only the first word of the DSN. `AnyPoolOptions::connect`
+    // parses the whole URL before it opens anything, so a bad port or a
+    // malformed authority fails `run` statically — checking the scheme alone
+    // here would certify a config the run refuses, which is the one thing
+    // `doctor` must never do.
+    use std::str::FromStr;
+    sqlx::any::AnyConnectOptions::from_str(&c.dsn).map_err(|e| e.to_string())?;
+    Ok(family.name())
+}
+
 /// Everything one connection needs to run and plan a query.
 pub(crate) struct ConnectionState {
     pool: AnyPool,
@@ -227,6 +244,15 @@ impl DbHandle {
 mod tests {
     use super::*;
 
+    /// `check_dsn` parses the DSN through `AnyConnectOptions`, which resolves
+    /// the driver by scheme. `main` installs the drivers once at startup; unit
+    /// tests share one process and run in parallel, so without this the result
+    /// depends on which test happened to run first.
+    fn drivers() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(sqlx::any::install_default_drivers);
+    }
+
     #[test]
     fn a_handle_without_connections_reports_no_database() {
         let h = DbHandle::new(None, String::new());
@@ -251,6 +277,44 @@ mod tests {
         h.current = "audit".to_string();
         h.reset();
         assert_eq!(h.current(), "main");
+    }
+
+    #[test]
+    fn check_dsn_names_the_platform_without_opening_a_socket() {
+        drivers();
+        // Port 1 is closed on any sane host: this must not connect.
+        let c = Connection {
+            dsn: "postgres://u:p@127.0.0.1:1/x".into(),
+            search_path: vec!["app".into()],
+            ..Default::default()
+        };
+        assert_eq!(check_dsn(&c).unwrap(), "postgres");
+    }
+
+    #[test]
+    fn check_dsn_refuses_a_dsn_the_driver_cannot_parse() {
+        // `Db::connect` parses the whole URL before it opens anything, so a
+        // typo past the scheme is a static failure for `run` — and must be one
+        // here too, or `doctor` certifies a config the run refuses.
+        drivers();
+        let c = Connection {
+            dsn: "postgres://u:p@127.0.0.1:notaport/x".into(),
+            ..Default::default()
+        };
+        let error = check_dsn(&c).unwrap_err();
+        assert!(error.contains("port"), "{error}");
+    }
+
+    #[test]
+    fn check_dsn_refuses_a_search_path_the_platform_cannot_honour() {
+        drivers();
+        let c = Connection {
+            dsn: "mysql://u:p@127.0.0.1:1/x".into(),
+            search_path: vec!["app".into()],
+            ..Default::default()
+        };
+        let error = check_dsn(&c).unwrap_err();
+        assert!(error.contains("search_path"), "{error}");
     }
 
     #[test]

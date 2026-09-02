@@ -1,5 +1,6 @@
 mod config;
 mod db;
+mod doctor;
 mod feature;
 mod hawk;
 mod http;
@@ -17,7 +18,7 @@ mod validate;
 mod vars;
 mod world;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -39,6 +40,41 @@ enum Command {
     Run(RunArgs),
     /// Show the steps this binary understands
     Steps(StepsArgs),
+    /// Check a suite's config, and with --live probe what it talks to
+    Doctor(DoctorArgs),
+}
+
+#[derive(Args)]
+#[command(after_help = "Examples:
+  bddkit doctor --config suite.yaml          every static check, no socket opened
+  bddkit doctor --config suite.yaml --live   also probe every API and database
+  bddkit doctor --config suite.yaml --json   the same report, machine-readable")]
+struct DoctorArgs {
+    /// Path to the YAML config
+    #[arg(long)]
+    config: PathBuf,
+    /// Override APP_ENV: selects .env.<name> / .env.<name>.local
+    #[arg(long = "env")]
+    env: Option<String>,
+    /// Also open a socket to every API and database the config names
+    #[arg(long)]
+    live: bool,
+    /// Machine-readable output
+    #[arg(long)]
+    json: bool,
+}
+
+/// Unlike `run`, every outcome here is a report: a config that cannot be
+/// parsed is the most ordinary thing `doctor` has to say, not a reason to
+/// answer in a different currency. Hence 0/1 and no `?`.
+async fn doctor_command(args: DoctorArgs) -> Result<i32> {
+    let report = doctor::check(&args.config, args.env.as_deref(), args.live).await;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print!("{}", report.render());
+    }
+    Ok(report.exit_code())
 }
 
 #[derive(Args)]
@@ -174,6 +210,7 @@ async fn main() {
     let (result, nothing_happened) = match cli.command {
         Command::Run(args) => (run(args).await, "run not started"),
         Command::Steps(args) => (steps_command(args), "nothing listed"),
+        Command::Doctor(args) => (doctor_command(args).await, "nothing checked"),
     };
     match result {
         Ok(code) => std::process::exit(code),
@@ -243,22 +280,35 @@ fn load_plugins(
     Ok(Some(plugins))
 }
 
+/// The one piece of startup `run` and `doctor` genuinely share.
+///
+/// `with_macros_and_plugins`, not `with_macros` plus a registration loop:
+/// macros are validated after everything is registered, so a macro body may
+/// name a plugin step. Both callers build it before checking any step, which
+/// is what keeps invariant 1 — every step of every selected scenario is
+/// matched before the first request.
+///
+/// Deliberately not a `build_context`: `doctor` needs neither `Apis` nor
+/// `RunContext`, and a shared constructor that builds both for a caller that
+/// wants neither is how an aggregator grows a builder.
+fn build_registry(
+    cfg: &config::Config,
+    plugins: Option<&Arc<plugin::Plugins>>,
+) -> std::result::Result<steps::Registry, String> {
+    let plugin_steps = plugins.map(|p| p.steps()).unwrap_or_default();
+    let plugin_groups = plugins.map(|p| p.group_names()).unwrap_or_default();
+    macros::MacroCatalog::load(&cfg.macro_paths).and_then(|catalog| {
+        steps::Registry::with_macros_and_plugins(catalog, &plugin_steps, &plugin_groups)
+    })
+}
+
 async fn run(cli: RunArgs) -> Result<i32> {
     let cfg = config::load(&cli.config, cli.env.as_deref())?;
     // Before the plugins: the artifact root is derived from the run id.
     let generator = Arc::new(unique::Generator::new());
     let plugins = load_plugins(&cli.config, &cfg, &generator)?;
 
-    // `with_macros_and_plugins`, not `with_macros` plus a registration loop:
-    // macros are validated after everything is registered, so a macro body may
-    // name a plugin step. This also runs before `validate::check` below, which
-    // is what keeps invariant 1 — every step of every selected scenario is
-    // matched before the first request.
-    let plugin_steps = plugins.as_ref().map(|p| p.steps()).unwrap_or_default();
-    let plugin_groups = plugins.as_ref().map(|p| p.group_names()).unwrap_or_default();
-    let reg = match macros::MacroCatalog::load(&cfg.macro_paths).and_then(|catalog| {
-        steps::Registry::with_macros_and_plugins(catalog, &plugin_steps, &plugin_groups)
-    }) {
+    let reg = match build_registry(&cfg, plugins.as_ref()) {
         Ok(registry) => registry,
         Err(error) => {
             eprintln!("error: 1 problem, run not started\n\n  {error}");
@@ -315,6 +365,19 @@ async fn run(cli: RunArgs) -> Result<i32> {
         );
     }
     let apis = Arc::new(http::Apis::new(by_name, cfg.resolve_default_api()?)?);
+
+    // Every declared SRP resource, not only the default: a malformed
+    // `variant:` in a second block must not sit there until someone points
+    // `default_srp` at it. This is also what keeps `doctor` — which reports on
+    // every declared resource — from being stricter than the run it predicts.
+    //
+    // Before the pools: this costs microseconds, and connecting can cost
+    // thirty seconds against a database that is down. A suite with both faults
+    // should learn about both on the first attempt, not one per attempt.
+    for (name, srp) in &cfg.resources.srp {
+        srp.to_params()
+            .with_context(|| format!("resources.srp.{name}"))?;
+    }
 
     // Pools are created once per run, sized to the worker pool's own
     // concurrency so every worker can hold a connection at once.
