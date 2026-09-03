@@ -163,6 +163,19 @@ db:
 
 Narrow it with a positional kind (`api`, `db`, `srp`, or a plugin's group). `--config <file>` also loads that suite's plugins, so the groups they serve are described too — by the plugins themselves, since only a plugin knows what its own group takes. A plugin whose manifest describes nothing says so and is not an error. `--json` emits the same listing machine-readably.
 
+### `bddkit resource add`
+
+```
+bddkit resource add <group> <name> --config <path> [--env <name>] [--json '{...}'] [--no-check] [--<field> <value>]...
+```
+
+```console
+$ bddkit resource add api staging --config suite.yaml --base_url http://staging.local --timeout_secs 5
+$ bddkit resource add s3 main --config suite.yaml --no-check --bucket photos --endpoint https://s3.local
+```
+
+Writes one new resource into `--config`'s YAML and reports whether it happened. A `--<field> <value>` becomes a body key; the value always arrives as a string, and it is the group's own field table (the host's for `api`/`db`/`srp`, a plugin's manifest for its own group) that converts it — `timeout_secs` becomes a YAML number, and a field the table calls a map or a list refuses the flag and names `--json` instead. `--json '{...}'` supplies the whole body at once and is applied first; any `--<field>` on the same command line then overrides that key, one key at a time, leaving the rest of the JSON body untouched. A name the group's table does not know is refused rather than silently added. The command's own flags (`--config`, `--env`, `--json`, `--no-check`) must be typed before any `--<field>` value — clap treats everything after the first flag it does not itself recognize as more field arguments, so one of these typed later would otherwise vanish into the resource body or be rejected as an unknown field. Before writing anything, the exact prospective file text is assembled, re-parsed and put through the checks `doctor` makes about a config and its resources — the suite's feature files, steps, macros and scheduling tags are deliberately not among them, since a broken `.feature` elsewhere is no reason to refuse a resource. A `${VAR}` placeholder in a value is written out literally and only *expanded* for that check. The live probe that `doctor --live` runs against this one new resource is also run here, by default; `--no-check` skips only that probe, the shape validation still happens. A resource that already exists under that name is refused rather than replaced, because rewriting the surrounding YAML block is how hand-written comments in it get lost — insertion only ever splices in a new block next to the existing text. Exit code is 0 when the file was written and 1 when it was not (a malformed flag, a rejected field, a failed check, an existing resource), matching `doctor`'s "0, or fix something" convention; the command itself never answers 2, though a usage error the argument parser catches before it starts still does.
+
 ## Config
 
 ```yaml

@@ -1352,3 +1352,278 @@ fn the_run_subcommand_is_how_a_suite_is_started() {
         "run keeps every flag the flat form had:\n{stdout}"
     );
 }
+
+/// The whole promise in one assertion: the file after equals the file before
+/// plus exactly the inserted block. Reordered keys, a requoted scalar or a
+/// swallowed final newline all fail here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resource_add_inserts_exactly_the_block_and_probes_the_new_api() {
+    let base = common::spawn().await;
+    let cfg = write_doctor_project(
+        "resource-add-ok",
+        &base,
+        "Feature: only\n  Scenario: one\n    When I request \"/ping\"\n",
+        "default_api: stub\n",
+    );
+    let before = std::fs::read_to_string(&cfg).expect("read config");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
+        .args([
+            "resource",
+            "add",
+            "api",
+            "staging",
+            "--config",
+            cfg.to_str().expect("path is UTF-8"),
+            "--base_url",
+            &base,
+            "--timeout_secs",
+            "5",
+        ])
+        .output()
+        .expect("failed to run bddkit");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+
+    let after = std::fs::read_to_string(&cfg).expect("read config");
+    assert_eq!(
+        after,
+        before.replace(
+            "  api:\n",
+            &format!("  api:\n    staging:\n      base_url: {base}\n      timeout_secs: 5\n")
+        )
+    );
+}
+
+/// The probe is on by default here — the resource being added is what the
+/// invocation is about — and a resource that cannot answer is not written.
+#[test]
+fn resource_add_writes_nothing_when_the_probe_fails() {
+    let cfg = write_doctor_project(
+        "resource-add-dead",
+        "http://127.0.0.1:1/",
+        "Feature: only\n  Scenario: one\n    When I request \"/ping\"\n",
+        "default_api: stub\n",
+    );
+    let before = std::fs::read_to_string(&cfg).expect("read config");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
+        .args([
+            "resource",
+            "add",
+            "api",
+            "staging",
+            "--config",
+            cfg.to_str().expect("path is UTF-8"),
+            "--base_url",
+            "http://127.0.0.1:1/",
+        ])
+        .output()
+        .expect("failed to run bddkit");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "{stdout}");
+    // The resource's own line, not the word `base_url` — which the failure
+    // message itself carries, so `contains("base_url")` proves nothing.
+    assert!(
+        stdout.contains("  base_url: http://127.0.0.1:1/\n"),
+        "the block is printed: {stdout}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&cfg).expect("read config"),
+        before,
+        "a failed add writes nothing"
+    );
+}
+
+/// `--no-check` skips the probe and nothing else: the same closed port, and
+/// the resource is written.
+#[test]
+fn resource_add_no_check_writes_a_resource_that_is_not_up_yet() {
+    let cfg = write_doctor_project(
+        "resource-add-nocheck",
+        "http://127.0.0.1:1/",
+        "Feature: only\n  Scenario: one\n    When I request \"/ping\"\n",
+        "default_api: stub\n",
+    );
+
+    let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
+        .args([
+            "resource",
+            "add",
+            "api",
+            "staging",
+            "--config",
+            cfg.to_str().expect("path is UTF-8"),
+            "--base_url",
+            "http://127.0.0.1:1/",
+            "--no-check",
+        ])
+        .output()
+        .expect("failed to run bddkit");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{stdout}");
+    assert!(
+        std::fs::read_to_string(&cfg)
+            .expect("read config")
+            .contains("staging:"),
+        "the resource is written"
+    );
+}
+
+/// Insert only, and the refusal is what a script reads: exit 1, the block on
+/// stdout, the file untouched.
+#[test]
+fn resource_add_refuses_a_name_that_is_already_taken() {
+    let cfg = write_doctor_project(
+        "resource-add-taken",
+        "http://127.0.0.1:1/",
+        "Feature: only\n  Scenario: one\n    When I request \"/ping\"\n",
+        "default_api: stub\n",
+    );
+    let before = std::fs::read_to_string(&cfg).expect("read config");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
+        .args([
+            "resource",
+            "add",
+            "api",
+            "stub",
+            "--config",
+            cfg.to_str().expect("path is UTF-8"),
+            "--base_url",
+            "http://other.local",
+            "--no-check",
+        ])
+        .output()
+        .expect("failed to run bddkit");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "{stdout}");
+    assert_eq!(std::fs::read_to_string(&cfg).expect("read config"), before);
+}
+
+/// A typo in a field name is an error, not a silently stored key — the whole
+/// reason the flags are checked against a list at all.
+#[test]
+fn resource_add_names_a_field_that_does_not_exist() {
+    let cfg = write_doctor_project(
+        "resource-add-typo",
+        "http://127.0.0.1:1/",
+        "Feature: only\n  Scenario: one\n    When I request \"/ping\"\n",
+        "default_api: stub\n",
+    );
+    let before = std::fs::read_to_string(&cfg).expect("read config");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
+        .args([
+            "resource",
+            "add",
+            "api",
+            "staging",
+            "--config",
+            cfg.to_str().expect("path is UTF-8"),
+            "--base_rul",
+            "http://a.local",
+            "--no-check",
+        ])
+        .output()
+        .expect("failed to run bddkit");
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Exactly 1: this command reports, so `not zero` would also accept a usage
+    // error or a panic, which are the two answers it must never give.
+    assert_eq!(out.status.code(), Some(1), "{combined}");
+    assert!(combined.contains("base_rul"), "{combined}");
+    assert_eq!(
+        std::fs::read_to_string(&cfg).expect("read config"),
+        before,
+        "a refused field writes nothing"
+    );
+}
+
+/// A resource name is written to the file literally and read back `${VAR}`-
+/// expanded, so a name carrying a variable that is set is not in the loaded
+/// config under the name being written. That is a refusal like any other —
+/// looking it up by index made the process panic with exit 101.
+#[test]
+fn resource_add_refuses_a_name_that_expands_to_something_else() {
+    let cfg = write_doctor_project(
+        "resource-add-expanding-name",
+        "http://127.0.0.1:1/",
+        "Feature: only\n  Scenario: one\n    When I request \"/ping\"\n",
+        "default_api: stub\n",
+    );
+    let before = std::fs::read_to_string(&cfg).expect("read config");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
+        .args([
+            "resource",
+            "add",
+            "api",
+            "${BDDKIT_TEST_NAME}",
+            "--config",
+            cfg.to_str().expect("path is UTF-8"),
+            "--base_url",
+            "http://a.local",
+            "--no-check",
+        ])
+        .env("BDDKIT_TEST_NAME", "expanded")
+        .output()
+        .expect("failed to run bddkit");
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(1), "{combined}");
+    assert!(combined.contains("${VAR}"), "{combined}");
+    assert_eq!(
+        std::fs::read_to_string(&cfg).expect("read config"),
+        before,
+        "nothing was written"
+    );
+}
+
+/// The block is the whole value of the failure path, so it has to be pasteable
+/// where the reader will paste it: under `resources:`, which means carrying the
+/// group key whenever the config does not have that group yet.
+#[test]
+fn resource_add_prints_the_group_key_for_a_group_the_config_lacks() {
+    let cfg = write_doctor_project(
+        "resource-add-new-group",
+        "http://127.0.0.1:1/",
+        "Feature: only\n  Scenario: one\n    When I request \"/ping\"\n",
+        "default_api: stub\n",
+    );
+
+    let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
+        .args([
+            "resource",
+            "add",
+            "db",
+            "reporting",
+            "--config",
+            cfg.to_str().expect("path is UTF-8"),
+            "--dsn",
+            "nope://reporting",
+            "--no-check",
+        ])
+        .output()
+        .expect("failed to run bddkit");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "{stdout}");
+    assert!(
+        stdout.contains("db:\n  reporting:\n    dsn: nope://reporting\n"),
+        "the block names the group it belongs under: {stdout}"
+    );
+}

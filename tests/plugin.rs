@@ -759,6 +759,76 @@ fn resource_fields_describes_a_plugins_group_only_with_a_config() {
     );
 }
 
+/// The write half of the same contract: a plugin group's field list is what a
+/// `--flag` is checked against, and the plugin's own `bddkit_probe_config` is
+/// what decides whether the resource is written.
+#[test]
+fn resource_add_writes_a_plugin_group_it_can_probe() {
+    let dir = project(
+        "resource-add",
+        "Feature: f\n",
+        &format!("{ECHO_GROUP}default_echo: main\n"),
+    );
+    let cfg = dir.join("cfg.yaml");
+    let before = std::fs::read_to_string(&cfg).expect("read config");
+
+    let add = |args: &[&str]| {
+        let argv: Vec<&str> = ["resource", "add", "echo"]
+            .iter()
+            .chain(args.iter())
+            .copied()
+            .collect();
+        let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
+            .args(&argv)
+            .current_dir(&dir)
+            .output()
+            .expect("run bddkit");
+        (
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+            out.status.code(),
+        )
+    };
+
+    // Only the plugin knows what its group takes, so the manifest's `fields`
+    // is the list a typo is caught against.
+    let (out, code) = add(&["second", "--config", "cfg.yaml", "--prefx", "q-"]);
+    assert_eq!(code, Some(1), "{out}");
+    assert!(
+        out.contains("prefx") && out.contains("prefix"),
+        "the typo is named beside the names the manifest declares:\n{out}"
+    );
+
+    // The probe runs by default here, and the plugin's own answer is final.
+    let (out, code) = add(&[
+        "second",
+        "--config",
+        "cfg.yaml",
+        "--prefix",
+        "q-",
+        "--probe_error",
+        "the bucket is not there",
+    ]);
+    assert_eq!(code, Some(1), "{out}");
+    assert!(out.contains("the bucket is not there"), "{out}");
+    assert_eq!(
+        std::fs::read_to_string(&cfg).expect("read config"),
+        before,
+        "a failed probe writes nothing"
+    );
+
+    let (out, code) = add(&["second", "--config", "cfg.yaml", "--prefix", "q-"]);
+    assert_eq!(code, Some(0), "{out}");
+    assert_eq!(
+        std::fs::read_to_string(&cfg).expect("read config"),
+        before.replace("  echo:\n", "  echo:\n    second:\n      prefix: q-\n"),
+        "the file gains the block and nothing else moves"
+    );
+}
+
 #[test]
 fn doctor_probes_a_declared_instance_only_under_live() {
     let dir = project(
