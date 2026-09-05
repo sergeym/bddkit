@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/sergeym/bddkit/compare/v0.1.1...v0.2.0) - 2026-09-05
+
+### Added
+
+- a plugin manifest declares the form of a field's value
+- `bddkit resource add`, a validated resource written into the config
+- `bddkit resource fields`, and the host side of the plugin config contract
+- *(plugin)* describe a group's config fields and probe it live
+- `bddkit doctor`, a suite check that does not need a run
+- *(db)* fill insert result variables without RETURNING
+- *(db)* pick the platform from the connection
+- *(db)* the MySQL and MariaDB dialect
+- *(plugin)* list plugin steps and their descriptions
+- *(cli)* bddkit steps list
+- *(steps)* step templates and translated descriptions
+- *(steps)* group, description and named parameters for every step
+- *(cli)* [**breaking**] run is now a subcommand
+
+### Fixed
+
+- *(steps)* usable help line, honest json filtering and plugin templates
+
+### Other
+
+- MySQL and MariaDB support
+- *(db)* run every connection through sqlx::Any
+- *(db)* move the SQL dialect behind a Platform trait
+- leave the version and changelog to release-plz
+- the steps command and the run split
+
 ## [0.1.1](https://github.com/sergeym/bddkit/compare/v0.1.0...v0.1.1) - 2026-08-27
 
 ### Added
