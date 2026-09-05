@@ -68,8 +68,8 @@ pub struct InstanceSpec {
 /// key. Flag values are always strings; this is the table that converts them,
 /// so nothing is ever inferred from the shape of a value.
 ///
-/// There is no `Bool`, because no host field is a boolean today. Add it with
-/// the field that needs it.
+/// No host field is a boolean, but a plugin's may be, and a plugin says so in
+/// its manifest — see `Scalar::from_declared`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 // `NonScalar` ends in the enum's own name only because "not a scalar" is the
 // accurate word for it — renaming it to dodge the lint would make the type
@@ -77,9 +77,40 @@ pub struct InstanceSpec {
 #[allow(clippy::enum_variant_names)]
 pub enum Scalar {
     Str,
+    Bool,
     Num,
     /// A map or a list: no flag can express it, and `--json` is how it is set.
     NonScalar,
+}
+
+impl Scalar {
+    /// The names a plugin's manifest may put in a field's `type`, and the only
+    /// place they are mapped. `None` is a name the host does not know, which
+    /// `plugin::library` refuses at load: degrading it into a string would
+    /// reproduce exactly the failure the key exists to prevent — a boolean key
+    /// written as `'false'`, refused by the plugin's own `validate_config`, on
+    /// every input, forever.
+    pub fn from_declared(name: &str) -> Option<Self> {
+        match name {
+            "string" => Some(Scalar::Str),
+            "boolean" => Some(Scalar::Bool),
+            "number" => Some(Scalar::Num),
+            "nonscalar" => Some(Scalar::NonScalar),
+            _ => None,
+        }
+    }
+
+    /// The same names, for an error message and for `resource fields`.
+    pub fn declared_name(&self) -> &'static str {
+        match self {
+            Scalar::Str => "string",
+            Scalar::Bool => "boolean",
+            Scalar::Num => "number",
+            Scalar::NonScalar => "nonscalar",
+        }
+    }
+
+    pub const DECLARABLE: &'static str = "string, boolean, number, nonscalar";
 }
 
 /// What a `resources.api.<name>` body takes: name, required, description, type.
@@ -597,7 +628,18 @@ pub fn load(path: &Path, cli_env: Option<&str>) -> Result<Config> {
         path.parent().unwrap_or_else(|| Path::new(".")),
         cli_env,
     )
-    .with_context(|| format!("config {}", path.display()))
+    // The migration hint belongs to a file somebody wrote, not to text a
+    // command just assembled: `resource add` validates its prospective config
+    // through `load_str`, and telling whoever adds a resource that "the format
+    // changed" would be answering a question they did not ask, about a file
+    // that is very likely fine.
+    .with_context(|| {
+        format!(
+            "config {}. If this suite predates the format change, suites were replaced by \
+             paths + resources — see docs/writing-tests.md",
+            path.display()
+        )
+    })
 }
 
 /// Everything `load` does except reading the file. `config_dir` is what selects
@@ -608,10 +650,8 @@ pub fn load_str(raw: &str, config_dir: &Path, cli_env: Option<&str>) -> Result<C
     let app_env = app_env_in(config_dir, cli_env)?;
     let env_map = load_env_layers(config_dir, &app_env)?;
     let expanded = expand_env(raw, &env_map)?;
-    let mut cfg: Config = serde_yaml_ng::from_str(&expanded).context(
-        "failed to parse config. The format changed: suites were replaced by \
-         paths + resources, see docs/writing-tests.md",
-    )?;
+    let mut cfg: Config =
+        serde_yaml_ng::from_str(&expanded).context("failed to parse config")?;
     // Resolve the defaults right away: an ambiguous config should fail at
     // startup, not at the first step that reaches for them.
     cfg.resolve_default_api()?;

@@ -69,12 +69,15 @@ pub struct Manifest {
 
 /// One key of a group's instance config, as the plugin describes it.
 ///
-/// Deliberately **not** JSON Schema: no types, no nesting, no constraints, no
-/// validation semantics. The host prints these and interprets none of them.
-/// Anything richer would make the host reason about plugin config, which is
-/// the boundary `bddkit_validate_config` exists to keep — and since the
-/// enforcing half already exists, a second, weaker copy in the manifest could
-/// only ever disagree with it.
+/// Deliberately **not** JSON Schema: no nesting, no enums, no ranges, no
+/// defaults, no validation semantics of any kind. The one thing declared
+/// beyond the name is `type`, the FORM of a scalar, and it exists because the
+/// host is the one turning a `resource add` flag's text into YAML and cannot
+/// do that without knowing whether `false` is a boolean or a string. Anything
+/// richer would make the host reason about whether a plugin's config is
+/// ACCEPTABLE, which is the boundary `bddkit_validate_config` exists to keep —
+/// and since the enforcing half already exists, a second, weaker copy in the
+/// manifest could only ever disagree with it.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ConfigField {
     pub name: String,
@@ -84,6 +87,18 @@ pub struct ConfigField {
     pub description: Option<String>,
     #[serde(default)]
     pub example: Option<String>,
+    /// The FORM of the value, never a constraint on it: `string`, `boolean`,
+    /// `number` or `nonscalar`, absent meaning `string`. It says how
+    /// `resource add` renders a flag's text into YAML — `false` as a boolean
+    /// rather than as `'false'` — and nothing about whether the value is
+    /// acceptable, which stays `bddkit_validate_config`'s sole business.
+    ///
+    /// Kept as text here so the mapping and its refusal live in one place
+    /// (`config::Scalar::from_declared`, checked at load), and so a manifest
+    /// declaring an unknown name fails with the name in the message rather
+    /// than as a serde error about an untagged enum.
+    #[serde(default, rename = "type")]
+    pub value_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]

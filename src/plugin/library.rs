@@ -148,6 +148,7 @@ impl Library {
             .with_context(|| format!("plugin {name:?} returned a malformed step list"))?;
         check_step_groups(name, &manifest, &steps)?;
         check_field_groups(name, &manifest)?;
+        check_field_types(name, &manifest)?;
 
         Ok(Self {
             name: name.to_string(),
@@ -306,6 +307,31 @@ fn check_field_groups(name: &str, manifest: &Manifest) -> Result<()> {
     for group in manifest.fields.keys() {
         if !manifest.groups.contains(group) {
             bail!("plugin {name:?} describes the config of group {group:?}, which it does not claim");
+        }
+    }
+    Ok(())
+}
+
+/// A declared `type` the host does not know is refused here rather than
+/// silently read as a string, for the reason the key exists at all: a string
+/// is what a boolean field already got, and what its `validate_config` already
+/// refused. A typo that degrades into the old behaviour would be reported to
+/// the plugin author as their own bug, from the far side of the FFI boundary.
+///
+/// A pure predicate over the already-parsed manifest, like its two neighbours.
+fn check_field_types(name: &str, manifest: &Manifest) -> Result<()> {
+    for (group, fields) in &manifest.fields {
+        for field in fields {
+            let Some(declared) = &field.value_type else {
+                continue;
+            };
+            if crate::config::Scalar::from_declared(declared).is_none() {
+                bail!(
+                    "plugin {name:?} declares field {:?} of group {group:?} as type {declared:?}, which is not one of: {}",
+                    field.name,
+                    crate::config::Scalar::DECLARABLE
+                );
+            }
         }
     }
     Ok(())
@@ -575,6 +601,39 @@ mod tests {
         let text = format!("{error:#}");
         assert!(text.contains("widget"), "{text}");
         assert!(text.contains("browser"), "{text}");
+    }
+
+    /// A typo in a declared type must not degrade into "string": that is the
+    /// exact failure the key exists to prevent, and a silent fallback would
+    /// write `'false'` for a boolean key and leave the plugin's own
+    /// `validate_config` to take the blame for refusing it.
+    #[test]
+    fn declaring_a_type_the_host_does_not_know_is_refused() {
+        let manifest: Manifest = serde_json::from_str(
+            r#"{"name":"widget","version":"1.0.0","groups":["widget"],
+                "fields":{"widget":[{"name":"headless","type":"boolena"}]}}"#,
+        )
+        .expect("manifest parses");
+        let error = check_field_types("widget", &manifest).expect_err("refused");
+        let text = format!("{error:#}");
+        assert!(text.contains("headless"), "{text}");
+        assert!(text.contains("boolena"), "{text}");
+        assert!(
+            text.contains("boolean"),
+            "the accepted values are named: {text}"
+        );
+    }
+
+    /// The backward-compatibility half: a manifest written before `type`
+    /// existed declares none, and that is not a finding.
+    #[test]
+    fn declaring_no_type_at_all_is_fine() {
+        let manifest: Manifest = serde_json::from_str(
+            r#"{"name":"widget","version":"1.0.0","groups":["widget"],
+                "fields":{"widget":[{"name":"selector"},{"name":"headless","type":"boolean"}]}}"#,
+        )
+        .expect("manifest parses");
+        check_field_types("widget", &manifest).expect("string is the default, boolean is known");
     }
 
     #[test]

@@ -151,15 +151,17 @@ api:
 
 ## What a resource's config takes
 
-`bddkit resource fields` prints the keys each kind of `resources` entry accepts, which key is mandatory, and what it is for:
+`bddkit resource fields` prints the keys each kind of `resources` entry accepts, which key is mandatory, what value it takes, and what it is for:
 
 ```console
 $ bddkit resource fields db
 db:
-  dsn               required  connection string; its scheme selects the engine (postgres://, mysql://)
-  search_path                 Postgres schema search path; refused on MySQL and MariaDB, which have no session equivalent
-  options                     polling.timeout_secs / polling.interval_ms for eventual assertions against this connection
+  dsn               string    required  connection string; its scheme selects the engine (postgres://, mysql://)
+  search_path       nonscalar           Postgres schema search path; refused on MySQL and MariaDB, which have no session equivalent
+  options           nonscalar           polling.timeout_secs / polling.interval_ms for eventual assertions against this connection
 ```
+
+The type column is the answer to "can I set this with a flag": `string`, `boolean` and `number` can, and `nonscalar` — a map or a list — is what `resource add --json` is for. A plugin's group is described by the plugin itself, and a field whose manifest declares no type is a string.
 
 Narrow it with a positional kind (`api`, `db`, `srp`, or a plugin's group). `--config <file>` also loads that suite's plugins, so the groups they serve are described too — by the plugins themselves, since only a plugin knows what its own group takes. A plugin whose manifest describes nothing says so and is not an error. `--json` emits the same listing machine-readably.
 

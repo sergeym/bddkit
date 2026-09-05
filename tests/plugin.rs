@@ -829,6 +829,59 @@ fn resource_add_writes_a_plugin_group_it_can_probe() {
     );
 }
 
+/// The failure issue #28 is about, end to end: the fixture's `loud` is a
+/// boolean and its `validate_config` refuses anything else, so before a
+/// manifest could declare a type the host wrote `'false'` and the plugin
+/// refused it on every input. The write is the assertion — `loud: false`
+/// unquoted — because a string would still be a string with the quotes gone.
+#[test]
+fn a_declared_boolean_field_is_written_as_a_boolean() {
+    let dir = project(
+        "resource-add-typed",
+        "Feature: f\n",
+        &format!("{ECHO_GROUP}default_echo: main\n"),
+    );
+    let cfg = dir.join("cfg.yaml");
+    let before = std::fs::read_to_string(&cfg).expect("read config");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
+        .args([
+            "resource", "add", "echo", "second", "--config", "cfg.yaml", "--prefix", "q-",
+            "--loud", "false",
+        ])
+        .current_dir(&dir)
+        .output()
+        .expect("run bddkit");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert_eq!(
+        std::fs::read_to_string(&cfg).expect("read config"),
+        before.replace(
+            "  echo:\n",
+            "  echo:\n    second:\n      prefix: q-\n      loud: false\n"
+        ),
+        "the boolean reaches the file as a boolean"
+    );
+
+    // And the value still has to be one of the two: the type says what form
+    // the value takes, never that any text will do.
+    let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
+        .args([
+            "resource", "add", "echo", "third", "--config", "cfg.yaml", "--prefix", "q-", "--loud",
+            "sometimes",
+        ])
+        .current_dir(&dir)
+        .output()
+        .expect("run bddkit");
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(text.contains("loud"), "{text}");
+}
+
 #[test]
 fn doctor_probes_a_declared_instance_only_under_live() {
     let dir = project(
