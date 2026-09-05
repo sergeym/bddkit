@@ -64,28 +64,54 @@ pub struct InstanceSpec {
     pub options: Options,
 }
 
-/// What a `resources.api.<name>` body takes: name, required, description.
+/// The YAML type a `resource add` flag's string value has to become for one
+/// key. Flag values are always strings; this is the table that converts them,
+/// so nothing is ever inferred from the shape of a value.
+///
+/// There is no `Bool`, because no host field is a boolean today. Add it with
+/// the field that needs it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// `NonScalar` ends in the enum's own name only because "not a scalar" is the
+// accurate word for it — renaming it to dodge the lint would make the type
+// less clear, not more.
+#[allow(clippy::enum_variant_names)]
+pub enum Scalar {
+    Str,
+    Num,
+    /// A map or a list: no flag can express it, and `--json` is how it is set.
+    NonScalar,
+}
+
+/// What a `resources.api.<name>` body takes: name, required, description, type.
 ///
 /// Hand-written because Rust has no reflection to derive it from `ApiConfig`,
 /// and a `#[serde(skip)]` field is not a config key at all. `bddkit resource
 /// fields` prints these beside what a plugin says about its own group, so the
 /// three host kinds answer the same question the plugins do.
-pub const API_FIELDS: &[(&str, bool, &str)] = &[
-    ("base_url", true, "root URL every request is resolved against"),
+pub const API_FIELDS: &[(&str, bool, &str, Scalar)] = &[
+    (
+        "base_url",
+        true,
+        "root URL every request is resolved against",
+        Scalar::Str,
+    ),
     (
         "timeout_secs",
         false,
         "per-request timeout in seconds (default 20)",
+        Scalar::Num,
     ),
     (
         "default_headers",
         false,
         "headers sent with every request until a scenario replaces them",
+        Scalar::NonScalar,
     ),
     (
         "options",
         false,
         "polling.timeout_secs / polling.interval_ms for eventual assertions against this API",
+        Scalar::NonScalar,
     ),
 ];
 
@@ -107,21 +133,24 @@ pub struct ApiConfig {
 /// does not do is carry on, so a whole-map call would return at the first dead
 /// DSN and never probe the second.
 /// What a `resources.db.<name>` body takes. See `API_FIELDS`.
-pub const DB_FIELDS: &[(&str, bool, &str)] = &[
+pub const DB_FIELDS: &[(&str, bool, &str, Scalar)] = &[
     (
         "dsn",
         true,
         "connection string; its scheme selects the engine (postgres://, mysql://)",
+        Scalar::Str,
     ),
     (
         "search_path",
         false,
         "Postgres schema search path; refused on MySQL and MariaDB, which have no session equivalent",
+        Scalar::NonScalar,
     ),
     (
         "options",
         false,
         "polling.timeout_secs / polling.interval_ms for eventual assertions against this connection",
+        Scalar::NonScalar,
     ),
 ];
 
@@ -139,21 +168,45 @@ pub struct Connection {
 /// SRP parameters. Everything except `variant` has a sensible default: the
 /// RFC 5054 4096-bit group, generator 5, SHA-256.
 /// What a `resources.srp.<name>` body takes. See `API_FIELDS`.
-pub const SRP_FIELDS: &[(&str, bool, &str)] = &[
-    ("variant", true, "hex-string or rfc5054"),
+pub const SRP_FIELDS: &[(&str, bool, &str, Scalar)] = &[
+    ("variant", true, "hex-string or rfc5054", Scalar::Str),
     (
         "prime",
         false,
         "group prime in hexadecimal (default: the RFC 5054 4096-bit group)",
+        Scalar::Str,
     ),
-    ("generator", false, "generator as a decimal number (default 5)"),
-    ("hash", false, "sha-1, sha-256 or sha-512 (default sha-256)"),
+    (
+        "generator",
+        false,
+        "generator as a decimal number (default 5)",
+        Scalar::Str,
+    ),
+    (
+        "hash",
+        false,
+        "sha-1, sha-256 or sha-512 (default sha-256)",
+        Scalar::Str,
+    ),
     (
         "options",
         false,
         "polling.timeout_secs / polling.interval_ms for eventual assertions using this configuration",
+        Scalar::NonScalar,
     ),
 ];
+
+/// The field table of a kind the host serves itself, or `None` for anything
+/// else — which is either a plugin group or a typo, and telling those two
+/// apart needs the loaded plugins the caller has and this module does not.
+pub fn host_fields(kind: &str) -> Option<&'static [(&'static str, bool, &'static str, Scalar)]> {
+    match kind {
+        "api" => Some(API_FIELDS),
+        "db" => Some(DB_FIELDS),
+        "srp" => Some(SRP_FIELDS),
+        _ => None,
+    }
+}
 
 #[derive(Debug, Deserialize)]
 pub struct SrpConfig {
@@ -525,28 +578,40 @@ fn default_missing_message(name: &str, custom: &str) -> String {
 /// unwrap_or here guards the case of a path with no parent at all
 /// (root/prefix), not the main mechanism.
 pub fn app_env_for(path: &Path, cli_env: Option<&str>) -> Result<String> {
-    let config_dir = path.parent().unwrap_or_else(|| Path::new("."));
+    app_env_in(path.parent().unwrap_or_else(|| Path::new(".")), cli_env)
+}
+
+/// The same answer from the directory alone, for a caller holding text rather
+/// than a path.
+fn app_env_in(config_dir: &Path, cli_env: Option<&str>) -> Result<String> {
     let mut base_map = BTreeMap::new();
     load_env_file(&config_dir.join(".env"), &mut base_map)?;
     Ok(resolve_app_env(cli_env, &base_map))
 }
 
 pub fn load(path: &Path, cli_env: Option<&str>) -> Result<Config> {
-    let config_dir = path.parent().unwrap_or_else(|| Path::new("."));
-
-    let app_env = app_env_for(path, cli_env)?;
-    let env_map = load_env_layers(config_dir, &app_env)?;
-
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read config {}", path.display()))?;
-    let expanded = expand_env(&raw, &env_map)?;
-    let mut cfg: Config = serde_yaml_ng::from_str(&expanded).with_context(|| {
-        format!(
-            "failed to parse config {}. The format changed: suites were replaced by \
-             paths + resources, see docs/writing-tests.md",
-            path.display()
-        )
-    })?;
+    load_str(
+        &raw,
+        path.parent().unwrap_or_else(|| Path::new(".")),
+        cli_env,
+    )
+    .with_context(|| format!("config {}", path.display()))
+}
+
+/// Everything `load` does except reading the file. `config_dir` is what selects
+/// the `.env` layers and is the config's own directory, not the working
+/// directory — so `resource add` can validate the exact text it is about to
+/// write with the layers a real run would see.
+pub fn load_str(raw: &str, config_dir: &Path, cli_env: Option<&str>) -> Result<Config> {
+    let app_env = app_env_in(config_dir, cli_env)?;
+    let env_map = load_env_layers(config_dir, &app_env)?;
+    let expanded = expand_env(raw, &env_map)?;
+    let mut cfg: Config = serde_yaml_ng::from_str(&expanded).context(
+        "failed to parse config. The format changed: suites were replaced by \
+         paths + resources, see docs/writing-tests.md",
+    )?;
     // Resolve the defaults right away: an ambiguous config should fail at
     // startup, not at the first step that reaches for them.
     cfg.resolve_default_api()?;
@@ -583,10 +648,10 @@ resources:
     /// forgotten in the table — the benign direction: the key still works, it
     /// is only undocumented.
     fn check_table<T: serde::de::DeserializeOwned + std::fmt::Debug>(
-        table: &[(&str, bool, &str)],
+        table: &[(&str, bool, &str, Scalar)],
         doc: &[(&str, &str)],
     ) {
-        let names: Vec<&str> = table.iter().map(|(name, _, _)| *name).collect();
+        let names: Vec<&str> = table.iter().map(|(name, ..)| *name).collect();
         let keys: Vec<&str> = doc.iter().map(|(key, _)| *key).collect();
         assert_eq!(names, keys, "the table and this test's document disagree");
         let render = |omit: &str| -> String {
@@ -596,7 +661,7 @@ resources:
                 .collect()
         };
         serde_yaml_ng::from_str::<T>(&render("")).expect("every field together deserializes");
-        for (name, required, _) in table {
+        for (name, required, ..) in table {
             if !required {
                 continue;
             }
@@ -1172,7 +1237,39 @@ resources:
         )
         .expect("write config");
         let err = load(&path, None).expect_err("default is ambiguous");
-        assert!(err.to_string().contains("default_api"), "{err}");
+        // `load` now wraps the error with `config <path>:` (`load_str`'s own
+        // context), so the ambiguity reason is in the chain, not in the
+        // top-level `Display` — `{:#}` renders the whole chain.
+        assert!(format!("{err:#}").contains("default_api"), "{err:#}");
+    }
+
+    /// The point of `load_str`: the text being validated need never have been a
+    /// file. This is what lets `resource add` check the exact bytes it is about to
+    /// write, with the `.env` layers of the real config's directory.
+    #[test]
+    fn load_str_validates_text_that_was_never_a_file() {
+        let raw = "paths: [features]\nresources:\n  api:\n    a:\n      base_url: http://a.local\n";
+        load_str(raw, Path::new("."), None).expect("one API needs no default_api");
+
+        let two = "paths: [features]\nresources:\n  api:\n    a:\n      base_url: http://a.local\n    b:\n      base_url: http://b.local\n";
+        let error = load_str(two, Path::new("."), None)
+            .expect_err("two APIs and no default_api is ambiguous")
+            .to_string();
+        assert!(error.contains("default_api"), "{error}");
+    }
+
+    /// `resource add` converts a flag's string through this table, so a kind the
+    /// host serves must be reachable by name and must say which keys no flag can
+    /// express.
+    #[test]
+    fn host_fields_names_the_type_each_key_takes() {
+        let api = host_fields("api").expect("api is a host kind");
+        let by_name = |key: &str| api.iter().find(|(name, ..)| *name == key).expect("declared").3;
+        assert_eq!(by_name("base_url"), Scalar::Str);
+        assert_eq!(by_name("timeout_secs"), Scalar::Num);
+        assert_eq!(by_name("default_headers"), Scalar::NonScalar);
+        assert_eq!(by_name("options"), Scalar::NonScalar);
+        assert!(host_fields("s3").is_none(), "a plugin group is not a host kind");
     }
 
     #[test]

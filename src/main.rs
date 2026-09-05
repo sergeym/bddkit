@@ -52,7 +52,10 @@ enum Command {
   bddkit resource fields                      every resource kind bddkit serves itself
   bddkit resource fields db                   only the database connection keys
   bddkit resource fields --config suite.yaml  also the groups this suite's plugins serve
-  bddkit resource fields --json               the same listing, machine-readable")]
+  bddkit resource fields --json               the same listing, machine-readable
+  bddkit resource add api staging --config suite.yaml --base_url http://staging.local
+  bddkit resource add db reporting --config suite.yaml --no-check --dsn postgres://...
+  # --config/--env/--json/--no-check must come before any --<field> value")]
 struct ResourceArgs {
     #[command(subcommand)]
     command: Option<ResourceCommand>,
@@ -62,6 +65,31 @@ struct ResourceArgs {
 enum ResourceCommand {
     /// List the keys each resource kind's config takes
     Fields(FieldsArgs),
+    /// Write a validated resource into the config
+    Add(AddArgs),
+}
+
+#[derive(Args)]
+struct AddArgs {
+    /// api, db, srp, or a plugin group
+    group: String,
+    /// The name the resource is reachable by
+    name: String,
+    /// Path to the YAML config to edit
+    #[arg(long)]
+    config: PathBuf,
+    /// Override APP_ENV: selects .env.<name> / .env.<name>.local
+    #[arg(long = "env")]
+    env: Option<String>,
+    /// The whole body as JSON; flags override it, key by key
+    #[arg(long)]
+    json: Option<String>,
+    /// Skip the live probe. The shape is validated either way
+    #[arg(long = "no-check")]
+    no_check: bool,
+    /// --<field> <value> pairs, one per key of the resource
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
+    fields: Vec<String>,
 }
 
 #[derive(Args)]
@@ -77,18 +105,44 @@ struct FieldsArgs {
 }
 
 /// Bare `bddkit resource` is a signpost, exactly as bare `bddkit steps` is.
-fn resource_command(args: ResourceArgs) -> Result<i32> {
-    let Some(ResourceCommand::Fields(args)) = args.command else {
-        use clap::CommandFactory;
-        let mut cli = Cli::command();
-        cli.build();
-        cli.find_subcommand_mut("resource")
-            .expect("the resource subcommand is declared")
-            .print_help()?;
-        println!();
-        return Ok(0);
-    };
-    list_fields(args)
+async fn resource_command(args: ResourceArgs) -> Result<i32> {
+    match args.command {
+        Some(ResourceCommand::Fields(args)) => list_fields(args),
+        Some(ResourceCommand::Add(mut args)) => {
+            // ponytail: `trailing_var_arg` starts swallowing every remaining
+            // token, known flags included, the moment it meets the first one
+            // clap does not recognize — and a resource field like
+            // `--base_url` is never in `AddArgs`'s own flag set, so a
+            // `--no-check` typed after it lands in `fields`, not in
+            // `args.no_check`. Recovering it here (rather than teaching
+            // `resource::add` about clap's parsing order) keeps the field
+            // parser answering only "what fields did the user set".
+            if let Some(pos) = args.fields.iter().position(|f| f == "--no-check") {
+                args.fields.remove(pos);
+                args.no_check = true;
+            }
+            resource::add(resource::AddInput {
+                group: &args.group,
+                name: &args.name,
+                config: &args.config,
+                env: args.env.as_deref(),
+                json: args.json.as_deref(),
+                no_check: args.no_check,
+                flags: &args.fields,
+            })
+            .await
+        }
+        None => {
+            use clap::CommandFactory;
+            let mut cli = Cli::command();
+            cli.build();
+            cli.find_subcommand_mut("resource")
+                .expect("the resource subcommand is declared")
+                .print_help()?;
+            println!();
+            Ok(0)
+        }
+    }
 }
 
 fn list_fields(args: FieldsArgs) -> Result<i32> {
@@ -291,7 +345,7 @@ async fn main() {
         Command::Run(args) => (run(args).await, "run not started"),
         Command::Steps(args) => (steps_command(args), "nothing listed"),
         Command::Doctor(args) => (doctor_command(args).await, "nothing checked"),
-        Command::Resource(args) => (resource_command(args), "nothing listed"),
+        Command::Resource(args) => (resource_command(args).await, "nothing listed"),
     };
     match result {
         Ok(code) => std::process::exit(code),

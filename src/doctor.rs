@@ -342,26 +342,76 @@ fn check_features(
     }
 }
 
+/// The static check of one API resource: the resource it builds, and the line
+/// describing it.
+///
+/// This and its three neighbours below are the per-resource checks `doctor` and
+/// `resource add` share. They live in this module because its whole subject is
+/// the checks a run makes before its first request, and `add` makes the same
+/// ones over the single resource it is about to write. A second copy is how the
+/// two commands come to disagree about whether a config is valid — which for
+/// `doctor` is by definition a bug in `doctor`.
+pub fn check_api(api: &config::ApiConfig) -> Result<(http::ApiResource, String), String> {
+    let headers = api
+        .default_headers
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let resource = http::ApiResource::new(
+        &api.base_url,
+        api.timeout_secs,
+        headers,
+        api.effective_options.clone(),
+    )
+    .map_err(|error| format!("{error:#}"))?;
+    Ok((
+        resource,
+        format!("{} ({}s timeout)", api.base_url, api.timeout_secs),
+    ))
+}
+
+/// The live half: whether the base URL answers at all. Any status is a pass —
+/// reachability is the question, the application's own routing is not.
+pub async fn probe_api(resource: &http::ApiResource, base_url: &str) -> Result<String, String> {
+    let status = resource.probe().await?;
+    Ok(format!("GET {base_url} → {status}"))
+}
+
+/// One connection at a time. `Db::connect` already names the failing connection
+/// in its error — what it does not do is carry on: the whole-map call returns
+/// at the first failure, so a second dead DSN would never be probed and a stage
+/// would not run to completion.
+///
+/// ponytail: a refused connection surfaces as sqlx's pool acquire timeout —
+/// thirty seconds, and the message says "pool timed out" rather than
+/// "connection refused". That is `Db::connect`'s own behaviour, which `run`
+/// shares, so fixing it belongs there rather than here: an `acquire_timeout` on
+/// `AnyPoolOptions` in `Db::connect` would make every caller fail fast at once.
+pub async fn probe_db(name: &str, connection: &config::Connection) -> Result<String, String> {
+    let one = std::collections::BTreeMap::from([(name.to_string(), connection.clone())]);
+    let pool = db::Db::connect(&one, 1).await?;
+    // The vendor the connection settled on, which on the shared `mysql://`
+    // scheme is only known after this round-trip.
+    let vendor = pool.platform(name).map(|p| p.name()).unwrap_or("?");
+    Ok(format!("connected, {vendor}"))
+}
+
+/// The SRP parameters a run would derive, and the variant that named them.
+pub fn check_srp_resource(srp: &config::SrpConfig) -> Result<String, String> {
+    srp.to_params()
+        .map(|_| srp.variant.clone())
+        .map_err(|error| format!("{error:#}"))
+}
+
 async fn check_apis(report: &mut Report, cfg: &config::Config, live: bool) {
     for (name, api) in &cfg.resources.api {
-        let headers = api
-            .default_headers
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        let resource = match http::ApiResource::new(
-            &api.base_url,
-            api.timeout_secs,
-            headers,
-            api.effective_options.clone(),
-        ) {
-            Ok(resource) => {
-                let detail = format!("{} ({}s timeout)", api.base_url, api.timeout_secs);
+        let resource = match check_api(api) {
+            Ok((resource, detail)) => {
                 report.push("api", Some(name), Status::Ok, &detail);
                 resource
             }
             Err(error) => {
-                report.push("api", Some(name), Status::Failed, &format!("{error:#}"));
+                report.push("api", Some(name), Status::Failed, &error);
                 continue;
             }
         };
@@ -369,11 +419,8 @@ async fn check_apis(report: &mut Report, cfg: &config::Config, live: bool) {
             report.push_live("api", name, Status::Skipped, "live probe skipped");
             continue;
         }
-        match resource.probe().await {
-            Ok(status) => {
-                let detail = format!("GET {} → {status}", api.base_url);
-                report.push_live("api", name, Status::Ok, &detail);
-            }
+        match probe_api(&resource, &api.base_url).await {
+            Ok(detail) => report.push_live("api", name, Status::Ok, &detail),
             Err(error) => report.push_live("api", name, Status::Failed, &error),
         }
     }
@@ -392,26 +439,8 @@ async fn check_databases(report: &mut Report, cfg: &config::Config, live: bool) 
             report.push_live("db", name, Status::Skipped, "live probe skipped");
             continue;
         }
-        // One connection at a time. `Db::connect` already names the failing
-        // connection in its error — what it does not do is carry on: the
-        // whole-map call returns at the first failure, so a second dead DSN
-        // would never be probed and a stage would not run to completion.
-        //
-        // ponytail: a refused connection surfaces as sqlx's pool acquire
-        // timeout — thirty seconds, and the message says "pool timed out"
-        // rather than "connection refused". That is `Db::connect`'s own
-        // behaviour, which `run` shares, so fixing it belongs there rather
-        // than here: an `acquire_timeout` on `AnyPoolOptions` in `Db::connect`
-        // would make both callers fail fast at once.
-        let one = std::collections::BTreeMap::from([(name.clone(), connection.clone())]);
-        match db::Db::connect(&one, 1).await {
-            Ok(pool) => {
-                // The vendor the connection settled on, which on the shared
-                // `mysql://` scheme is only known after this round-trip.
-                let vendor = pool.platform(name).map(|p| p.name()).unwrap_or("?");
-                let detail = format!("connected, {vendor}");
-                report.push_live("db", name, Status::Ok, &detail);
-            }
+        match probe_db(name, connection).await {
+            Ok(detail) => report.push_live("db", name, Status::Ok, &detail),
             Err(error) => report.push_live("db", name, Status::Failed, &error),
         }
     }
@@ -419,9 +448,9 @@ async fn check_databases(report: &mut Report, cfg: &config::Config, live: bool) 
 
 fn check_srp(report: &mut Report, cfg: &config::Config) {
     for (name, srp) in &cfg.resources.srp {
-        match srp.to_params() {
-            Ok(_) => report.push("srp", Some(name), Status::Ok, &srp.variant),
-            Err(error) => report.push("srp", Some(name), Status::Failed, &format!("{error:#}")),
+        match check_srp_resource(srp) {
+            Ok(variant) => report.push("srp", Some(name), Status::Ok, &variant),
+            Err(error) => report.push("srp", Some(name), Status::Failed, &error),
         }
     }
 }
