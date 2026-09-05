@@ -16,12 +16,24 @@ use serde::Serialize;
 /// drop: it would retarget the file being edited.
 const RESERVED_FLAGS: &[&str] = &["config", "env", "json", "no-check"];
 
-/// One name a flag may set. `scalar: None` is a plugin's field: the manifest
-/// carries no type by design, so the value stays the string the user typed.
+/// What a plugin's field says its value is, defaulting to a string. The
+/// `unwrap_or` is the load-time guarantee written down: `check_field_types`
+/// has already refused any name `from_declared` does not know.
+fn scalar_of(field: &crate::plugin::abi::ConfigField) -> Scalar {
+    field
+        .value_type
+        .as_deref()
+        .and_then(Scalar::from_declared)
+        .unwrap_or(Scalar::Str)
+}
+
+/// One name a flag may set, and the YAML type its value becomes. A plugin's
+/// field that declares no `type` is a string, which is what the host did for
+/// every plugin field before a manifest could say otherwise.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FieldDef {
     pub name: String,
-    pub scalar: Option<Scalar>,
+    pub scalar: Scalar,
 }
 
 /// What is known about a kind's keys. `Undescribed` is a plugin whose manifest
@@ -43,12 +55,16 @@ impl Fields {
                 .iter()
                 .map(|(name, _, _, scalar)| FieldDef {
                     name: name.to_string(),
-                    scalar: Some(*scalar),
+                    scalar: *scalar,
                 })
                 .collect(),
         ))
     }
 
+    /// A field's declared `type`, or a string when the manifest declares none.
+    /// An unknown name cannot reach here: `plugin::library` refuses it at load,
+    /// so falling back to a string is the documented default and never the
+    /// silent swallowing of a typo.
     pub fn plugin(declared: Option<&[crate::plugin::abi::ConfigField]>) -> Self {
         match declared {
             Some(fields) => Fields::Known(
@@ -56,7 +72,7 @@ impl Fields {
                     .iter()
                     .map(|field| FieldDef {
                         name: field.name.clone(),
-                        scalar: None,
+                        scalar: scalar_of(field),
                     })
                     .collect(),
             ),
@@ -136,16 +152,35 @@ pub fn assemble_body(
     for (key, value) in flags {
         let converted = match fields.find(key) {
             Some(FieldDef {
-                scalar: Some(Scalar::Num),
+                scalar: Scalar::Num,
                 ..
             }) => serde_yaml_ng::Value::Number(
+                // An integer first, so a whole number reaches YAML as one
+                // rather than as `30.0`. The fraction is not decoration: a
+                // plugin's key may be a duration or a ratio, and refusing one
+                // would be the host inventing a rule about a config it does
+                // not own.
                 value
                     .parse::<i64>()
                     .map(serde_yaml_ng::Number::from)
+                    .or_else(|_| value.parse::<f64>().map(serde_yaml_ng::Number::from))
                     .map_err(|_| format!("--{key} takes a number, got {value:?}"))?,
             ),
             Some(FieldDef {
-                scalar: Some(Scalar::NonScalar),
+                scalar: Scalar::Bool,
+                ..
+            }) => match value.as_str() {
+                "true" => serde_yaml_ng::Value::Bool(true),
+                "false" => serde_yaml_ng::Value::Bool(false),
+                // Only the two YAML 1.2 spellings. `yes`/`on`/`1` are the
+                // Norway problem in miniature, and guessing which of them a
+                // plugin means is the inference this whole key replaces.
+                other => {
+                    return Err(format!("--{key} takes true or false, got {other:?}"));
+                }
+            },
+            Some(FieldDef {
+                scalar: Scalar::NonScalar,
                 ..
             }) => {
                 return Err(format!(
@@ -194,6 +229,12 @@ pub struct Kind {
 pub struct Field {
     pub name: String,
     pub required: bool,
+    /// The YAML type a `resource add` flag's value becomes for this key —
+    /// `string`, `boolean`, `number`, or `nonscalar` for a key only `--json`
+    /// can set. Never `None`: a plugin field that declares no type is a
+    /// string, and saying so is the answer the reader came for.
+    #[serde(rename = "type")]
+    pub value_type: String,
     pub description: Option<String>,
     pub example: Option<String>,
 }
@@ -213,9 +254,10 @@ pub fn host_kinds() -> Vec<Kind> {
         fields: Some(
             table
                 .iter()
-                .map(|(name, required, description, _)| Field {
+                .map(|(name, required, description, scalar)| Field {
                     name: name.to_string(),
                     required: *required,
+                    value_type: scalar.declared_name().to_string(),
                     description: Some(description.to_string()),
                     example: None,
                 })
@@ -237,6 +279,7 @@ pub fn plugin_kinds(plugins: &Plugins) -> Vec<Kind> {
                     .map(|field| Field {
                         name: field.name.clone(),
                         required: field.required,
+                        value_type: scalar_of(field).declared_name().to_string(),
                         description: field.description.clone(),
                         example: field.example.clone(),
                     })
@@ -268,8 +311,9 @@ pub fn render(kinds: &[Kind]) -> String {
                 detail.push_str(&format!(" (e.g. {example})"));
             }
             out.push_str(&format!(
-                "  {:<18}{mark:<10}{}\n",
+                "  {:<18}{:<10}{mark:<10}{}\n",
                 field.name,
+                field.value_type,
                 detail.trim_start()
             ));
         }
@@ -761,6 +805,52 @@ mod tests {
         assert!(kinds.iter().all(|kind| kind.fields.is_some()));
     }
 
+    /// `resource fields` is where someone learns what a key takes, and the
+    /// type is what decides between `--timeout_secs 5` and `--json`. A field
+    /// whose manifest declares none is shown as a string, because that is what
+    /// the host will actually do with it — not left blank, which would read as
+    /// "unknown" for a question that always has an answer.
+    #[test]
+    fn each_field_shows_the_type_its_flag_value_becomes() {
+        let out = render(&host_kinds());
+        let line = |key: &str| -> String {
+            out.lines()
+                .find(|line| line.trim_start().starts_with(key))
+                .unwrap_or_else(|| panic!("{key} is listed:\n{out}"))
+                .to_string()
+        };
+        assert!(line("timeout_secs").contains("number"), "{}", line("timeout_secs"));
+        assert!(line("base_url").contains("string"), "{}", line("base_url"));
+        assert!(
+            line("default_headers").contains("nonscalar"),
+            "{}",
+            line("default_headers")
+        );
+
+        let out = render(&[Kind {
+            kind: "s3".into(),
+            source: "plugin",
+            fields: Some(vec![
+                Field {
+                    name: "path_style".into(),
+                    required: false,
+                    value_type: "boolean".into(),
+                    description: None,
+                    example: None,
+                },
+                Field {
+                    name: "bucket".into(),
+                    required: true,
+                    value_type: "string".into(),
+                    description: None,
+                    example: None,
+                },
+            ]),
+        }]);
+        assert!(out.contains("boolean"), "{out}");
+        assert!(out.contains("string"), "{out}");
+    }
+
     #[test]
     fn an_undescribed_group_says_so_instead_of_showing_an_empty_block() {
         let out = render(&[Kind {
@@ -780,6 +870,7 @@ mod tests {
             fields: Some(vec![Field {
                 name: "bucket".into(),
                 required: true,
+                value_type: "string".into(),
                 description: Some("bucket the steps read and write".into()),
                 example: Some("acceptance".into()),
             }]),
@@ -909,17 +1000,76 @@ mod tests {
         );
     }
 
-    /// A plugin describes names, never types, so its values stay strings — and
-    /// a plugin that describes nothing accepts any name, because the rejection
-    /// belongs to `validate_config` and not to a list the host does not have.
-    #[test]
-    fn plugin_fields_are_strings_and_an_undescribed_group_accepts_anything() {
-        let declared = [crate::plugin::abi::ConfigField {
-            name: "bucket".into(),
-            required: true,
+    /// One field as a manifest declares it. `declared` is what the manifest's
+    /// `type` said, and `None` is a manifest written before the key existed.
+    fn plugin_field(name: &str, declared: Option<&str>) -> crate::plugin::abi::ConfigField {
+        crate::plugin::abi::ConfigField {
+            name: name.into(),
+            required: false,
             description: None,
             example: None,
-        }];
+            value_type: declared.map(str::to_string),
+        }
+    }
+
+    /// The failure this whole key exists for: a plugin whose value is a
+    /// boolean got the string `'false'`, which its own `validate_config` then
+    /// refused — correctly — on every input, forever.
+    #[test]
+    fn a_declared_boolean_becomes_a_yaml_boolean_not_the_word() {
+        let declared = [plugin_field("path_style", Some("boolean"))];
+        let fields = Fields::plugin(Some(&declared));
+        let body = assemble_body(None, &[("path_style".into(), "false".into())], &fields)
+            .expect("the manifest says this key is a boolean");
+        assert_eq!(body["path_style"], serde_yaml_ng::Value::Bool(false));
+
+        let error = assemble_body(None, &[("path_style".into(), "sometimes".into())], &fields)
+            .expect_err("a boolean field takes a boolean");
+        assert!(error.contains("path_style"), "{error}");
+        assert!(error.contains("true"), "the two it takes are named: {error}");
+    }
+
+    /// A plugin's `timeout_secs` must reach YAML the way the host's own does.
+    /// The fraction is not decoration: a plugin key may be a duration or a
+    /// ratio, and refusing it would be the host inventing a rule of its own.
+    #[test]
+    fn a_declared_number_takes_an_integer_or_a_fraction() {
+        let declared = [plugin_field("timeout_secs", Some("number"))];
+        let fields = Fields::plugin(Some(&declared));
+        let body = assemble_body(None, &[("timeout_secs".into(), "30".into())], &fields)
+            .expect("an integer");
+        assert_eq!(body["timeout_secs"], serde_yaml_ng::Value::from(30));
+
+        let body = assemble_body(None, &[("timeout_secs".into(), "1.5".into())], &fields)
+            .expect("a fraction");
+        assert_eq!(body["timeout_secs"], serde_yaml_ng::Value::from(1.5));
+
+        let error = assemble_body(None, &[("timeout_secs".into(), "soon".into())], &fields)
+            .expect_err("a number field takes a number");
+        assert!(error.contains("timeout_secs"), "{error}");
+    }
+
+    /// The same courtesy the host's own `default_headers` gets: told it cannot
+    /// come from a flag, rather than handed a string the plugin will reject.
+    #[test]
+    fn a_declared_nonscalar_field_names_json_instead_of_writing_a_string() {
+        let declared = [plugin_field("tags", Some("nonscalar"))];
+        let error = assemble_body(
+            None,
+            &[("tags".into(), "a,b".into())],
+            &Fields::plugin(Some(&declared)),
+        )
+        .expect_err("no flag can express a map or a list");
+        assert!(error.contains("--json"), "{error}");
+    }
+
+    /// A field whose manifest declares no type is a string, which is the whole
+    /// backward-compatibility promise — and a plugin that describes nothing at
+    /// all still accepts any name, because that rejection belongs to
+    /// `validate_config` and not to a list the host does not have.
+    #[test]
+    fn plugin_fields_are_strings_and_an_undescribed_group_accepts_anything() {
+        let declared = [plugin_field("bucket", None)];
         let fields = Fields::plugin(Some(&declared));
         let body = assemble_body(None, &[("bucket".into(), "42".into())], &fields)
             .expect("bucket is declared");
@@ -944,12 +1094,7 @@ mod tests {
     /// failure does not depend on whether the user happened to type it.
     #[test]
     fn a_field_colliding_with_the_commands_own_flags_is_refused() {
-        let declared = [crate::plugin::abi::ConfigField {
-            name: "config".into(),
-            required: false,
-            description: None,
-            example: None,
-        }];
+        let declared = [plugin_field("config", None)];
         let error = assemble_body(None, &[], &Fields::plugin(Some(&declared)))
             .expect_err("config collides with --config");
         assert!(error.contains("--json"), "{error}");

@@ -70,8 +70,10 @@ pub extern "C" fn bddkit_manifest() -> *mut c_char {
         serde_json::json!({
             "name": "echo", "version": "0.1.0", "groups": ["echo"], "concurrency": "shared",
             "fields": {"echo": [
-                {"name": "prefix", "required": true,
+                {"name": "prefix", "required": true, "type": "string",
                  "description": "prepended to every echoed value", "example": "p-"},
+                {"name": "loud", "type": "boolean",
+                 "description": "upper-cases what is echoed", "example": "true"},
                 {"name": "probe_error",
                  "description": "message bddkit_probe_config answers with; omit to probe clean"}
             ]}
@@ -102,9 +104,18 @@ pub extern "C" fn bddkit_validate_config(request: *const c_char) -> *mut c_char 
             Ok(v) => v,
             Err(e) => return serde_json::json!({"ok": false, "error": e.to_string()}).to_string(),
         };
-        match value["config"]["prefix"].as_str() {
-            Some(_) => r#"{"ok":true}"#.to_string(),
-            None => r#"{"ok":false,"error":"echo instance requires a string \"prefix\""}"#.to_string(),
+        if value["config"]["prefix"].as_str().is_none() {
+            return r#"{"ok":false,"error":"echo instance requires a string \"prefix\""}"#
+                .to_string();
+        }
+        // The half a manifest's `type` exists for: this key is a boolean, and a
+        // plugin holding that line is what turns the host writing `'false'`
+        // into a refusal the author of the config can do nothing about. The
+        // manifest declares `"type": "boolean"` so the host writes `false`.
+        match &value["config"]["loud"] {
+            serde_json::Value::Null | serde_json::Value::Bool(_) => r#"{"ok":true}"#.to_string(),
+            _ => r#"{"ok":false,"error":"echo instance's \"loud\" must be true or false"}"#
+                .to_string(),
         }
     })
 }
