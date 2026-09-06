@@ -42,10 +42,7 @@ instead of silently shadowing each other.
 `I expect the next assertion to pass within "10" seconds` and it retries —
 re-sending the request or re-running the query — until it holds.
 
-**Test data shouldn't collide, and should be removable afterwards.** Every
-`<<unique()>>` value in a run shares one prefix drawn once per process, so
-uniqueness is guaranteed rather than probable, and cleanup afterwards is one
-`DELETE FROM t WHERE col LIKE '%<run_id>%'`.
+**Test data shouldn't collide, and should be removable afterwards.** Every `<<unique()>>` value in a run shares one prefix drawn once per process, so uniqueness is guaranteed rather than probable — and `<<run_id>>` writes that prefix down, so cleanup afterwards is one step: `I delete "companies" where "slug~: u<<run_id>>%"`.
 
 **A failure should explain itself.** Every failed step prints the full last
 exchange — method, URL, headers, bodies, status — with no debug flag and no
@@ -224,6 +221,27 @@ What does not carry over:
 
 `examples/README.md` has the same ground as a per-engine table, with the workaround for each row.
 
+### Cleaning up what a run created
+
+Every `<<unique()>>` token is `u` followed by the run's own 12-character prefix and a counter, and `<<run_id>>` is that prefix. A `~` on the column name asks for SQL `LIKE` instead of `=`, so one step removes exactly the rows this run wrote — `examples/db-features/cleanup.feature` is it, working:
+
+```gherkin
+@serial(demo) @priority(-100)
+Feature: cleaning up what this run created
+
+  Scenario: remove the companies this run created
+    When I delete "companies" where "slug~: u<<run_id>>%"
+```
+
+Four things to know about it:
+
+- **The operator lives on the column, never in the value.** `slug: 20%` is still exact equality against the text `20%`; only `slug~:` is a pattern. That direction is deliberate: a `%` that arrives through a variable — from an API response, say — must never be able to widen a `DELETE` on its own.
+- **The condition grammar is four operators**, and they work in every step that takes a condition: `col:` is `=`, `col!:` is `<>`, `col~:` is `LIKE`, `col!~:` is `NOT LIKE`. With `<<null>>`: `col:` reads `IS NULL` and `col!:` reads `IS NOT NULL`. Under a `~` the value is an SQL `LIKE` pattern in full — `_` matches any single character too, and `\%` / `\_` are the literal characters.
+- **A negation with a value never matches a NULL column.** `name!: keeper` is SQL's `name <> 'keeper'`, and that is unknown — not true — for a row whose `name` is NULL, so "everything that isn't `keeper`" quietly leaves those rows behind. It is ordinary three-valued logic and the engine is right; it is just rarely what the sentence in your head meant. Add `name: <<null>>` as a second condition if you want them too.
+- **`<<run_id>>` is now a reserved name.** Like `<<null>>`, `<<uuid()>>` and `<<unique()>>`, it is answered before your own variables are looked at, so a variable you set called `run_id` — plausible, if you extract one from a column — is shadowed rather than read.
+- **Only `<<unique()>>` carries the run prefix** — the `token` kind and its `email`, `slug`, `url` aliases. `<<unique(number)>>` is microseconds plus a counter, with no prefix in it, so a `LIKE` on `<<run_id>>` never reaches a column filled that way: delete those rows by a column that does carry a token, or by their key.
+- **`@priority(-100)` makes the file last in *its own chain*, not last in the run.** Chains run in parallel, so the cleanup file and the files whose data it removes belong in one `@serial(<name>)` chain — otherwise it can delete rows another chain is still using.
+
 ## Plugins
 
 `api`, `db` and `srp` are the resource kinds built into the binary. Any **other** key under `resources:` is a group served by a plugin — a shared library bddkit loads at startup — so reaching an object store, a queue or a mailbox is the same move as reaching a second database:
@@ -278,6 +296,7 @@ Writing one: [`docs/plugin-authoring.md`](docs/plugin-authoring.md) is the compl
 | Polling an assertion until it passes | `examples/features/eventual.feature` |
 | The mock API behind all of it | `examples/mocks/api-server.yaml` |
 | Every DB step, worked through | `examples/db-features/db.feature` |
+| Cleaning up a run's data | `examples/db-features/cleanup.feature` |
 | The same on MySQL and MariaDB | `examples/db-features-mysql/db.feature` |
 | SRP handshake, Hawk signing | `tests/features/` |
 | Config schema | `src/config.rs` |
