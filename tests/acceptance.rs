@@ -1627,3 +1627,48 @@ fn resource_add_prints_the_group_key_for_a_group_the_config_lacks() {
         "the block names the group it belongs under: {stdout}"
     );
 }
+
+/// The first question an agent asks a binary on `PATH`. `version` and
+/// `--version` must be the same answer, and its first line must stay the one
+/// line a script greps.
+#[test]
+fn version_answers_to_both_spellings_and_leads_with_the_semver() {
+    let subcommand = Command::new(env!("CARGO_BIN_EXE_bddkit"))
+        .arg("version")
+        .output()
+        .expect("failed to run bddkit");
+    let flag = Command::new(env!("CARGO_BIN_EXE_bddkit"))
+        .arg("--version")
+        .output()
+        .expect("failed to run bddkit");
+
+    let short = Command::new(env!("CARGO_BIN_EXE_bddkit"))
+        .arg("-V")
+        .output()
+        .expect("failed to run bddkit");
+
+    assert_eq!(subcommand.status.code(), Some(0));
+    assert_eq!(flag.status.code(), Some(0));
+    assert_eq!(short.status.code(), Some(0));
+
+    let text = String::from_utf8_lossy(&subcommand.stdout);
+    assert_eq!(text, String::from_utf8_lossy(&flag.stdout), "same answer");
+
+    let first = text.lines().next().expect("version prints something");
+    assert_eq!(
+        first,
+        format!("bddkit {}", env!("CARGO_PKG_VERSION")),
+        "the first line is the binary and its version, nothing else"
+    );
+    assert!(text.contains("bddkit steps list"), "signposts: {text}");
+    assert!(text.contains("bddkit doctor"), "signposts: {text}");
+
+    // The whole point of the `version` / `long_version` split: a one-token
+    // edit that feeds the long form to `-V` too breaks every script grepping
+    // it, and every assertion above would stay green.
+    assert_eq!(
+        String::from_utf8_lossy(&short.stdout),
+        format!("bddkit {}\n", env!("CARGO_PKG_VERSION")),
+        "-V stays the one line a script greps"
+    );
+}
