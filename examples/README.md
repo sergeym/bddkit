@@ -31,7 +31,9 @@ docker compose up -d db                          # Postgres on :5433, schema fro
 ./target/release/bddkit run --config examples/db.yaml
 ```
 
-`db-features/db.feature` walks through every DB step: inserts (one-liner, table, multi-table), update, delete, extraction into a variable, row-presence assertions, procedures, functions, sequences, and a second connection. It is deliberately Postgres-only — see the portability table below for what that costs.
+`db-features/db.feature` walks through every DB step: inserts (one-liner, table, multi-table), update, delete, extraction into a variable, row-presence assertions, the four condition operators (`col:`, `col!:`, `col~:`, `col!~:`), procedures, functions, sequences, and a second connection. It is deliberately Postgres-only — see the portability table below for what that costs.
+
+`db-features/cleanup.feature` is the run-scoped cleanup pattern: `<<run_id>>` plus a `~:` on the column — the operator that asks for `LIKE` — removes exactly the companies this run inserted. Both files carry `@serial(demo)`, so they are one chain and the cleanup — tagged `@priority(-100)` — is the last file of it. Without the shared `@serial` tag the two files are separate chains and can run at the same time, which is the one way this pattern goes wrong.
 
 ## Database suite on MySQL — `examples/db-mysql.yaml`
 
@@ -71,6 +73,7 @@ The root `README.md` states the support level; this is the same ground per row, 
 | `binary`/`varbinary` columns | n/a | **no** | **no** | `UUID_TO_BIN(uuid, swap_flag)` reorders bytes depending on a flag that `information_schema` does not record, so bddkit cannot know which layout the service under test reads. It refuses rather than write disagreeing bytes. Use `char(36)` — as `examples/db/init-mysql.sql` does — and bddkit fills it with a client-side UUIDv7. Every width is refused, not just 16: this layer binds and compares as text, so a WHERE against any binary column would match nothing |
 | A PK filled by a server-side `DEFAULT` that is not `AUTO_INCREMENT` | yes | **no** | yes | Reading the value back needs `RETURNING`, which MySQL does not have (MariaDB has it from 10.5). The step is refused before the INSERT rather than after it commits — give the value explicitly, or use `AUTO_INCREMENT` |
 | The *text* an `I extract` yields | each its own | each its own | each its own | Portable as a step, not as a value. Every engine renders its own types: `now()` is `2026-08-29 15:11:50.884052+00` on Postgres and `2026-08-29 15:11:50` on both others, a boolean is `true` vs `1`, and a bare `numeric` is `0` where `decimal(12,2)` is `0.00`. So `variable "x" should be equal to "..."` on an extracted timestamp or boolean is engine-specific even though the steps around it are not — the example only extracts from `varchar` columns for that reason |
+| `col~:` / `col!~:` (`LIKE`) | case-sensitive | **case-insensitive** | **case-insensitive** | The operator, the pattern and the escaping are identical; only the matching is not. MySQL and MariaDB compare under the column's collation, which is case-insensitive by default (`..._ci`), where Postgres `LIKE` never folds case. A pattern that must behave the same on all three should not rely on case — the run prefix `<<run_id>>` is lowercase base36, so the cleanup pattern is unaffected |
 | `I call procedure` / `I call function` | yes | yes | yes | The *steps* are portable; the routine *bodies* are not. The Postgres example's are `LANGUAGE sql` with `nextval()` and `\|\|`, which is why they are absent here rather than translated |
 
 Every other DB step is spelled the same and behaves the same on all three — which is what `examples/db-features-mysql/db.feature` demonstrates by passing, unchanged, from two different configs.

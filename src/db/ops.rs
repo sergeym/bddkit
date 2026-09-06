@@ -183,6 +183,9 @@ pub async fn extract(
     var: &str,
 ) -> Result<(), String> {
     let (pool, platform, schema, tref) = resolve(w, raw_table).await?;
+    // The read column is a plain name — the one position where a name is
+    // neither a condition nor a written value, and so takes no operator.
+    plan::plain_column(column)?;
     let col = schema.col(column).ok_or_else(|| {
         format!("column {column:?} is missing from {}", tref.sql_name())
     })?;

@@ -125,6 +125,9 @@ pub fn interpolate(input: &str, vars: &VarStack, generator: &Generator) -> Resul
             ("unique", a) => generator.next(parse_kind(a.unwrap_or(""))?),
             ("uuid", _) => uuid::Uuid::now_v7().to_string(),
             ("null", None) => NULL_SENTINEL.to_string(),
+            // The prefix every `<<unique()>>` token already carries, written
+            // down so a suite can delete exactly what this run created.
+            ("run_id", None) => generator.run_id().to_string(),
             (n, None) => vars
                 .get(n)
                 .ok_or_else(|| format!("variable {n:?} is not set"))?
@@ -334,6 +337,19 @@ mod tests {
         let s = VarStack::new();
         let err = interpolate("<<microtime(true)>>", &s, &generator()).unwrap_err();
         assert!(err.contains("unknown function"), "{err}");
+    }
+
+    #[test]
+    fn run_id_expands_to_the_prefix_every_unique_token_carries() {
+        let s = VarStack::new();
+        let g = generator();
+        let out = interpolate("<<run_id>>", &s, &g).unwrap();
+        assert_eq!(out, g.run_id());
+        assert!(
+            g.next(crate::unique::UniqueKind::Token)
+                .starts_with(&format!("u{out}")),
+            "a LIKE on the run_id must reach every unique token of the run"
+        );
     }
 
     #[test]

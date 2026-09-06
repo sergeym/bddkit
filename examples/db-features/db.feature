@@ -1,4 +1,4 @@
-@db
+@db @serial(demo)
 Feature: working with the database
 
   Demonstrates every DB step against the apibdd_demo schema (see examples/db/init.sql,
@@ -72,3 +72,35 @@ Feature: working with the database
     Given I use "reporting" connection
     And I have "audit_log" with "message: demo audit entry"
     Then I should have "audit_log" with "message: demo audit entry"
+
+  Scenario: the four condition operators
+    Given I have "companies" where:
+      | slug                 | name       |
+      | opdemo_a_<<run_id>>  | underscore |
+      | opdemoXaY<<run_id>>  | neighbour  |
+      | opdemo50%<<run_id>>  | percent    |
+      | opdemokeep<<run_id>> | keeper     |
+
+    # A bare "col:" is exact equality even when the value is nothing but wildcards.
+    Then I should have "companies" with "slug: opdemo50%<<run_id>>"
+    And I should not have "companies" with "slug: opdemo50Z<<run_id>>"
+
+    # "col!:" is <> and "col!~:" is NOT LIKE.
+    Then I should not have "companies" with "name!: keeper, slug: opdemokeep<<run_id>>"
+    And I should have "companies" with "name!~: keep%, slug: opdemo_a_<<run_id>>"
+
+    # Under a pattern a literal per cent is "\%": one row, not the whole opdemo50 family.
+    When I delete "companies" where "slug~: opdemo50\%<<run_id>>"
+    Then variable "deleted_companies" should be equal to "1"
+
+    # Unmarked, that same "%" is data — this asks for a slug that literally contains it.
+    When I delete "companies" where "slug: opdemokeep%<<run_id>>"
+    Then variable "deleted_companies" should be equal to "0"
+
+    # Under "~:" an "_" matches any single character, so the neighbour goes too.
+    When I delete "companies" where "slug~: opdemo_a_<<run_id>>"
+    Then variable "deleted_companies" should be equal to "2"
+
+    # Whatever this scenario still owns. Its rows are prefixed, so no other file's are.
+    When I delete "companies" where "slug~: opdemo%<<run_id>>"
+    Then variable "deleted_companies" should be equal to "1"

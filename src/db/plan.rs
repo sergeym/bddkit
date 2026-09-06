@@ -80,6 +80,7 @@ pub fn build_insert(
 ) -> Result<InsertPlan, String> {
     // Given columns must exist and be bindable.
     for (col, _) in values {
+        plain_column(col)?;
         match schema.col(col) {
             None => return Err(format!("column {col:?} is missing from table {sql_name}")),
             Some(c) => platform.check_bindable(c)?,
@@ -226,9 +227,83 @@ pub fn build_insert(
     })
 }
 
-/// Builds `col = <bind> AND …`, in the platform's own bind syntax. NULL →
-/// `col IS NULL` with no bind. Parameter numbering starts at `start` (for
-/// UPDATE, where SET takes the first parameter).
+/// The comparison one condition pair asks for. It is written as a suffix on
+/// the COLUMN name (`slug~: u123%`), never inferred from the value's text —
+/// so a `%` that arrives inside a variable can never turn an equality into a
+/// pattern behind the author's back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Op {
+    Eq,
+    Ne,
+    Like,
+    NotLike,
+}
+
+impl Op {
+    /// The SQL keyword. A `match`, not an `if`, on purpose: this is the one
+    /// place a new operator can be forgotten silently, because the arms of
+    /// `build_where` below already pattern-match on `Op` and so refuse to
+    /// compile until a new variant is placed. Adding `Gte` here without a
+    /// keyword is a compile error; adding it to an `if op == Op::Eq` was not.
+    fn sql(self) -> &'static str {
+        match self {
+            Op::Eq => "=",
+            Op::Ne => "<>",
+            Op::Like => "LIKE",
+            Op::NotLike => "NOT LIKE",
+        }
+    }
+}
+
+/// Splits `slug!~` into (`slug`, `Op::NotLike`). Longest suffix first, so
+/// `!~` cannot degrade into `!`. A leftover OPERATOR-SHAPED character is an
+/// error naming what was written, because the alternative is a schema lookup
+/// for a column called `price>=`, which reports a missing column and sends
+/// the author to their DDL over a typo in their step. The guard covers
+/// `!~<>=` only — `slug*:` still reports a missing column, which is the right
+/// answer for a character no operator will ever start with.
+fn split_operator(raw: &str) -> Result<(&str, Op), String> {
+    const SUFFIXES: [(&str, Op); 3] = [("!~", Op::NotLike), ("~", Op::Like), ("!", Op::Ne)];
+    let (name, op) = SUFFIXES
+        .iter()
+        .find_map(|(s, op)| raw.strip_suffix(s).map(|n| (n, *op)))
+        .unwrap_or((raw, Op::Eq));
+    let name = name.trim_end();
+    if name.is_empty() || name.ends_with(|c: char| "!~<>=".contains(c)) {
+        return Err(format!(
+            "unknown operator in condition column {raw:?}; available: \
+             `col:` (=), `col!:` (<>), `col~:` (LIKE), `col!~:` (NOT LIKE)"
+        ));
+    }
+    Ok((name, op))
+}
+
+/// An operator belongs to a condition. Anywhere a value is WRITTEN it is a
+/// typo, and letting it through would report a missing column `slug~` —
+/// sending the author to look at their schema instead of at their step.
+pub fn plain_column(raw: &str) -> Result<(), String> {
+    match split_operator(raw)? {
+        (_, Op::Eq) => Ok(()),
+        _ => Err(format!(
+            "column {raw:?}: an operator is only allowed in a condition, \
+             not where a value is set"
+        )),
+    }
+}
+
+/// Builds `col <op> <bind> AND …`, in the platform's own bind syntax.
+/// Parameter numbering starts at `start` (for UPDATE, where SET takes the
+/// first parameters).
+///
+/// NULL is `col: <<null>>` → `IS NULL` and `col!: <<null>>` → `IS NOT NULL`,
+/// both with no bind; a LIKE against NULL is refused rather than built, since
+/// it can only ever match nothing.
+///
+/// Under `~`/`!~` the value is an SQL LIKE pattern in full: `%` and `_` both
+/// match, and `\%` / `\_` are the literal characters — backslash is the
+/// default LIKE escape on all three engines, so no ESCAPE clause is built.
+/// The COLUMN side goes through `cast_text`, so a non-text column is matched
+/// against its own text rendering instead of failing on the operator.
 pub fn build_where(
     platform: &dyn Platform,
     schema: &TableSchema,
@@ -238,15 +313,42 @@ pub fn build_where(
     let mut parts = Vec::new();
     let mut binds = Vec::new();
     let mut param = start;
-    for (col, val) in pairs {
+    for (raw, val) in pairs {
+        let (col, op) = split_operator(raw)?;
         let c = schema
             .col(col)
             .ok_or_else(|| format!("column {col:?} is missing from the table"))?;
         platform.check_bindable(c)?;
-        match val {
-            None => parts.push(format!("{col} IS NULL")),
-            Some(_) => {
-                parts.push(format!("{col} = {}", platform.bind(param, &c.type_name)));
+        match (op, val) {
+            (Op::Eq, None) => parts.push(format!("{col} IS NULL")),
+            (Op::Ne, None) => parts.push(format!("{col} IS NOT NULL")),
+            (Op::Like | Op::NotLike, None) => {
+                return Err(format!(
+                    "column {col:?}: a LIKE has nothing to match against <<null>>; \
+                     write `{col}: <<null>>` or `{col}!: <<null>>`"
+                ));
+            }
+            // A pattern: the COLUMN is rendered as text and the value binds
+            // as text. An ordering operator must NOT be added here — under
+            // `cast_text` a comparison is lexicographic, and `amount>=: 9`
+            // would answer `'9' >= '10'`. It belongs in the arm below, which
+            // binds the column's own type and lets the engine compare.
+            (Op::Like | Op::NotLike, Some(_)) => {
+                parts.push(format!(
+                    "{} {} {}",
+                    platform.cast_text(col),
+                    op.sql(),
+                    platform.bind(param, "text")
+                ));
+                binds.push(val.clone());
+                param += 1;
+            }
+            (Op::Eq | Op::Ne, Some(_)) => {
+                parts.push(format!(
+                    "{col} {} {}",
+                    op.sql(),
+                    platform.bind(param, &c.type_name)
+                ));
                 binds.push(val.clone());
                 param += 1;
             }
@@ -269,6 +371,7 @@ pub fn build_update(
     let mut binds = Vec::new();
     let mut param = 1usize;
     for (col, val) in set {
+        plain_column(col)?;
         let c = schema
             .col(col)
             .ok_or_else(|| format!("column {col:?} is missing from the table"))?;
@@ -520,7 +623,8 @@ mod tests {
 
     #[test]
     fn where_param_numbering_respects_start() {
-        let (sql, _) = build_where(&PG, &companies(), &[("slug".into(), Some("x".into()))], 4).unwrap();
+        let (sql, _) =
+            build_where(&PG, &companies(), &[("slug".into(), Some("x".into()))], 4).unwrap();
         assert_eq!(sql, "slug = $4::text");
     }
 
@@ -558,6 +662,162 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn operator_parsing_holds_at_its_edges() {
+        // `parse_oneliner` trims the whole column, so `slug ~: x` arrives as
+        // "slug ~" and the trim_end inside split_operator is what saves it.
+        let (sql, _) = build_delete(
+            &PG,
+            &companies(),
+            "companies",
+            &[("slug ~".into(), Some("a%".into()))],
+        )
+        .unwrap();
+        assert!(sql.contains("LIKE"), "a space before the operator is allowed: {sql}");
+
+        for raw in ["!", "~", "slug!!", "slug~!", "slug>="] {
+            let err = build_where(&PG, &companies(), &[(raw.into(), Some("x".into()))], 1)
+                .unwrap_err();
+            assert!(
+                err.contains("unknown operator") && err.contains(raw),
+                "{raw:?} must be refused by name, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_operator_comes_from_the_column_not_from_the_value() {
+        // The whole point of the suffix: an unmarked column is `=` even when
+        // the value is full of wildcards, so a `%` arriving through a variable
+        // cannot widen a delete behind the author's back.
+        let (sql, binds) = build_delete(
+            &PG,
+            &companies(),
+            "companies",
+            &[("slug".into(), Some("50%_x".into()))],
+        )
+        .unwrap();
+        assert_eq!(sql, "DELETE FROM companies WHERE slug = $1::text");
+        assert_eq!(binds, vec![Some("50%_x".to_string())]);
+    }
+
+    #[test]
+    fn a_tilde_asks_for_like_and_the_value_is_the_pattern() {
+        let (sql, binds) = build_delete(
+            &PG,
+            &companies(),
+            "companies",
+            &[("slug~".into(), Some("demo_run_uabc123%".into()))],
+        )
+        .unwrap();
+        assert_eq!(sql, "DELETE FROM companies WHERE (slug)::text LIKE $1::text");
+        assert_eq!(
+            binds,
+            vec![Some("demo_run_uabc123%".to_string())],
+            "the author asked for a pattern: it reaches the server untouched"
+        );
+    }
+
+    #[test]
+    fn bang_is_not_equal_and_bang_tilde_is_not_like() {
+        let (sql, _) = build_delete(
+            &PG,
+            &companies(),
+            "companies",
+            &[
+                ("id!".into(), Some("7".into())),
+                ("slug!~".into(), Some("tmp%".into())),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            sql,
+            "DELETE FROM companies WHERE id <> $1::int4 AND (slug)::text NOT LIKE $2::text"
+        );
+    }
+
+    #[test]
+    fn null_reads_is_null_and_is_not_null() {
+        let (sql, binds) = build_where(
+            &PG,
+            &companies(),
+            &[("deleted_at".into(), None), ("slug!".into(), None)],
+            1,
+        )
+        .unwrap();
+        assert_eq!(sql, "deleted_at IS NULL AND slug IS NOT NULL");
+        assert!(binds.is_empty(), "neither side binds anything");
+    }
+
+    #[test]
+    fn a_like_against_null_is_refused_naming_the_alternative() {
+        let err = build_where(&PG, &companies(), &[("slug~".into(), None)], 1).unwrap_err();
+        assert!(err.contains("slug"), "{err}");
+        assert!(err.contains("<<null>>"), "{err}");
+    }
+
+    #[test]
+    fn an_unknown_operator_is_an_error_naming_it() {
+        // Not "column \"price>=\" is missing from the table": that answer sends
+        // the author to their DDL for what is a typo in the step.
+        let err = build_where(&PG, &companies(), &[("slug>=".into(), Some("1".into()))], 1)
+            .unwrap_err();
+        assert!(err.contains("slug>="), "{err}");
+        assert!(err.contains("unknown operator"), "{err}");
+    }
+
+    #[test]
+    fn an_operator_is_refused_where_a_value_is_written() {
+        let err = build_update(
+            &PG,
+            &companies(),
+            "companies",
+            &[("slug~".into(), Some("x%".into()))],
+            &[("id".into(), Some("1".into()))],
+        )
+        .unwrap_err();
+        assert!(err.contains("only allowed in a condition"), "{err}");
+        let err = build_insert(
+            &PG,
+            &companies(),
+            "companies",
+            "companies",
+            &[("slug!".into(), Some("x".into()))],
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("only allowed in a condition"), "{err}");
+    }
+
+    #[test]
+    fn operators_reach_an_assertion_too() {
+        // Nothing gates them by step any more: the syntax is explicit, so
+        // there is no silent loosening left to protect an assertion from.
+        let (sql, _) = build_exists(
+            &PG,
+            &companies(),
+            "companies",
+            &[("slug~".into(), Some("uabc%".into()))],
+        )
+        .unwrap();
+        assert_eq!(
+            sql,
+            "SELECT 1 FROM companies WHERE (slug)::text LIKE $1::text LIMIT 1"
+        );
+    }
+
+    #[test]
+    fn like_is_spelled_in_the_mysql_dialect() {
+        let (sql, _) = build_delete(
+            &MYSQL,
+            &companies(),
+            "companies",
+            &[("slug~".into(), Some("uabc123%".into()))],
+        )
+        .unwrap();
+        assert_eq!(sql, "DELETE FROM companies WHERE CAST(slug AS CHAR) LIKE ?");
     }
 
     #[test]
