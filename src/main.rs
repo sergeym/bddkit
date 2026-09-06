@@ -24,10 +24,21 @@ use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+/// What `--version` and `bddkit version` answer. `-V` keeps the bare
+/// `version` — the one line a script greps — so the two signposts below are
+/// the long form only. clap prefixes both with the binary name.
+const LONG_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    "\nGherkin acceptance testing for backend services.\n",
+    "\n  bddkit steps list                    every step this binary understands",
+    "\n  bddkit doctor --config suite.yaml    check a suite before it runs",
+);
+
 #[derive(Parser)]
 #[command(
     name = "bddkit",
     version,
+    long_version = LONG_VERSION,
     about = "Run Gherkin scenarios against an HTTP API"
 )]
 struct Cli {
@@ -45,6 +56,8 @@ enum Command {
     Doctor(DoctorArgs),
     /// Show what a resource's config takes
     Resource(ResourceArgs),
+    /// Print the version, and where to look next
+    Version,
 }
 
 #[derive(Args)]
@@ -346,6 +359,14 @@ async fn main() {
         Command::Steps(args) => (steps_command(args), "nothing listed"),
         Command::Doctor(args) => (doctor_command(args).await, "nothing checked"),
         Command::Resource(args) => (resource_command(args).await, "nothing listed"),
+        Command::Version => {
+            use clap::CommandFactory;
+            // Rendered, never re-formatted from `LONG_VERSION` by hand: the
+            // subcommand and `--version` cannot drift apart if they cannot be
+            // written apart.
+            print!("{}", Cli::command().render_long_version());
+            (Ok(0), "nothing printed")
+        }
     };
     match result {
         Ok(code) => std::process::exit(code),
