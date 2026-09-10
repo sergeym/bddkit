@@ -619,6 +619,51 @@ async fn print_body_as_path_fails_for_plain_content_type() {
     );
 }
 
+/// The bug this fixes: `Print response body as "<selector>"` used to route
+/// HTML through the XML-only XPath engine and fail on anything but strict,
+/// fully-closed, fully-quoted XHTML. It must now succeed on real HTML.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn print_body_as_path_succeeds_on_real_world_html() {
+    let base = common::spawn().await;
+    let dir = std::env::temp_dir().join(format!("bddkit-debug-html-loose-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("features")).expect("mkdir");
+    std::fs::write(
+        dir.join("features/html_loose.feature"),
+        "Feature: f\n  Scenario: s\n    When I request \"/html-loose\"\n    Then Print response body as \"div.box\"\n",
+    )
+    .expect("write feature");
+    std::fs::write(
+        dir.join("cfg.yaml"),
+        format!(
+            "paths: [{}]\nresources:\n  api:\n    stub:\n      base_url: {base}\n",
+            dir.join("features")
+                .display()
+                .to_string()
+                .replace('\\', "/")
+        ),
+    )
+    .expect("write config");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
+        .args([
+            "run",
+            "--config",
+            dir.join("cfg.yaml").to_str().expect("path is UTF-8"),
+        ])
+        .output()
+        .expect("failed to run bddkit");
+
+    assert!(
+        out.status.success(),
+        "expected success, got: {:?}\nstdout: {}\nstderr: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("Loose"), "{stderr}");
+}
+
 /// Prepares two feature files that write the same variable with different
 /// values BEFORE the barrier and check it AFTER. The barrier guarantees that
 /// both files have written before either reads: a run-wide `VarStack` would

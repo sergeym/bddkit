@@ -14,8 +14,8 @@ Feature: debug printing of the response
     And Print response body
     And Print response body as "//user[@id='2']/email"
 
-  Scenario: print an HTML response and select by XPath
+  Scenario: print an HTML response and select by CSS
     When I request "/html"
     Then the response code is 200
     And Print response body
-    And Print response body as "//p"
+    And Print response body as "p"
