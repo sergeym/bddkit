@@ -52,6 +52,36 @@ Feature: basic HTTP steps
     And the "x-trace" response header is "trace-1"
     And the JSON node "jwt" should exist
 
+  Scenario: JSON node absence and null checks
+    Given the "Content-Type" request header is "application/json"
+    And the request body is:
+      """
+      {"name": "test", "deletedAt": null}
+      """
+    When I request "/echo" using HTTP POST
+    Then the JSON node "received.password" should not exist
+    And the JSON node "received.deletedAt" should be null
+    And the JSON node "received.name" should not be null
+    And the response body does not contain JSON:
+      """
+      {"received": {"password": "secret"}}
+      """
+    And the JSON node "received.name" should not contain "xyz"
+
+  Scenario: error responses do not leak internals
+    Given the "Content-Type" request header is "application/json"
+    And the request body is:
+      """
+      {"password": "wrong"}
+      """
+    When I request "/login" using HTTP POST
+    Then the JSON node "errorMessage" should not contain "SQL"
+
+  Scenario: empty response body
+    When I request "/no-content" using HTTP GET
+    Then the response code is 204
+    And the response body should be empty
+
   Scenario Outline: query parameter
     Given the query parameter "email" is "<email>"
     When I request "/users" using HTTP GET
