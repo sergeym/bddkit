@@ -27,6 +27,7 @@ pub async fn spawn() -> String {
         .route("/xml", get(xml_doc))
         .route("/html", get(html_doc))
         .route("/plain", get(plain_text))
+        .route("/no-content", get(no_content))
         .route("/srp/register", post(srp_register))
         .route("/srp/step1", post(srp_step1))
         .route("/srp/step2", post(srp_step2))
@@ -85,6 +86,10 @@ pub async fn spawn_barrier(n: usize) -> String {
         axum::serve(listener, app).await.expect("serve");
     });
     format!("http://{addr}/")
+}
+
+async fn no_content() -> StatusCode {
+    StatusCode::NO_CONTENT
 }
 
 async fn ping() -> Json<Value> {

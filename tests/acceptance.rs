@@ -118,6 +118,82 @@ async fn eventual_post_response_replays_the_saved_method_and_body() {
     assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
 
+async fn spawn_eventual_absence_stub(ready_on: usize) -> String {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let app = Router::new().route(
+        "/eventual-absence",
+        post(move |_body: String| {
+            let calls = calls.clone();
+            async move {
+                let call = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                if call >= ready_on {
+                    Json(json!({"state": "ready"}))
+                } else {
+                    Json(json!({"state": "pending", "pendingReason": "not ready yet"}))
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind eventual-absence stub");
+    let address = listener.local_addr().expect("eventual-absence stub address");
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serve eventual-absence stub");
+    });
+    format!("http://{address}/")
+}
+
+fn write_eventual_absence_project(base: &str, name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("bddkit-{name}-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("features")).expect("mkdir");
+    std::fs::write(
+        dir.join("features/eventual.feature"),
+        r#"Feature: eventual absence
+  Scenario: poll until a node disappears
+    When I request "/eventual-absence" using HTTP POST
+    And I expect the next assertion to pass within "1" seconds, checking every "25" milliseconds
+    Then the JSON node "pendingReason" should not exist
+"#,
+    )
+    .expect("write eventual feature");
+    let config = dir.join("cfg.yaml");
+    std::fs::write(
+        &config,
+        format!(
+            "paths: [{}]\nresources:\n  api:\n    stub:\n      base_url: {base}\n",
+            dir.join("features")
+                .display()
+                .to_string()
+                .replace('\\', "/")
+        ),
+    )
+    .expect("write eventual config");
+    config
+}
+
+/// Issue #22, item 7: "wait for absence" must be explicitly validated, not just
+/// assumed to work by composition with the existing polling mechanism.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn eventual_absence_polls_until_the_node_disappears() {
+    let base = spawn_eventual_absence_stub(2).await;
+    let config = write_eventual_absence_project(&base, "eventual-absence-success");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
+        .args(["run", "--config", config.to_str().expect("UTF-8 config path")])
+        .output()
+        .expect("run bddkit");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "polling for absence must pass once the node disappears\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn eventual_post_timeout_reports_last_mismatch_and_final_exchange() {
     let (base, _calls) = spawn_eventual_post_stub(None).await;

@@ -39,6 +39,12 @@ pub enum StepId {
     ResponseArrayLength,
     ResponseHeader,
     JsonNodeExists,
+    JsonNodeNotExists,
+    JsonNodeIsNull,
+    JsonNodeNotNull,
+    ResponseBodyNotContainsJson,
+    JsonNodeNotContainsSubstring,
+    ResponseBodyEmpty,
     // variables
     SetVariable,
     SetVariableGlobal,
@@ -255,6 +261,48 @@ pub const BUILTIN_STEPS: &[StepDef] = &[
         "api",
         r#"^the JSON node "(?P<path>[^"]*)" should exist$"#,
         "asserts the response body has a node at this JSON path",
+        OptionsSource::Http,
+    ),
+    assertion(
+        StepId::JsonNodeNotExists,
+        "api",
+        r#"^the JSON node "(?P<path>[^"]*)" should not exist$"#,
+        "asserts the response body has no node at this JSON path — a null value still counts as existing",
+        OptionsSource::Http,
+    ),
+    assertion(
+        StepId::JsonNodeIsNull,
+        "api",
+        r#"^the JSON node "(?P<path>[^"]*)" should be null$"#,
+        "asserts the node at this JSON path exists and is JSON null",
+        OptionsSource::Http,
+    ),
+    assertion(
+        StepId::JsonNodeNotNull,
+        "api",
+        r#"^the JSON node "(?P<path>[^"]*)" should not be null$"#,
+        "asserts the node at this JSON path exists and is not JSON null",
+        OptionsSource::Http,
+    ),
+    assertion(
+        StepId::ResponseBodyNotContainsJson,
+        "api",
+        r#"^the response body does not contain JSON:$"#,
+        "asserts the response body does not contain this JSON — same subset/order-independent matching as `contains`, inverted",
+        OptionsSource::Http,
+    ),
+    assertion(
+        StepId::JsonNodeNotContainsSubstring,
+        "api",
+        r#"^the JSON node "(?P<path>[^"]*)" should not contain "(?P<substring>[^"]*)"$"#,
+        "asserts a string node does not contain this substring",
+        OptionsSource::Http,
+    ),
+    assertion(
+        StepId::ResponseBodyEmpty,
+        "api",
+        r#"^the response body should be empty$"#,
+        "asserts the response body is empty",
         OptionsSource::Http,
     ),
     action(
@@ -984,6 +1032,30 @@ pub async fn dispatch(w: &mut World, id: StepId, a: &Args, attempt: u64) -> Atte
         StepId::JsonNodeExists => {
             assert::replay_response(w, attempt).await?;
             return assert::json_node_exists(w, a.cap(0));
+        }
+        StepId::JsonNodeNotExists => {
+            assert::replay_response(w, attempt).await?;
+            return assert::json_node_not_exists(w, a.cap(0));
+        }
+        StepId::JsonNodeIsNull => {
+            assert::replay_response(w, attempt).await?;
+            return assert::json_node_is_null(w, a.cap(0));
+        }
+        StepId::JsonNodeNotNull => {
+            assert::replay_response(w, attempt).await?;
+            return assert::json_node_not_null(w, a.cap(0));
+        }
+        StepId::ResponseBodyNotContainsJson => {
+            assert::replay_response(w, attempt).await?;
+            return assert::body_not_contains_json(w, a.docstring.as_ref());
+        }
+        StepId::JsonNodeNotContainsSubstring => {
+            assert::replay_response(w, attempt).await?;
+            return assert::json_node_not_contains(w, a.cap(0), a.cap(1));
+        }
+        StepId::ResponseBodyEmpty => {
+            assert::replay_response(w, attempt).await?;
+            return assert::body_empty(w);
         }
         StepId::SetVariable => vars::set_variable(w, a.cap(0), a.cap(1), false),
         StepId::SetVariableGlobal => vars::set_variable(w, a.cap(0), a.cap(1), true),
