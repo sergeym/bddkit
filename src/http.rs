@@ -296,6 +296,11 @@ impl HttpState {
         self.last.as_ref()
     }
 
+    #[cfg(test)]
+    pub(crate) fn store_test_exchange(&mut self, ex: Exchange) {
+        self.last = Some(ex);
+    }
+
     pub fn options_for_last_response(&self) -> Result<&Options, String> {
         let recipe = self.replay.as_ref().ok_or("request has not been sent")?;
         self.apis.options(&recipe.api)

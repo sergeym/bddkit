@@ -3,6 +3,7 @@ pub mod assert;
 pub mod db;
 pub mod debug;
 pub mod help;
+mod markup;
 pub mod plugin;
 pub mod srp;
 pub mod vars;
@@ -45,6 +46,13 @@ pub enum StepId {
     ResponseBodyNotContainsJson,
     JsonNodeNotContainsSubstring,
     ResponseBodyEmpty,
+    ResponseBodyContains,
+    ResponseBodyNotContains,
+    ResponseBodyMatches,
+    ResponseBodyNotMatches,
+    ResponseBodyHasElement,
+    ResponseBodyHasElementWithText,
+    ResponseBodyNotHasElement,
     // variables
     SetVariable,
     SetVariableGlobal,
@@ -52,6 +60,7 @@ pub enum StepId {
     ExtractFromJsonGlobal,
     ExtractFromCookies,
     ExtractFromCookiesGlobal,
+    ExtractFromMarkup,
     VariableEquals,
     VariableNotEquals,
     EncryptWithAes,
@@ -305,6 +314,55 @@ pub const BUILTIN_STEPS: &[StepDef] = &[
         "asserts the response body is empty",
         OptionsSource::Http,
     ),
+    assertion(
+        StepId::ResponseBodyContains,
+        "api",
+        r#"^the response body contains "(?P<text>[^"]*)"$"#,
+        "asserts the raw response body contains this text — works for any content type",
+        OptionsSource::Http,
+    ),
+    assertion(
+        StepId::ResponseBodyNotContains,
+        "api",
+        r#"^the response body does not contain "(?P<text>[^"]*)"$"#,
+        "asserts the raw response body does not contain this text",
+        OptionsSource::Http,
+    ),
+    assertion(
+        StepId::ResponseBodyMatches,
+        "api",
+        r#"^the response body matches "(?P<pattern>[^"]*)"$"#,
+        "asserts the raw response body matches this regular expression",
+        OptionsSource::Http,
+    ),
+    assertion(
+        StepId::ResponseBodyNotMatches,
+        "api",
+        r#"^the response body does not match "(?P<pattern>[^"]*)"$"#,
+        "asserts the raw response body does not match this regular expression",
+        OptionsSource::Http,
+    ),
+    assertion(
+        StepId::ResponseBodyHasElement,
+        "api",
+        r#"^the response body has element "(?P<selector>[^"]*)"$"#,
+        "asserts an HTML (CSS selector) or XML (XPath) element matches in the response body",
+        OptionsSource::Http,
+    ),
+    assertion(
+        StepId::ResponseBodyHasElementWithText,
+        "api",
+        r#"^the response body has element "(?P<selector>[^"]*)" with text "(?P<text>[^"]*)"$"#,
+        "asserts the matched elements' text, newline-joined if more than one, equals this value exactly",
+        OptionsSource::Http,
+    ),
+    assertion(
+        StepId::ResponseBodyNotHasElement,
+        "api",
+        r#"^the response body does not have element "(?P<selector>[^"]*)"$"#,
+        "asserts no element matches this selector in the response body",
+        OptionsSource::Http,
+    ),
     action(
         StepId::SetVariableGlobal,
         "vars",
@@ -340,6 +398,12 @@ pub const BUILTIN_STEPS: &[StepDef] = &[
         "vars",
         r#"^extract "(?P<cookie>[^"]*)" from cookies as "(?P<name>[^"]*)"$"#,
         "reads a response cookie into a variable",
+    ),
+    action(
+        StepId::ExtractFromMarkup,
+        "vars",
+        r#"^extract "(?P<selector>[^"]*)" from response body as "(?P<name>[^"]*)"$"#,
+        "reads the matched elements' text, newline-joined if more than one, into a variable",
     ),
     assertion(
         StepId::VariableNotEquals,
@@ -507,7 +571,7 @@ pub const BUILTIN_STEPS: &[StepDef] = &[
         StepId::PrintResponseBodyAsPath,
         "debug",
         r#"^Print response body as "(?P<path>[^"]*)"$"#,
-        "prints one JSON path or XPath selection of the last response to stderr",
+        "prints one JSON path, XPath (XML) or CSS selector (HTML) selection of the last response to stderr",
     ),
     action(
         StepId::SrpVerifierWithSalt,
@@ -1057,12 +1121,41 @@ pub async fn dispatch(w: &mut World, id: StepId, a: &Args, attempt: u64) -> Atte
             assert::replay_response(w, attempt).await?;
             return assert::body_empty(w);
         }
+        StepId::ResponseBodyContains => {
+            assert::replay_response(w, attempt).await?;
+            return assert::body_contains_text(w, a.cap(0));
+        }
+        StepId::ResponseBodyNotContains => {
+            assert::replay_response(w, attempt).await?;
+            return assert::body_not_contains_text(w, a.cap(0));
+        }
+        StepId::ResponseBodyMatches => {
+            assert::replay_response(w, attempt).await?;
+            return assert::body_matches(w, a.cap(0));
+        }
+        StepId::ResponseBodyNotMatches => {
+            assert::replay_response(w, attempt).await?;
+            return assert::body_not_matches(w, a.cap(0));
+        }
+        StepId::ResponseBodyHasElement => {
+            assert::replay_response(w, attempt).await?;
+            return assert::body_has_element(w, a.cap(0));
+        }
+        StepId::ResponseBodyHasElementWithText => {
+            assert::replay_response(w, attempt).await?;
+            return assert::body_has_element_with_text(w, a.cap(0), a.cap(1));
+        }
+        StepId::ResponseBodyNotHasElement => {
+            assert::replay_response(w, attempt).await?;
+            return assert::body_not_has_element(w, a.cap(0));
+        }
         StepId::SetVariable => vars::set_variable(w, a.cap(0), a.cap(1), false),
         StepId::SetVariableGlobal => vars::set_variable(w, a.cap(0), a.cap(1), true),
         StepId::ExtractFromJson => vars::extract_from_json(w, a.cap(0), a.cap(1), false),
         StepId::ExtractFromJsonGlobal => vars::extract_from_json(w, a.cap(0), a.cap(1), true),
         StepId::ExtractFromCookies => vars::extract_from_cookies(w, a.cap(0), a.cap(1), false),
         StepId::ExtractFromCookiesGlobal => vars::extract_from_cookies(w, a.cap(0), a.cap(1), true),
+        StepId::ExtractFromMarkup => vars::extract_from_markup(w, a.cap(0), a.cap(1)),
         StepId::VariableEquals => {
             return vars::variable_equals(w, a.cap(0), a.cap(1), false);
         }
@@ -1425,6 +1518,13 @@ mod tests {
             "the response body contains JSON:",
             "the response body equals JSON:",
             "the response body is a JSON array of length 3",
+            r#"the response body contains "hello""#,
+            r#"the response body does not contain "hello""#,
+            r#"the response body matches "h[0-9]""#,
+            r#"the response body does not match "h[0-9]""#,
+            r#"the response body has element "h1#title""#,
+            r#"the response body has element "h1#title" with text "Hi""#,
+            r#"the response body does not have element "h1#title""#,
             r#"the "X-Trace" response header is "abc""#,
             r#"the JSON node "data.id" should exist"#,
             r#"set variable "a" to "1""#,
@@ -1433,6 +1533,7 @@ mod tests {
             r#"extract "id" from JSON as "userId" global"#,
             r#"extract "jwt" from cookies as "t""#,
             r#"extract "jwt" from cookies as "t" global"#,
+            r#"extract "h1#title" from response body as "pageTitle""#,
             r#"variable "a" should be equal to "1""#,
             r#"variable "a" should not be equal to "1""#,
             r#"I encrypt "555555" with AES using key "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f" as "otp""#,

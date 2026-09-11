@@ -1,7 +1,9 @@
+use super::markup::{self, MarkupError};
 use crate::http::ReplayError;
 use crate::json::{matcher, path};
 use crate::polling::{AttemptError, AttemptResult};
 use crate::world::World;
+use regex::Regex;
 
 pub(super) async fn replay_response(w: &mut World, attempt: u64) -> AttemptResult {
     if attempt == 0 {
@@ -229,10 +231,192 @@ pub fn body_empty(w: &World) -> AttemptResult {
     }
 }
 
+pub fn body_contains_text(w: &World, needle: &str) -> AttemptResult {
+    let ex = last(w).map_err(AttemptError::Fatal)?;
+    if ex.body.contains(needle) {
+        Ok(())
+    } else {
+        Err(AttemptError::NotYet(format!(
+            "    expected body to contain: {needle:?}\n    actual body:\n{}",
+            ex.body
+        )))
+    }
+}
+
+pub fn body_not_contains_text(w: &World, needle: &str) -> AttemptResult {
+    let ex = last(w).map_err(AttemptError::Fatal)?;
+    if ex.body.contains(needle) {
+        Err(AttemptError::NotYet(format!(
+            "    expected body to NOT contain: {needle:?}\n    actual body:\n{}",
+            ex.body
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+pub fn body_matches(w: &World, pattern: &str) -> AttemptResult {
+    let ex = last(w).map_err(AttemptError::Fatal)?;
+    let re = Regex::new(pattern)
+        .map_err(|e| AttemptError::Fatal(format!("invalid regex {pattern:?}: {e}")))?;
+    if re.is_match(&ex.body) {
+        Ok(())
+    } else {
+        Err(AttemptError::NotYet(format!(
+            "    expected body to match: {pattern}\n    actual body:\n{}",
+            ex.body
+        )))
+    }
+}
+
+pub fn body_not_matches(w: &World, pattern: &str) -> AttemptResult {
+    let ex = last(w).map_err(AttemptError::Fatal)?;
+    let re = Regex::new(pattern)
+        .map_err(|e| AttemptError::Fatal(format!("invalid regex {pattern:?}: {e}")))?;
+    if re.is_match(&ex.body) {
+        Err(AttemptError::NotYet(format!(
+            "    expected body to NOT match: {pattern}\n    actual body:\n{}",
+            ex.body
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+fn selected_element(w: &World, selector: &str) -> Result<String, AttemptError> {
+    let ex = last(w).map_err(AttemptError::Fatal)?;
+    let kind = markup::classify(markup::content_type(&ex.resp_headers));
+    markup::select(kind, &ex.body, selector, true).map_err(|e| match e {
+        MarkupError::NoMatch(msg) => AttemptError::NotYet(msg),
+        MarkupError::Fatal(msg) => AttemptError::Fatal(msg),
+    })
+}
+
+pub fn body_has_element(w: &World, selector: &str) -> AttemptResult {
+    selected_element(w, selector)?;
+    Ok(())
+}
+
+pub fn body_has_element_with_text(w: &World, selector: &str, text: &str) -> AttemptResult {
+    let got = selected_element(w, selector)?;
+    if got == text {
+        Ok(())
+    } else {
+        Err(AttemptError::NotYet(format!(
+            "    expected: {text:?}\n    actual:   {got:?}"
+        )))
+    }
+}
+
+pub fn body_not_has_element(w: &World, selector: &str) -> AttemptResult {
+    match selected_element(w, selector) {
+        Ok(got) => Err(AttemptError::NotYet(format!(
+            "    expected: no element to match {selector:?}\n    actual:   matched {got:?}"
+        ))),
+        Err(AttemptError::NotYet(_)) => Ok(()),
+        Err(fatal) => Err(fatal),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn world_with_response(body: &str, headers: Vec<(String, String)>) -> World {
+        let resources = std::collections::HashMap::from([(
+            "main".to_string(),
+            crate::http::ApiResource::new(
+                "http://x.local",
+                5,
+                Vec::new(),
+                crate::options::Options::default(),
+            )
+            .expect("valid base URL"),
+        )]);
+        let apis = std::sync::Arc::new(
+            crate::http::Apis::new(resources, Some("main".to_string()))
+                .expect("default API exists"),
+        );
+        let mut w = World::new(
+            apis,
+            std::sync::Arc::new(crate::unique::Generator::new()),
+            crate::db::DbHandle::new(None, String::new()),
+            None,
+            None,
+            crate::options::Options::default(),
+        );
+        w.http.store_test_exchange(crate::http::Exchange {
+            method: "GET".to_string(),
+            url: "http://x.local/".to_string(),
+            req_headers: Vec::new(),
+            req_body: None,
+            status: 200,
+            resp_headers: headers,
+            body: body.to_string(),
+        });
+        w
+    }
+
+    #[test]
+    fn contains_text_passes_on_a_substring() {
+        let w = world_with_response("<h1>Hello</h1>", Vec::new());
+        assert_eq!(body_contains_text(&w, "<h1>"), Ok(()));
+    }
+
+    #[test]
+    fn contains_text_fails_when_absent() {
+        let w = world_with_response("<h1>Hello</h1>", Vec::new());
+        assert!(matches!(body_contains_text(&w, "<h2>"), Err(AttemptError::NotYet(_))));
+    }
+
+    #[test]
+    fn not_contains_text_passes_when_absent() {
+        let w = world_with_response("<h1>Hello</h1>", Vec::new());
+        assert_eq!(body_not_contains_text(&w, "<h2>"), Ok(()));
+    }
+
+    #[test]
+    fn not_contains_text_fails_when_present() {
+        let w = world_with_response("<h1>Hello</h1>", Vec::new());
+        assert!(matches!(body_not_contains_text(&w, "<h1>"), Err(AttemptError::NotYet(_))));
+    }
+
+    #[test]
+    fn matches_passes_on_a_regex_hit() {
+        let w = world_with_response("<h1>Hello</h1>", Vec::new());
+        assert_eq!(body_matches(&w, "<h[0-9]>"), Ok(()));
+    }
+
+    #[test]
+    fn matches_fails_on_a_regex_miss() {
+        let w = world_with_response("<h1>Hello</h1>", Vec::new());
+        assert!(matches!(body_matches(&w, "<h9>"), Err(AttemptError::NotYet(_))));
+    }
+
+    #[test]
+    fn matches_is_fatal_on_an_invalid_pattern() {
+        let w = world_with_response("<h1>Hello</h1>", Vec::new());
+        assert!(matches!(body_matches(&w, "["), Err(AttemptError::Fatal(_))));
+    }
+
+    #[test]
+    fn not_matches_passes_on_a_regex_miss() {
+        let w = world_with_response("<h1>Hello</h1>", Vec::new());
+        assert_eq!(body_not_matches(&w, "<h9>"), Ok(()));
+    }
+
+    #[test]
+    fn not_matches_fails_on_a_regex_hit() {
+        let w = world_with_response("<h1>Hello</h1>", Vec::new());
+        assert!(matches!(body_not_matches(&w, "<h[0-9]>"), Err(AttemptError::NotYet(_))));
+    }
+
+    #[test]
+    fn not_matches_is_fatal_on_an_invalid_pattern_not_swallowed_as_a_pass() {
+        let w = world_with_response("<h1>Hello</h1>", Vec::new());
+        assert!(matches!(body_not_matches(&w, "["), Err(AttemptError::Fatal(_))));
+    }
 
     #[test]
     fn not_exists_passes_when_the_path_is_missing() {
@@ -362,5 +546,91 @@ mod tests {
             check_not_contains_substring(&json!({"a": 1}), "a", "1"),
             Err(AttemptError::Fatal(_))
         ));
+    }
+
+    #[test]
+    fn has_element_passes_on_html() {
+        let headers = vec![("content-type".to_string(), "text/html".to_string())];
+        let w = world_with_response(r#"<html><body><h1 id="title">Hi</h1></body></html>"#, headers);
+        assert_eq!(body_has_element(&w, "h1#title"), Ok(()));
+    }
+
+    #[test]
+    fn has_element_passes_on_xml() {
+        let headers = vec![("content-type".to_string(), "application/xml".to_string())];
+        let w = world_with_response(r#"<root><name>Acme</name></root>"#, headers);
+        assert_eq!(body_has_element(&w, "//name"), Ok(()));
+    }
+
+    #[test]
+    fn has_element_fails_when_no_match() {
+        let headers = vec![("content-type".to_string(), "text/html".to_string())];
+        let w = world_with_response(r#"<html><body></body></html>"#, headers);
+        assert!(matches!(body_has_element(&w, ".missing"), Err(AttemptError::NotYet(_))));
+    }
+
+    #[test]
+    fn has_element_is_fatal_on_json_content_type() {
+        let headers = vec![("content-type".to_string(), "application/json".to_string())];
+        let w = world_with_response(r#"{"a": 1}"#, headers);
+        assert!(matches!(body_has_element(&w, "a"), Err(AttemptError::Fatal(_))));
+    }
+
+    #[test]
+    fn has_element_with_text_passes_on_exact_match() {
+        let headers = vec![("content-type".to_string(), "text/html".to_string())];
+        let w = world_with_response(r#"<html><body><h1 id="title">Hi</h1></body></html>"#, headers);
+        assert_eq!(body_has_element_with_text(&w, "h1#title", "Hi"), Ok(()));
+    }
+
+    #[test]
+    fn has_element_with_text_fails_on_mismatch() {
+        let headers = vec![("content-type".to_string(), "text/html".to_string())];
+        let w = world_with_response(r#"<html><body><h1 id="title">Hi</h1></body></html>"#, headers);
+        assert!(matches!(
+            body_has_element_with_text(&w, "h1#title", "Bye"),
+            Err(AttemptError::NotYet(_))
+        ));
+    }
+
+    #[test]
+    fn not_has_element_passes_when_absent() {
+        let headers = vec![("content-type".to_string(), "text/html".to_string())];
+        let w = world_with_response(r#"<html><body></body></html>"#, headers);
+        assert_eq!(body_not_has_element(&w, ".missing"), Ok(()));
+    }
+
+    #[test]
+    fn not_has_element_fails_when_present() {
+        let headers = vec![("content-type".to_string(), "text/html".to_string())];
+        let w = world_with_response(r#"<html><body><h1 id="title">Hi</h1></body></html>"#, headers);
+        assert!(matches!(body_not_has_element(&w, "h1#title"), Err(AttemptError::NotYet(_))));
+    }
+
+    /// Negation must not swallow a config-level error: "wrong content-type"
+    /// is a failure to evaluate, not a successful absence.
+    #[test]
+    fn not_has_element_stays_fatal_on_json_content_type() {
+        let headers = vec![("content-type".to_string(), "application/json".to_string())];
+        let w = world_with_response(r#"{"a": 1}"#, headers);
+        assert!(matches!(body_not_has_element(&w, "a"), Err(AttemptError::Fatal(_))));
+    }
+
+    #[test]
+    fn has_element_does_not_silently_pass_on_a_false_boolean_xpath() {
+        let headers = vec![("content-type".to_string(), "application/xml".to_string())];
+        let w = world_with_response(r#"<root><name>Acme</name></root>"#, headers);
+        assert!(matches!(body_has_element(&w, "//missing = 'x'"), Err(AttemptError::Fatal(_))));
+    }
+
+    #[test]
+    fn has_element_with_text_fails_on_whitespace_only_difference_and_the_message_shows_it() {
+        let headers = vec![("content-type".to_string(), "text/html".to_string())];
+        let indented = "<html><body>\n  <div class=\"box\">\n    Loose\n  </div>\n</body></html>";
+        let w = world_with_response(indented, headers);
+        let err = body_has_element_with_text(&w, "div.box", "Loose").unwrap_err();
+        let AttemptError::NotYet(msg) = err else { panic!("expected NotYet") };
+        // Debug-quoted so the whitespace difference is visible, not silently swallowed.
+        assert!(msg.contains("\\n"), "message should show escaped whitespace: {msg}");
     }
 }

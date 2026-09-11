@@ -5,6 +5,8 @@ use aes::cipher::{BlockModeEncrypt, KeyIvInit, block_padding::Pkcs7};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 
+use super::markup;
+
 fn hex_nibble(byte: u8) -> Option<u8> {
     match byte {
         b'0'..=b'9' => Some(byte - b'0'),
@@ -98,6 +100,14 @@ pub fn extract_from_cookies(
     } else {
         w.vars.set(name, value);
     }
+    Ok(())
+}
+
+pub fn extract_from_markup(w: &mut World, selector: &str, name: &str) -> Result<(), String> {
+    let ex = w.http.last().ok_or("no request has been sent yet")?;
+    let kind = markup::classify(markup::content_type(&ex.resp_headers));
+    let value = markup::select(kind, &ex.body, selector, false).map_err(|e| e.to_string())?;
+    w.vars.set(name, value);
     Ok(())
 }
 
@@ -228,5 +238,40 @@ mod tests {
         assert!(error.contains("64"), "{error}");
         assert_eq!(world.vars.get("otp_ciphertext"), None);
         assert_eq!(world.vars.get("otp_ivHex"), None);
+    }
+
+    #[test]
+    fn extract_from_markup_writes_the_selected_text() {
+        let mut w = world();
+        w.http.store_test_exchange(crate::http::Exchange {
+            method: "GET".to_string(),
+            url: "http://x.local/".to_string(),
+            req_headers: Vec::new(),
+            req_body: None,
+            status: 200,
+            resp_headers: vec![("content-type".to_string(), "text/html".to_string())],
+            body: r#"<html><body><h1 id="title">Hi</h1></body></html>"#.to_string(),
+        });
+
+        extract_from_markup(&mut w, "h1#title", "pageTitle").expect("extraction succeeds");
+        assert_eq!(w.vars.get("pageTitle"), Some("Hi"));
+    }
+
+    #[test]
+    fn extract_from_markup_propagates_the_error_without_setting_the_variable() {
+        let mut w = world();
+        w.http.store_test_exchange(crate::http::Exchange {
+            method: "GET".to_string(),
+            url: "http://x.local/".to_string(),
+            req_headers: Vec::new(),
+            req_body: None,
+            status: 200,
+            resp_headers: vec![("content-type".to_string(), "text/html".to_string())],
+            body: r#"<html><body></body></html>"#.to_string(),
+        });
+
+        let err = extract_from_markup(&mut w, ".missing", "pageTitle").unwrap_err();
+        assert!(err.contains("missing"), "{err}");
+        assert_eq!(w.vars.get("pageTitle"), None);
     }
 }

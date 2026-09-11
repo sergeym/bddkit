@@ -26,6 +26,7 @@ pub async fn spawn() -> String {
         .route("/headers", get(headers))
         .route("/xml", get(xml_doc))
         .route("/html", get(html_doc))
+        .route("/html-loose", get(html_doc_loose))
         .route("/plain", get(plain_text))
         .route("/no-content", get(no_content))
         .route("/srp/register", post(srp_register))
@@ -164,6 +165,18 @@ async fn html_doc() -> impl IntoResponse {
         StatusCode::OK,
         h,
         r#"<html><body><h1 id="title">Hello</h1><p class="msg">World</p></body></html>"#,
+    )
+}
+
+/// Realistic tag soup — doctype, an unclosed void element, an unquoted
+/// attribute — the exact shape that broke the old XPath-only debug path.
+async fn html_doc_loose() -> impl IntoResponse {
+    let mut h = HeaderMap::new();
+    h.insert("content-type", "text/html".parse().expect("header"));
+    (
+        StatusCode::OK,
+        h,
+        "<!doctype html><html><body><img src=\"a.png\"><div class=box id=main>Loose</div></body></html>",
     )
 }
 

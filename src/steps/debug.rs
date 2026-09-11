@@ -1,34 +1,6 @@
 use crate::world::World;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BodyKind {
-    Json,
-    Xml,
-    Html,
-    Plain,
-}
-
-/// Substring order matters: `application/xhtml+xml` contains both `html` and
-/// `xml` — it must land in `Html`, so `html` is checked before `xml`.
-pub(crate) fn classify(content_type: Option<&str>) -> BodyKind {
-    let ct = content_type.unwrap_or("").to_ascii_lowercase();
-    if ct.contains("json") {
-        BodyKind::Json
-    } else if ct.contains("html") {
-        BodyKind::Html
-    } else if ct.contains("xml") {
-        BodyKind::Xml
-    } else {
-        BodyKind::Plain
-    }
-}
-
-pub(crate) fn content_type(headers: &[(String, String)]) -> Option<&str> {
-    headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
-        .map(|(_, v)| v.as_str())
-}
+use super::markup::{self, BodyKind};
 
 fn headers_table(headers: &[(String, String)]) -> String {
     let width = headers
@@ -55,7 +27,7 @@ pub fn print_headers(w: &World) -> Result<(), String> {
 /// Naive tag-by-tag line breaking for XML/HTML with nesting-based indentation.
 /// It does not really parse the syntax (a text node containing `<` would
 /// distort the result) — good enough for debug printing; a real
-/// parse is only needed for XPath (see `xpath_select`).
+/// parse is only needed for structured selection (see `markup::select`).
 fn beautify_markup(raw: &str) -> String {
     let mut out = String::new();
     let mut depth: usize = 0;
@@ -127,7 +99,7 @@ fn highlight_inner(code: &str, extension: &str, colorize: bool) -> String {
 
 pub fn print_body(w: &World) -> Result<(), String> {
     let ex = super::assert::last(w)?;
-    match classify(content_type(&ex.resp_headers)) {
+    match markup::classify(markup::content_type(&ex.resp_headers)) {
         BodyKind::Json => {
             let v = ex.json()?;
             let pretty = serde_json::to_string_pretty(&v)
@@ -141,37 +113,10 @@ pub fn print_body(w: &World) -> Result<(), String> {
     Ok(())
 }
 
-fn xpath_select(xml: &str, expr: &str) -> Result<String, String> {
-    let package = sxd_document::parser::parse(xml)
-        .map_err(|e| format!("failed to parse XML/HTML: {e}"))?;
-    let document = package.as_document();
-    let xpath = sxd_xpath::Factory::new()
-        .build(expr)
-        .map_err(|e| format!("invalid XPath {expr:?}: {e}"))?
-        .ok_or_else(|| format!("empty XPath expression {expr:?}"))?;
-    let context = sxd_xpath::Context::new();
-    let value = xpath
-        .evaluate(&context, document.root())
-        .map_err(|e| format!("failed to evaluate XPath {expr:?}: {e}"))?;
-    match value {
-        sxd_xpath::Value::Nodeset(nodes) => {
-            let ordered = nodes.document_order();
-            if ordered.is_empty() {
-                return Err(format!("XPath {expr:?} found no nodes"));
-            }
-            Ok(ordered
-                .iter()
-                .map(|n| n.string_value())
-                .collect::<Vec<_>>()
-                .join("\n"))
-        }
-        other => Ok(other.string()),
-    }
-}
-
 pub fn print_body_as(w: &World, path: &str) -> Result<(), String> {
     let ex = super::assert::last(w)?;
-    match classify(content_type(&ex.resp_headers)) {
+    let kind = markup::classify(markup::content_type(&ex.resp_headers));
+    match kind {
         BodyKind::Json => {
             let root = ex.json()?;
             let sub = crate::json::path::read(&root, path)?;
@@ -180,7 +125,7 @@ pub fn print_body_as(w: &World, path: &str) -> Result<(), String> {
             eprintln!("{}", highlight(&pretty, "json"));
         }
         BodyKind::Xml | BodyKind::Html => {
-            eprintln!("{}", xpath_select(&ex.body, path)?);
+            eprintln!("{}", markup::select(kind, &ex.body, path, false).map_err(|e| e.to_string())?);
         }
         BodyKind::Plain => {
             return Err(
@@ -194,51 +139,6 @@ pub fn print_body_as(w: &World, path: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn classifies_json() {
-        assert_eq!(
-            classify(Some("application/json; charset=utf-8")),
-            BodyKind::Json
-        );
-    }
-
-    #[test]
-    fn classifies_xml() {
-        assert_eq!(classify(Some("application/xml")), BodyKind::Xml);
-    }
-
-    #[test]
-    fn classifies_html() {
-        assert_eq!(classify(Some("text/html; charset=utf-8")), BodyKind::Html);
-    }
-
-    #[test]
-    fn xhtml_xml_is_classified_as_html_not_xml() {
-        assert_eq!(classify(Some("application/xhtml+xml")), BodyKind::Html);
-    }
-
-    #[test]
-    fn unrecognized_content_type_is_plain() {
-        assert_eq!(classify(Some("application/octet-stream")), BodyKind::Plain);
-    }
-
-    #[test]
-    fn missing_content_type_is_plain() {
-        assert_eq!(classify(None), BodyKind::Plain);
-    }
-
-    #[test]
-    fn content_type_reads_the_header_case_insensitively() {
-        let headers = vec![("Content-Type".to_string(), "application/json".to_string())];
-        assert_eq!(content_type(&headers), Some("application/json"));
-    }
-
-    #[test]
-    fn content_type_is_none_when_absent() {
-        let headers = vec![("x-trace".to_string(), "1".to_string())];
-        assert_eq!(content_type(&headers), None);
-    }
 
     #[test]
     fn headers_table_aligns_names_to_the_longest_one() {
@@ -291,43 +191,5 @@ mod tests {
     fn highlight_returns_code_unmodified_when_colorize_is_off() {
         let out = highlight_inner("{\"a\": 1}", "json", false);
         assert_eq!(out, "{\"a\": 1}");
-    }
-
-    fn users_xml() -> &'static str {
-        r#"<users><user id="1"><email>a@b.net</email></user><user id="2"><email>c@d.net</email></user></users>"#
-    }
-
-    #[test]
-    fn xpath_select_reads_element_text() {
-        let got = xpath_select(users_xml(), "//user[@id='2']/email").unwrap();
-        assert_eq!(got, "c@d.net");
-    }
-
-    #[test]
-    fn xpath_select_reads_an_attribute() {
-        let got = xpath_select(users_xml(), "//user[1]/@id").unwrap();
-        assert_eq!(got, "1");
-    }
-
-    #[test]
-    fn xpath_select_joins_multiple_matches_with_newlines() {
-        let got = xpath_select(users_xml(), "//user/email").unwrap();
-        assert_eq!(got, "a@b.net\nc@d.net");
-    }
-
-    #[test]
-    fn xpath_select_with_no_matches_is_an_error() {
-        assert!(xpath_select(users_xml(), "//missing").is_err());
-    }
-
-    #[test]
-    fn xpath_select_on_malformed_xml_is_an_error() {
-        let err = xpath_select("<not-closed>", "/x").unwrap_err();
-        assert!(err.contains("failed to parse"), "{err}");
-    }
-
-    #[test]
-    fn xpath_select_with_an_invalid_expression_is_an_error() {
-        assert!(xpath_select(users_xml(), "///[[[").is_err());
     }
 }
