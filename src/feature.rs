@@ -136,6 +136,36 @@ pub fn priority_of(lf: &LoadedFeature) -> Result<i64, String> {
     Ok(best.unwrap_or(0))
 }
 
+static EXPORTS_TAG: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"^exports\((.*)\)$").expect("constant regex"));
+
+/// Names an `I include`-d scenario hands back to its caller, from
+/// `@exports(a,b,*)`. A scenario may carry more than one such tag (its own
+/// plus one inherited from `Feature:`, already merged into `sc.tags` by
+/// `load`) — every one contributes, in the order found.
+#[allow(dead_code)]
+pub fn exports_of(lf: &LoadedFeature, sc: &gherkin::Scenario) -> Result<Vec<String>, String> {
+    // Consumed starting in Task 9 when `I include` executes scenario-level exports
+    let mut out = Vec::new();
+    for tag in &sc.tags {
+        let Some(c) = EXPORTS_TAG.captures(strip_at(tag)) else {
+            continue;
+        };
+        let raw = c.get(1).expect("group 1 is required").as_str();
+        for name in raw.split(',') {
+            let name = name.trim();
+            if name.is_empty() {
+                return Err(format!(
+                    "{}: @exports() tag has an empty name",
+                    display_path(&lf.path)
+                ));
+            }
+            out.push(name.to_string());
+        }
+    }
+    Ok(out)
+}
+
 impl LoadedFeature {
     /// Whether the file has at least one scenario passing the filter. Expanding
     /// a Scenario Outline does not change tags, so this can be checked before that.
@@ -635,5 +665,68 @@ Feature: f
             "the scenario's own tag must survive: {:?}",
             lf.feature.scenarios[0].tags
         );
+    }
+
+    mod exports_tag {
+        use super::super::*;
+
+        fn loaded(src: &str) -> LoadedFeature {
+            LoadedFeature {
+                path: PathBuf::from("t.feature"),
+                feature: parse_str(src).expect("gherkin parses"),
+            }
+        }
+
+        #[test]
+        fn exports_of_reads_a_single_tag() {
+            let lf = loaded(
+                "Feature: f\n  @exports(userId)\n  Scenario: s\n    Then the response code is 200\n",
+            );
+            let sc = &lf.feature.scenarios[0];
+            assert_eq!(exports_of(&lf, sc).unwrap(), vec!["userId".to_string()]);
+        }
+
+        #[test]
+        fn exports_of_splits_comma_separated_names_and_trims() {
+            let lf = loaded(
+                "Feature: f\n  @exports(userId,token)\n  Scenario: s\n    Then the response code is 200\n",
+            );
+            let sc = &lf.feature.scenarios[0];
+            assert_eq!(
+                exports_of(&lf, sc).unwrap(),
+                vec!["userId".to_string(), "token".to_string()]
+            );
+        }
+
+        #[test]
+        fn exports_of_keeps_a_trailing_glob_star_as_one_token() {
+            let lf = loaded(
+                "Feature: f\n  @exports(last_insert_id_*)\n  Scenario: s\n    Then the response code is 200\n",
+            );
+            let sc = &lf.feature.scenarios[0];
+            assert_eq!(
+                exports_of(&lf, sc).unwrap(),
+                vec!["last_insert_id_*".to_string()]
+            );
+        }
+
+        #[test]
+        fn exports_of_unions_two_exports_tags() {
+            let lf = loaded(
+                "Feature: f\n  @exports(a) @exports(b)\n  Scenario: s\n    Then the response code is 200\n",
+            );
+            let sc = &lf.feature.scenarios[0];
+            assert_eq!(
+                exports_of(&lf, sc).unwrap(),
+                vec!["a".to_string(), "b".to_string()]
+            );
+        }
+
+        #[test]
+        fn exports_of_is_empty_with_no_tag() {
+            let lf = loaded("Feature: f\n  Scenario: s\n    Then the response code is 200\n");
+            let sc = &lf.feature.scenarios[0];
+            assert_eq!(exports_of(&lf, sc).unwrap(), Vec::<String>::new());
+        }
     }
 }
