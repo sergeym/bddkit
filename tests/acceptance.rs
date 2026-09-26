@@ -2556,3 +2556,115 @@ fn with_table_cell_is_interpolated_against_the_callers_scope() {
         "--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
     );
 }
+
+#[test]
+fn include_by_scenario_name_picks_the_named_one() {
+    let dir =
+        std::env::temp_dir().join(format!("bddkit-include-multi-test-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("features")).expect("mkdir");
+    std::fs::copy(
+        "tests/features/include/multi.feature",
+        dir.join("features/multi.feature"),
+    )
+    .expect("copy multi.feature");
+    std::fs::copy(
+        "tests/features/include/caller_multi.feature",
+        dir.join("features/caller_multi.feature"),
+    )
+    .expect("copy caller_multi.feature");
+    std::fs::write(
+        dir.join("cfg.yaml"),
+        "paths: [features]\nresources:\n  api:\n    stub:\n      base_url: http://example.test\n",
+    )
+    .expect("write config");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
+        .args(["run", "--config", "cfg.yaml"])
+        .current_dir(&dir)
+        .output()
+        .expect("failed to run bddkit");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+    );
+}
+
+#[test]
+fn include_of_an_outline_uses_the_callers_with_row() {
+    let dir = std::env::temp_dir().join(format!(
+        "bddkit-include-outline-with-test-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(dir.join("features")).expect("mkdir");
+    std::fs::copy(
+        "tests/features/include/outline.feature",
+        dir.join("features/outline.feature"),
+    )
+    .expect("copy outline.feature");
+    std::fs::copy(
+        "tests/features/include/caller_outline_with.feature",
+        dir.join("features/caller_outline_with.feature"),
+    )
+    .expect("copy caller_outline_with.feature");
+    std::fs::write(
+        dir.join("cfg.yaml"),
+        "paths: [features]\nresources:\n  api:\n    stub:\n      base_url: http://example.test\n",
+    )
+    .expect("write config");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
+        .args(["run", "--config", "cfg.yaml"])
+        .current_dir(&dir)
+        .output()
+        .expect("failed to run bddkit");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+    );
+}
+
+#[test]
+fn include_of_an_outline_with_one_examples_row_and_no_with_uses_that_row() {
+    let dir = std::env::temp_dir().join(format!(
+        "bddkit-include-outline-bare-test-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(dir.join("features")).expect("mkdir");
+    std::fs::copy(
+        "tests/features/include/outline.feature",
+        dir.join("features/outline.feature"),
+    )
+    .expect("copy outline.feature");
+    std::fs::copy(
+        "tests/features/include/caller_outline_bare.feature",
+        dir.join("features/caller_outline_bare.feature"),
+    )
+    .expect("copy caller_outline_bare.feature");
+    std::fs::write(
+        dir.join("cfg.yaml"),
+        "paths: [features]\nresources:\n  api:\n    stub:\n      base_url: http://example.test\n",
+    )
+    .expect("write config");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
+        .args(["run", "--config", "cfg.yaml"])
+        .current_dir(&dir)
+        .output()
+        .expect("failed to run bddkit");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+    );
+}
