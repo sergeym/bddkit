@@ -2390,3 +2390,169 @@ async fn an_unwritable_report_path_is_a_startup_failure_and_doctor_reports_it() 
     assert_eq!(out.status.code(), Some(1), "{stdout}");
     assert!(stdout.contains("✗ reports"), "{stdout}");
 }
+
+/// `I include` runs another file's scenario inline and copies back only its
+/// declared `@exports` variable — no HTTP steps involved, so no stub server
+/// is needed.
+#[test]
+fn include_of_a_one_scenario_file_exports_its_declared_variable() {
+    let dir = std::env::temp_dir().join(format!("bddkit-include-test-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("features")).expect("mkdir");
+    std::fs::copy(
+        "tests/features/include/target.feature",
+        dir.join("features/target.feature"),
+    )
+    .expect("copy target.feature");
+    std::fs::copy(
+        "tests/features/include/caller.feature",
+        dir.join("features/caller.feature"),
+    )
+    .expect("copy caller.feature");
+    std::fs::write(
+        dir.join("cfg.yaml"),
+        "paths: [features]\nresources:\n  api:\n    stub:\n      base_url: http://example.test\n",
+    )
+    .expect("write config");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
+        .args(["run", "--config", "cfg.yaml"])
+        .current_dir(&dir)
+        .output()
+        .expect("failed to run bddkit");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+    );
+}
+
+/// A failed step inside an included scenario must not leave the caller's
+/// file-level `VarStack` swapped for the included one — `run_include` must
+/// restore it on the way out regardless of the include's own outcome. Two
+/// scenarios in one file: the first sets a variable then includes a scenario
+/// whose only step fails cleanly (an unset-variable assertion, never a
+/// panic); the second — sharing the file's `VarStack` per invariant 2 —
+/// asserts the first scenario's variable is still there. If a later refactor
+/// ever short-circuits before the restore (a `?` between the swap and the
+/// restore, or a fresh `push_frame` swapped in for the whole-stack swap),
+/// this regresses: scenario 2 sees "before" undefined and fails too.
+#[test]
+fn a_failed_include_still_restores_the_callers_var_stack() {
+    let dir = std::env::temp_dir().join(format!(
+        "bddkit-include-restore-test-{}",
+        std::process::id()
+    ));
+    // These fixtures live under `tests/fixtures/include/`, NOT
+    // `tests/features/`, because `restore_on_failure.feature` fails one
+    // scenario on purpose — `tests/fixtures/` is this repo's existing home
+    // for fixtures that are not part of the "every feature file passes"
+    // acceptance gate (see `tests/fixtures/echo-plugin`,
+    // `tests/fixtures/worker-plugin`). The include target is placed in a
+    // sibling `targets/` directory, outside `paths: [features]` — its own
+    // `.feature` file's `I include "../targets/..."` path matches — so it is
+    // reached only through the include and never discovered and run a
+    // second time on its own, which would add an unrelated failed scenario.
+    std::fs::create_dir_all(dir.join("features")).expect("mkdir");
+    std::fs::create_dir_all(dir.join("targets")).expect("mkdir");
+    std::fs::copy(
+        "tests/fixtures/include/failing_target.feature",
+        dir.join("targets/failing_target.feature"),
+    )
+    .expect("copy failing_target.feature");
+    std::fs::copy(
+        "tests/fixtures/include/restore_on_failure.feature",
+        dir.join("features/restore_on_failure.feature"),
+    )
+    .expect("copy restore_on_failure.feature");
+    std::fs::write(
+        dir.join("cfg.yaml"),
+        "paths: [features]\nresources:\n  api:\n    stub:\n      base_url: http://example.test\n",
+    )
+    .expect("write config");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
+        .args(["run", "--config", "cfg.yaml"])
+        .current_dir(&dir)
+        .output()
+        .expect("failed to run bddkit");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "one scenario fails (the include), the other passes — never a validation exit 2\n\
+         --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+    );
+    assert!(
+        stdout.contains("The included scenario fails"),
+        "the failing scenario ran: --- stdout ---\n{stdout}"
+    );
+    // The report only prints FAILING scenarios, so scenario 2 passing leaves
+    // no line of its own — the summary counts are the proof it ran and
+    // passed: one file, two scenarios, exactly one failed.
+    assert!(
+        stdout.contains("scenarios: 2, failed: 1"),
+        "scenario 2 (\"before\" == \"kept\") must pass silently, not add a \
+         second failure — the swap must have been restored: \
+         --- stdout ---\n{stdout}"
+    );
+    assert_eq!(
+        stdout.matches("is not set").count(),
+        1,
+        "only the include's own failure should mention an unset variable; a \
+         second occurrence would mean scenario 2 also saw \"before\" as \
+         undefined — the swap was left in place: --- stdout ---\n{stdout}"
+    );
+}
+
+/// A `with:` table cell is interpolated against the CALLER's scope before
+/// `world.vars` is swapped for the include's fresh stack — never left as a
+/// literal `<<...>>` token, and never resolved against the (empty) included
+/// scope. `target_with.feature` stores the value it receives into its own
+/// variable and compares it against a fixed literal, independent of the
+/// substitution token itself, so a regression that skips the caller-scope
+/// interpolation (or interpolates too late, after the swap) fails the run
+/// instead of coincidentally still matching.
+#[test]
+fn with_table_cell_is_interpolated_against_the_callers_scope() {
+    let dir = std::env::temp_dir().join(format!("bddkit-include-with-test-{}", std::process::id()));
+    // Same reasoning and layout as the restore-on-failure test above:
+    // `target_with.feature` fails standalone (its own Examples row is
+    // `unused@example.com`, not `test@example.com`), so it goes in the
+    // sibling `targets/` directory, reached only through the include.
+    std::fs::create_dir_all(dir.join("features")).expect("mkdir");
+    std::fs::create_dir_all(dir.join("targets")).expect("mkdir");
+    std::fs::copy(
+        "tests/fixtures/include/target_with.feature",
+        dir.join("targets/target_with.feature"),
+    )
+    .expect("copy target_with.feature");
+    std::fs::copy(
+        "tests/fixtures/include/caller_with.feature",
+        dir.join("features/caller_with.feature"),
+    )
+    .expect("copy caller_with.feature");
+    std::fs::write(
+        dir.join("cfg.yaml"),
+        "paths: [features]\nresources:\n  api:\n    stub:\n      base_url: http://example.test\n",
+    )
+    .expect("write config");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
+        .args(["run", "--config", "cfg.yaml"])
+        .current_dir(&dir)
+        .output()
+        .expect("failed to run bddkit");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+    );
+}
