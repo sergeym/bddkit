@@ -184,11 +184,26 @@ pub fn build_scenario(
 mod tests {
     use super::*;
     use std::fs;
-    use tempfile::tempdir;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A fresh, uniquely named directory under the OS temp dir — this
+    /// codebase's own convention (`tests/acceptance.rs`), not `tempfile`.
+    /// Tests in this module run in parallel within one process, so the pid
+    /// alone (the convention's usual suffix) is not enough when a helper
+    /// like `parse_scenario` is called from several tests at once — hence
+    /// the added call counter.
+    fn temp_test_dir(slug: &str) -> PathBuf {
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        let n = CALLS.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("bddkit-include-{slug}-{}-{n}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
 
     fn parse_scenario(body: &str) -> gherkin::Scenario {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("s.feature");
+        let dir = temp_test_dir("parse-scenario");
+        let path = dir.join("s.feature");
         fs::write(&path, format!("Feature: f\n{body}")).unwrap();
         let lf = crate::feature::load(&path).unwrap();
         lf.feature.scenarios[0].clone()
@@ -213,29 +228,29 @@ mod tests {
 
     #[test]
     fn resolve_joins_a_relative_path_to_the_base_dir() {
-        let dir = tempdir().unwrap();
-        fs::create_dir_all(dir.path().join("flows")).unwrap();
+        let dir = temp_test_dir("resolve-joins");
+        fs::create_dir_all(dir.join("flows")).unwrap();
         fs::write(
-            dir.path().join("flows/register.feature"),
+            dir.join("flows/register.feature"),
             "Feature: f\n  Scenario: s\n    Given x\n",
         )
         .unwrap();
-        let resolved = resolve("flows/register.feature", dir.path()).unwrap();
-        assert_eq!(resolved, dir.path().join("flows/register.feature"));
+        let resolved = resolve("flows/register.feature", &dir).unwrap();
+        assert_eq!(resolved, dir.join("flows/register.feature"));
     }
 
     #[test]
     fn resolve_rejects_a_missing_file() {
-        let dir = tempdir().unwrap();
-        let err = resolve("nope.feature", dir.path()).unwrap_err();
+        let dir = temp_test_dir("resolve-missing");
+        let err = resolve("nope.feature", &dir).unwrap_err();
         assert!(err.contains("nope.feature"), "{err}");
     }
 
     #[test]
     fn resolve_rejects_a_non_feature_extension() {
-        let dir = tempdir().unwrap();
-        fs::write(dir.path().join("notes.txt"), "hi").unwrap();
-        let err = resolve("notes.txt", dir.path()).unwrap_err();
+        let dir = temp_test_dir("resolve-non-feature");
+        fs::write(dir.join("notes.txt"), "hi").unwrap();
+        let err = resolve("notes.txt", &dir).unwrap_err();
         assert!(err.contains(".feature"), "{err}");
     }
 
@@ -247,9 +262,9 @@ mod tests {
 
     #[test]
     fn select_scenario_requires_exactly_one_when_no_name_given() {
-        let dir = tempdir().unwrap();
+        let dir = temp_test_dir("select-scenario-multi");
         let path = write_feature(
-            dir.path(),
+            &dir,
             "two.feature",
             "Feature: f\n  Scenario: a\n    Given x\n  Scenario: b\n    Given y\n",
         );
@@ -260,9 +275,9 @@ mod tests {
 
     #[test]
     fn select_scenario_picks_the_one_scenario() {
-        let dir = tempdir().unwrap();
+        let dir = temp_test_dir("select-scenario-one");
         let path = write_feature(
-            dir.path(),
+            &dir,
             "one.feature",
             "Feature: f\n  Scenario: only\n    Given x\n",
         );
@@ -273,9 +288,9 @@ mod tests {
 
     #[test]
     fn select_scenario_matches_by_exact_name() {
-        let dir = tempdir().unwrap();
+        let dir = temp_test_dir("select-scenario-named");
         let path = write_feature(
-            dir.path(),
+            &dir,
             "two.feature",
             "Feature: f\n  Scenario: a\n    Given x\n  Scenario: b\n    Given y\n",
         );
@@ -286,9 +301,9 @@ mod tests {
 
     #[test]
     fn select_scenario_rejects_an_unknown_name() {
-        let dir = tempdir().unwrap();
+        let dir = temp_test_dir("select-scenario-unknown");
         let path = write_feature(
-            dir.path(),
+            &dir,
             "one.feature",
             "Feature: f\n  Scenario: only\n    Given x\n",
         );

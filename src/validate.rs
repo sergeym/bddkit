@@ -519,8 +519,12 @@ Feature: f
 
     #[test]
     fn include_of_a_missing_file_is_a_problem() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("caller.feature");
+        let dir = std::env::temp_dir().join(format!(
+            "bddkit-validate-missing-file-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("caller.feature");
         std::fs::write(
             &path,
             "Feature: f\n  Scenario: s\n    Given I include \"nope.feature\"\n",
@@ -535,8 +539,12 @@ Feature: f
 
     #[test]
     fn include_with_a_runtime_token_path_is_a_problem() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("caller.feature");
+        let dir = std::env::temp_dir().join(format!(
+            "bddkit-validate-runtime-token-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("caller.feature");
         std::fs::write(
             &path,
             "Feature: f\n  Scenario: s\n    Given I include \"<<name>>.feature\"\n",
@@ -551,18 +559,20 @@ Feature: f
 
     #[test]
     fn a_two_file_include_cycle_is_a_problem() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir =
+            std::env::temp_dir().join(format!("bddkit-validate-cycle-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
-            dir.path().join("a.feature"),
+            dir.join("a.feature"),
             "Feature: a\n  Scenario: sa\n    Given I include \"b.feature\"\n",
         )
         .unwrap();
         std::fs::write(
-            dir.path().join("b.feature"),
+            dir.join("b.feature"),
             "Feature: b\n  Scenario: sb\n    Given I include \"a.feature\"\n",
         )
         .unwrap();
-        let path = dir.path().join("a.feature");
+        let path = dir.join("a.feature");
         let lf = crate::feature::load(&path).unwrap();
         let reg = crate::steps::Registry::new().unwrap();
         let filter = crate::feature::TagFilter::new(&[]);
@@ -575,13 +585,17 @@ Feature: f
 
     #[test]
     fn an_unknown_step_inside_an_included_scenario_is_a_problem_naming_the_included_file() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "bddkit-validate-unknown-step-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
-            dir.path().join("target.feature"),
+            dir.join("target.feature"),
             "Feature: t\n  Scenario: only\n    Given this step does not exist\n",
         )
         .unwrap();
-        let path = dir.path().join("caller.feature");
+        let path = dir.join("caller.feature");
         std::fs::write(
             &path,
             "Feature: f\n  Scenario: s\n    Given I include \"target.feature\"\n",
@@ -601,13 +615,17 @@ Feature: f
 
     #[test]
     fn include_of_a_valid_one_scenario_file_has_no_problem() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "bddkit-validate-valid-include-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
-            dir.path().join("target.feature"),
+            dir.join("target.feature"),
             "Feature: f\n  Scenario: only\n    Given I am in debug mode\n",
         )
         .unwrap();
-        let path = dir.path().join("caller.feature");
+        let path = dir.join("caller.feature");
         std::fs::write(
             &path,
             "Feature: f\n  Scenario: s\n    Given I include \"target.feature\"\n",
@@ -622,18 +640,22 @@ Feature: f
 
     #[test]
     fn a_nested_include_with_a_docstring_is_rejected_at_validation_time() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "bddkit-validate-nested-docstring-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
-            dir.path().join("inner.feature"),
+            dir.join("inner.feature"),
             "Feature: f\n  Scenario: only\n    Given I am in debug mode\n",
         )
         .unwrap();
         std::fs::write(
-            dir.path().join("middle.feature"),
+            dir.join("middle.feature"),
             "Feature: f\n  Scenario: only\n    Given I include \"inner.feature\"\n      \"\"\"\n      not allowed\n      \"\"\"\n",
         )
         .unwrap();
-        let path = dir.path().join("caller.feature");
+        let path = dir.join("caller.feature");
         std::fs::write(
             &path,
             "Feature: f\n  Scenario: s\n    Given I include \"middle.feature\"\n",
@@ -653,13 +675,17 @@ Feature: f
 
     #[test]
     fn a_malformed_exports_tag_on_an_included_scenario_is_caught_at_validation_time() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "bddkit-validate-malformed-exports-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
-            dir.path().join("target.feature"),
+            dir.join("target.feature"),
             "Feature: f\n  @exports(a,,b)\n  Scenario: only\n    Given I am in debug mode\n",
         )
         .unwrap();
-        let path = dir.path().join("caller.feature");
+        let path = dir.join("caller.feature");
         std::fs::write(
             &path,
             "Feature: f\n  Scenario: s\n    Given I include \"target.feature\"\n",

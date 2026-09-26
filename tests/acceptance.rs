@@ -2465,39 +2465,62 @@ async fn an_unwritable_report_path_is_a_startup_failure_and_doctor_reports_it() 
     assert!(stdout.contains("✗ reports"), "{stdout}");
 }
 
-/// `I include` runs another file's scenario inline and copies back only its
-/// declared `@exports` variable — no HTTP steps involved, so no stub server
-/// is needed.
-#[test]
-fn include_of_a_one_scenario_file_exports_its_declared_variable() {
-    let dir = std::env::temp_dir().join(format!("bddkit-include-test-{}", std::process::id()));
-    std::fs::create_dir_all(dir.join("features")).expect("mkdir");
-    std::fs::copy(
-        "tests/features/include/target.feature",
-        dir.join("features/target.feature"),
-    )
-    .expect("copy target.feature");
-    std::fs::copy(
-        "tests/features/include/caller.feature",
-        dir.join("features/caller.feature"),
-    )
-    .expect("copy caller.feature");
+/// Builds a temp project for an `I include` acceptance test: copies each
+/// `(dest path under the temp dir, source fixture path)` pair, then writes
+/// the one `cfg.yaml` every one of these tests shares (a single `stub` API,
+/// no live server needed — none of them make an HTTP request). Returns the
+/// project directory.
+fn build_include_project(dir_slug: &str, fixtures: &[(&str, &str)]) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("bddkit-{dir_slug}-{}", std::process::id()));
+    for (dest, src) in fixtures {
+        let dest_path = dir.join(dest);
+        std::fs::create_dir_all(dest_path.parent().expect("dest has a parent")).expect("mkdir");
+        std::fs::copy(src, &dest_path).unwrap_or_else(|e| panic!("copy {src} to {dest}: {e}"));
+    }
     std::fs::write(
         dir.join("cfg.yaml"),
         "paths: [features]\nresources:\n  api:\n    stub:\n      base_url: http://example.test\n",
     )
     .expect("write config");
+    dir
+}
 
+/// Runs `bddkit <subcommand> --config cfg.yaml` inside a project directory
+/// built by `build_include_project`, and decodes the result for assertions.
+fn run_bddkit_in(subcommand: &str, dir: &std::path::Path) -> (Option<i32>, String, String) {
     let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
-        .args(["run", "--config", "cfg.yaml"])
-        .current_dir(&dir)
+        .args([subcommand, "--config", "cfg.yaml"])
+        .current_dir(dir)
         .output()
         .expect("failed to run bddkit");
-
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(
+    (
         out.status.code(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// `I include` runs another file's scenario inline and copies back only its
+/// declared `@exports` variable — no HTTP steps involved, so no stub server
+/// is needed.
+#[test]
+fn include_of_a_one_scenario_file_exports_its_declared_variable() {
+    let dir = build_include_project(
+        "include-test",
+        &[
+            (
+                "features/target.feature",
+                "tests/features/include/target.feature",
+            ),
+            (
+                "features/caller.feature",
+                "tests/features/include/caller.feature",
+            ),
+        ],
+    );
+    let (code, stdout, stderr) = run_bddkit_in("run", &dir);
+    assert_eq!(
+        code,
         Some(0),
         "--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
     );
@@ -2515,10 +2538,6 @@ fn include_of_a_one_scenario_file_exports_its_declared_variable() {
 /// this regresses: scenario 2 sees "before" undefined and fails too.
 #[test]
 fn a_failed_include_still_restores_the_callers_var_stack() {
-    let dir = std::env::temp_dir().join(format!(
-        "bddkit-include-restore-test-{}",
-        std::process::id()
-    ));
     // These fixtures live under `tests/fixtures/include/`, NOT
     // `tests/features/`, because `restore_on_failure.feature` fails one
     // scenario on purpose — `tests/fixtures/` is this repo's existing home
@@ -2529,34 +2548,22 @@ fn a_failed_include_still_restores_the_callers_var_stack() {
     // `.feature` file's `I include "../targets/..."` path matches — so it is
     // reached only through the include and never discovered and run a
     // second time on its own, which would add an unrelated failed scenario.
-    std::fs::create_dir_all(dir.join("features")).expect("mkdir");
-    std::fs::create_dir_all(dir.join("targets")).expect("mkdir");
-    std::fs::copy(
-        "tests/fixtures/include/failing_target.feature",
-        dir.join("targets/failing_target.feature"),
-    )
-    .expect("copy failing_target.feature");
-    std::fs::copy(
-        "tests/fixtures/include/restore_on_failure.feature",
-        dir.join("features/restore_on_failure.feature"),
-    )
-    .expect("copy restore_on_failure.feature");
-    std::fs::write(
-        dir.join("cfg.yaml"),
-        "paths: [features]\nresources:\n  api:\n    stub:\n      base_url: http://example.test\n",
-    )
-    .expect("write config");
-
-    let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
-        .args(["run", "--config", "cfg.yaml"])
-        .current_dir(&dir)
-        .output()
-        .expect("failed to run bddkit");
-
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    let dir = build_include_project(
+        "include-restore-test",
+        &[
+            (
+                "targets/failing_target.feature",
+                "tests/fixtures/include/failing_target.feature",
+            ),
+            (
+                "features/restore_on_failure.feature",
+                "tests/fixtures/include/restore_on_failure.feature",
+            ),
+        ],
+    );
+    let (code, stdout, stderr) = run_bddkit_in("run", &dir);
     assert_eq!(
-        out.status.code(),
+        code,
         Some(1),
         "one scenario fails (the include), the other passes — never a validation exit 2\n\
          --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
@@ -2593,39 +2600,26 @@ fn a_failed_include_still_restores_the_callers_var_stack() {
 /// instead of coincidentally still matching.
 #[test]
 fn with_table_cell_is_interpolated_against_the_callers_scope() {
-    let dir = std::env::temp_dir().join(format!("bddkit-include-with-test-{}", std::process::id()));
     // Same reasoning and layout as the restore-on-failure test above:
     // `target_with.feature` fails standalone (its own Examples row is
     // `unused@example.com`, not `test@example.com`), so it goes in the
     // sibling `targets/` directory, reached only through the include.
-    std::fs::create_dir_all(dir.join("features")).expect("mkdir");
-    std::fs::create_dir_all(dir.join("targets")).expect("mkdir");
-    std::fs::copy(
-        "tests/fixtures/include/target_with.feature",
-        dir.join("targets/target_with.feature"),
-    )
-    .expect("copy target_with.feature");
-    std::fs::copy(
-        "tests/fixtures/include/caller_with.feature",
-        dir.join("features/caller_with.feature"),
-    )
-    .expect("copy caller_with.feature");
-    std::fs::write(
-        dir.join("cfg.yaml"),
-        "paths: [features]\nresources:\n  api:\n    stub:\n      base_url: http://example.test\n",
-    )
-    .expect("write config");
-
-    let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
-        .args(["run", "--config", "cfg.yaml"])
-        .current_dir(&dir)
-        .output()
-        .expect("failed to run bddkit");
-
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    let dir = build_include_project(
+        "include-with-test",
+        &[
+            (
+                "targets/target_with.feature",
+                "tests/fixtures/include/target_with.feature",
+            ),
+            (
+                "features/caller_with.feature",
+                "tests/fixtures/include/caller_with.feature",
+            ),
+        ],
+    );
+    let (code, stdout, stderr) = run_bddkit_in("run", &dir);
     assert_eq!(
-        out.status.code(),
+        code,
         Some(0),
         "--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
     );
@@ -2645,43 +2639,27 @@ fn with_table_cell_is_interpolated_against_the_callers_scope() {
 /// pass outright were the check changed to tolerate that.
 #[test]
 fn a_caller_variable_is_not_visible_inside_an_included_scenario() {
-    let dir = std::env::temp_dir().join(format!(
-        "bddkit-include-isolation-test-{}",
-        std::process::id()
-    ));
     // Same layout as `a_failed_include_still_restores_the_callers_var_stack`:
     // the included scenario fails on purpose, so both fixtures live under
     // `tests/fixtures/include/`, and the target sits in a sibling `targets/`
     // directory outside `paths: [features]` so it is reached only through
     // the include, never discovered and run a second time on its own.
-    std::fs::create_dir_all(dir.join("features")).expect("mkdir");
-    std::fs::create_dir_all(dir.join("targets")).expect("mkdir");
-    std::fs::copy(
-        "tests/fixtures/include/isolation_target_cannot_read_caller.feature",
-        dir.join("targets/isolation_target_cannot_read_caller.feature"),
-    )
-    .expect("copy isolation_target_cannot_read_caller.feature");
-    std::fs::copy(
-        "tests/fixtures/include/isolation_caller_cannot_read.feature",
-        dir.join("features/isolation_caller_cannot_read.feature"),
-    )
-    .expect("copy isolation_caller_cannot_read.feature");
-    std::fs::write(
-        dir.join("cfg.yaml"),
-        "paths: [features]\nresources:\n  api:\n    stub:\n      base_url: http://example.test\n",
-    )
-    .expect("write config");
-
-    let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
-        .args(["run", "--config", "cfg.yaml"])
-        .current_dir(&dir)
-        .output()
-        .expect("failed to run bddkit");
-
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    let dir = build_include_project(
+        "include-isolation-test",
+        &[
+            (
+                "targets/isolation_target_cannot_read_caller.feature",
+                "tests/fixtures/include/isolation_target_cannot_read_caller.feature",
+            ),
+            (
+                "features/isolation_caller_cannot_read.feature",
+                "tests/fixtures/include/isolation_caller_cannot_read.feature",
+            ),
+        ],
+    );
+    let (code, stdout, stderr) = run_bddkit_in("run", &dir);
     assert_eq!(
-        out.status.code(),
+        code,
         Some(1),
         "the included scenario's own assertion must fail (the variable is \
          genuinely undefined inside the include), which fails the include \
@@ -2709,38 +2687,22 @@ fn a_caller_variable_is_not_visible_inside_an_included_scenario() {
 /// leak turns its expected failure into an unexpected pass, not the reverse.
 #[test]
 fn only_the_declared_export_reaches_the_caller() {
-    let dir = std::env::temp_dir().join(format!(
-        "bddkit-include-export-boundary-test-{}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(dir.join("features")).expect("mkdir");
-    std::fs::create_dir_all(dir.join("targets")).expect("mkdir");
-    std::fs::copy(
-        "tests/fixtures/include/isolation_target_export_boundary.feature",
-        dir.join("targets/isolation_target_export_boundary.feature"),
-    )
-    .expect("copy isolation_target_export_boundary.feature");
-    std::fs::copy(
-        "tests/fixtures/include/isolation_caller_export_boundary.feature",
-        dir.join("features/isolation_caller_export_boundary.feature"),
-    )
-    .expect("copy isolation_caller_export_boundary.feature");
-    std::fs::write(
-        dir.join("cfg.yaml"),
-        "paths: [features]\nresources:\n  api:\n    stub:\n      base_url: http://example.test\n",
-    )
-    .expect("write config");
-
-    let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
-        .args(["run", "--config", "cfg.yaml"])
-        .current_dir(&dir)
-        .output()
-        .expect("failed to run bddkit");
-
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    let dir = build_include_project(
+        "include-export-boundary-test",
+        &[
+            (
+                "targets/isolation_target_export_boundary.feature",
+                "tests/fixtures/include/isolation_target_export_boundary.feature",
+            ),
+            (
+                "features/isolation_caller_export_boundary.feature",
+                "tests/fixtures/include/isolation_caller_export_boundary.feature",
+            ),
+        ],
+    );
+    let (code, stdout, stderr) = run_bddkit_in("run", &dir);
     assert_eq!(
-        out.status.code(),
+        code,
         Some(1),
         "scenario 1 (declared export `kept`) must pass; scenario 2 must \
          fail on purpose, proving `notExported` never crossed the boundary: \
@@ -2771,38 +2733,22 @@ fn only_the_declared_export_reaches_the_caller() {
 /// the output would never mention "neverSet".
 #[test]
 fn a_declared_export_that_is_never_set_fails_the_include_step() {
-    let dir = std::env::temp_dir().join(format!(
-        "bddkit-include-missing-export-test-{}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(dir.join("features")).expect("mkdir");
-    std::fs::create_dir_all(dir.join("targets")).expect("mkdir");
-    std::fs::copy(
-        "tests/fixtures/include/isolation_target_missing_export.feature",
-        dir.join("targets/isolation_target_missing_export.feature"),
-    )
-    .expect("copy isolation_target_missing_export.feature");
-    std::fs::copy(
-        "tests/fixtures/include/isolation_caller_missing_export.feature",
-        dir.join("features/isolation_caller_missing_export.feature"),
-    )
-    .expect("copy isolation_caller_missing_export.feature");
-    std::fs::write(
-        dir.join("cfg.yaml"),
-        "paths: [features]\nresources:\n  api:\n    stub:\n      base_url: http://example.test\n",
-    )
-    .expect("write config");
-
-    let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
-        .args(["run", "--config", "cfg.yaml"])
-        .current_dir(&dir)
-        .output()
-        .expect("failed to run bddkit");
-
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    let dir = build_include_project(
+        "include-missing-export-test",
+        &[
+            (
+                "targets/isolation_target_missing_export.feature",
+                "tests/fixtures/include/isolation_target_missing_export.feature",
+            ),
+            (
+                "features/isolation_caller_missing_export.feature",
+                "tests/fixtures/include/isolation_caller_missing_export.feature",
+            ),
+        ],
+    );
+    let (code, stdout, stderr) = run_bddkit_in("run", &dir);
     assert_eq!(
-        out.status.code(),
+        code,
         Some(1),
         "the missing export must fail the include step (and the caller \
          scenario with it), a scenario failure rather than a validation \
@@ -2819,35 +2765,22 @@ fn a_declared_export_that_is_never_set_fails_the_include_step() {
 
 #[test]
 fn include_by_scenario_name_picks_the_named_one() {
-    let dir =
-        std::env::temp_dir().join(format!("bddkit-include-multi-test-{}", std::process::id()));
-    std::fs::create_dir_all(dir.join("features")).expect("mkdir");
-    std::fs::copy(
-        "tests/features/include/multi.feature",
-        dir.join("features/multi.feature"),
-    )
-    .expect("copy multi.feature");
-    std::fs::copy(
-        "tests/features/include/caller_multi.feature",
-        dir.join("features/caller_multi.feature"),
-    )
-    .expect("copy caller_multi.feature");
-    std::fs::write(
-        dir.join("cfg.yaml"),
-        "paths: [features]\nresources:\n  api:\n    stub:\n      base_url: http://example.test\n",
-    )
-    .expect("write config");
-
-    let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
-        .args(["run", "--config", "cfg.yaml"])
-        .current_dir(&dir)
-        .output()
-        .expect("failed to run bddkit");
-
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    let dir = build_include_project(
+        "include-multi-test",
+        &[
+            (
+                "features/multi.feature",
+                "tests/features/include/multi.feature",
+            ),
+            (
+                "features/caller_multi.feature",
+                "tests/features/include/caller_multi.feature",
+            ),
+        ],
+    );
+    let (code, stdout, stderr) = run_bddkit_in("run", &dir);
     assert_eq!(
-        out.status.code(),
+        code,
         Some(0),
         "--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
     );
@@ -2855,37 +2788,22 @@ fn include_by_scenario_name_picks_the_named_one() {
 
 #[test]
 fn include_of_an_outline_uses_the_callers_with_row() {
-    let dir = std::env::temp_dir().join(format!(
-        "bddkit-include-outline-with-test-{}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(dir.join("features")).expect("mkdir");
-    std::fs::copy(
-        "tests/features/include/outline.feature",
-        dir.join("features/outline.feature"),
-    )
-    .expect("copy outline.feature");
-    std::fs::copy(
-        "tests/features/include/caller_outline_with.feature",
-        dir.join("features/caller_outline_with.feature"),
-    )
-    .expect("copy caller_outline_with.feature");
-    std::fs::write(
-        dir.join("cfg.yaml"),
-        "paths: [features]\nresources:\n  api:\n    stub:\n      base_url: http://example.test\n",
-    )
-    .expect("write config");
-
-    let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
-        .args(["run", "--config", "cfg.yaml"])
-        .current_dir(&dir)
-        .output()
-        .expect("failed to run bddkit");
-
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    let dir = build_include_project(
+        "include-outline-with-test",
+        &[
+            (
+                "features/outline.feature",
+                "tests/features/include/outline.feature",
+            ),
+            (
+                "features/caller_outline_with.feature",
+                "tests/features/include/caller_outline_with.feature",
+            ),
+        ],
+    );
+    let (code, stdout, stderr) = run_bddkit_in("run", &dir);
     assert_eq!(
-        out.status.code(),
+        code,
         Some(0),
         "--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
     );
@@ -2893,37 +2811,22 @@ fn include_of_an_outline_uses_the_callers_with_row() {
 
 #[test]
 fn include_of_an_outline_with_one_examples_row_and_no_with_uses_that_row() {
-    let dir = std::env::temp_dir().join(format!(
-        "bddkit-include-outline-bare-test-{}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(dir.join("features")).expect("mkdir");
-    std::fs::copy(
-        "tests/features/include/outline.feature",
-        dir.join("features/outline.feature"),
-    )
-    .expect("copy outline.feature");
-    std::fs::copy(
-        "tests/features/include/caller_outline_bare.feature",
-        dir.join("features/caller_outline_bare.feature"),
-    )
-    .expect("copy caller_outline_bare.feature");
-    std::fs::write(
-        dir.join("cfg.yaml"),
-        "paths: [features]\nresources:\n  api:\n    stub:\n      base_url: http://example.test\n",
-    )
-    .expect("write config");
-
-    let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
-        .args(["run", "--config", "cfg.yaml"])
-        .current_dir(&dir)
-        .output()
-        .expect("failed to run bddkit");
-
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    let dir = build_include_project(
+        "include-outline-bare-test",
+        &[
+            (
+                "features/outline.feature",
+                "tests/features/include/outline.feature",
+            ),
+            (
+                "features/caller_outline_bare.feature",
+                "tests/features/include/caller_outline_bare.feature",
+            ),
+        ],
+    );
+    let (code, stdout, stderr) = run_bddkit_in("run", &dir);
     assert_eq!(
-        out.status.code(),
+        code,
         Some(0),
         "--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
     );
@@ -2931,35 +2834,22 @@ fn include_of_an_outline_with_one_examples_row_and_no_with_uses_that_row() {
 
 #[test]
 fn debug_mode_logs_the_includes_with_and_export_lines() {
-    let dir =
-        std::env::temp_dir().join(format!("bddkit-debug-include-test-{}", std::process::id()));
-    std::fs::create_dir_all(dir.join("features")).expect("mkdir");
-    std::fs::copy(
-        "tests/features/include/outline.feature",
-        dir.join("features/outline.feature"),
-    )
-    .expect("copy outline.feature");
-    std::fs::copy(
-        "tests/features/include/caller_debug_export.feature",
-        dir.join("features/caller_debug_export.feature"),
-    )
-    .expect("copy caller_debug_export.feature");
-    std::fs::write(
-        dir.join("cfg.yaml"),
-        "paths: [features]\nresources:\n  api:\n    stub:\n      base_url: http://example.test\n",
-    )
-    .expect("write config");
-
-    let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
-        .args(["run", "--config", "cfg.yaml"])
-        .current_dir(&dir)
-        .output()
-        .expect("failed to run bddkit");
-
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    let dir = build_include_project(
+        "debug-include-test",
+        &[
+            (
+                "features/outline.feature",
+                "tests/features/include/outline.feature",
+            ),
+            (
+                "features/caller_debug_export.feature",
+                "tests/features/include/caller_debug_export.feature",
+            ),
+        ],
+    );
+    let (code, stdout, stderr) = run_bddkit_in("run", &dir);
     assert_eq!(
-        out.status.code(),
+        code,
         Some(0),
         "--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
     );

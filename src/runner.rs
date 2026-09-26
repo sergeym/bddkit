@@ -307,13 +307,17 @@ fn run_include<'a>(
         let scenario = crate::include::select_scenario(&included, scenario_name)?;
         let exports = crate::feature::exports_of(&included, scenario)?;
 
+        // build_scenario validates the with: table's shape (exactly one data row) —
+        // do this BEFORE extracting values, so there is one authoritative shape
+        // check, not two independently-written ones with different error messages.
+        let expanded = crate::include::build_scenario(scenario, caller_step.table.as_deref())?;
+
         // `with:` cells are interpolated in the CALLER's scope, before the swap.
+        // The shape (exactly one data row) is already guaranteed by build_scenario above.
         let with_values: Vec<(String, String)> = match &caller_step.table {
             Some(table) => {
                 let [header, row] = table.as_slice() else {
-                    return Err(format!(
-                        "I include {path_literal:?}: `with:` must have exactly one data row"
-                    ));
+                    unreachable!("build_scenario already validated exactly one data row")
                 };
                 let mut out = Vec::with_capacity(header.len());
                 for (name, raw) in header.iter().zip(row.iter()) {
@@ -324,9 +328,6 @@ fn run_include<'a>(
             }
             None => Vec::new(),
         };
-
-        let with_table_shape: Option<Vec<Vec<String>>> = caller_step.table.clone();
-        let expanded = crate::include::build_scenario(scenario, with_table_shape.as_deref())?;
 
         if world.debug {
             eprintln!(
