@@ -2928,3 +2928,53 @@ fn include_of_an_outline_with_one_examples_row_and_no_with_uses_that_row() {
         "--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
     );
 }
+
+#[test]
+fn debug_mode_logs_the_includes_with_and_export_lines() {
+    let dir =
+        std::env::temp_dir().join(format!("bddkit-debug-include-test-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("features")).expect("mkdir");
+    std::fs::copy(
+        "tests/features/include/outline.feature",
+        dir.join("features/outline.feature"),
+    )
+    .expect("copy outline.feature");
+    std::fs::copy(
+        "tests/features/include/caller_debug_export.feature",
+        dir.join("features/caller_debug_export.feature"),
+    )
+    .expect("copy caller_debug_export.feature");
+    std::fs::write(
+        dir.join("cfg.yaml"),
+        "paths: [features]\nresources:\n  api:\n    stub:\n      base_url: http://example.test\n",
+    )
+    .expect("write config");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
+        .args(["run", "--config", "cfg.yaml"])
+        .current_dir(&dir)
+        .output()
+        .expect("failed to run bddkit");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+    );
+
+    // In debug mode, the include logs its inputs and every exported variable
+    assert!(
+        stderr.contains("outline.feature ›"),
+        "stderr should contain 'outline.feature ›' (entry line with filename and separator):\n{stderr}"
+    );
+    assert!(
+        stderr.contains("  with value = "),
+        "stderr should contain '  with value = ' (with two-space indentation):\n{stderr}"
+    );
+    assert!(
+        stderr.contains("  export seen = "),
+        "stderr should contain '  export seen = ' (with two-space indentation):\n{stderr}"
+    );
+}
