@@ -540,6 +540,80 @@ async fn one_scenario_can_call_two_different_apis() {
     );
 }
 
+/// Gate: API switch inside an include persists after the include returns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_api_switch_inside_an_include_stays_switched_after_it_returns() {
+    let primary = common::spawn().await;
+    let secondary = common::spawn_secondary().await;
+
+    let dir =
+        std::env::temp_dir().join(format!("bddkit-include-api-switch-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("features").join("include")).expect("mkdir");
+
+    // Included scenario: switches to secondary API and makes a request.
+    std::fs::write(
+        dir.join("features/include/state.feature"),
+        r#"Feature: Switches API inside an include
+  Scenario: Switches to a secondary API
+    Given I use "secondary" api
+    When I request "/ping"
+    Then the response body contains JSON:
+      """
+      {"source": "secondary"}
+      """
+"#,
+    )
+    .expect("write state.feature");
+
+    // Caller scenario: includes the state.feature, then makes another request.
+    // The second request should still go to secondary (not revert to default).
+    std::fs::write(
+        dir.join("features/caller.feature"),
+        r#"Feature: Caller verifies API switch persists
+  Scenario: API switch inside include persists after include returns
+    Given I include "include/state.feature"
+    When I request "/ping"
+    Then the response body contains JSON:
+      """
+      {"source": "secondary"}
+      """
+"#,
+    )
+    .expect("write caller.feature");
+
+    std::fs::write(
+        dir.join("cfg.yaml"),
+        format!(
+            "paths: [{}]\ndefault_api: primary\nresources:\n  api:\n    primary:\n      base_url: {primary}\n    secondary:\n      base_url: {secondary}\n",
+            dir.join("features").display().to_string().replace('\\', "/")
+        ),
+    )
+    .expect("write config");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
+        .args([
+            "run",
+            "--config",
+            dir.join("cfg.yaml").to_str().expect("path is UTF-8"),
+        ])
+        .output()
+        .expect("failed to run bddkit");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "a scenario that includes another and maintains API switch must be green\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+    );
+    // Two files: the included state.feature (which switches API and makes a request),
+    // and the caller.feature (which includes state.feature and makes another request).
+    // Both must pass with failed: 0 to prove the API switch persists through the include.
+    assert!(
+        stdout.contains("files: 2, scenarios: 2, failed: 0"),
+        "two scenarios in two files must pass:\n{stdout}"
+    );
+}
+
 #[test]
 fn macro_cycle_fails_validation_with_exit_code_two() {
     let dir = std::env::temp_dir().join(format!("bddkit-cycle-test-{}", std::process::id()));
