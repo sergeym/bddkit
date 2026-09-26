@@ -1,4 +1,7 @@
-use crate::feature::{LoadedFeature, display_path};
+use crate::feature::{
+    ExpandedScenario, ExpandedStep, LoadedFeature, display_path, scenario_placeholders, substitute,
+    to_step,
+};
 use std::path::{Path, PathBuf};
 
 /// Rejects a runtime token or a macro parameter in an include's file
@@ -93,11 +96,112 @@ pub fn select_scenario<'a>(
     }
 }
 
+/// Picks the concrete steps an include runs, in one of three shapes:
+/// - `with:` given: the scenario must be an Outline; the table's single data
+///   row's columns must exactly match the scenario's own placeholders; every
+///   `<name>` in the scenario's steps becomes the runtime token `<<name>>`
+///   (reusing `substitute`, aimed at a runtime token instead of a literal),
+///   so the value comes from whatever `run_include` seeds into the fresh
+///   `VarStack` — not from anything known at validation time.
+/// - No `with:`, one Examples row total: the ordinary Outline literal
+///   substitution already answers this — `Vec<ExpandedScenario>`'s single
+///   element from `expand_outlines` is used unchanged.
+/// - A plain `Scenario`, no `with:`: its steps as written.
+#[allow(dead_code)]
+pub fn build_scenario(
+    sc: &gherkin::Scenario,
+    with_table: Option<&[Vec<String>]>,
+) -> Result<ExpandedScenario, String> {
+    // Consumed starting in Task 8 when `validate::check` validates includes
+    // and Task 10 when `runner::run_include` builds the concrete scenario
+    match with_table {
+        Some(table) => {
+            if sc.examples.is_empty() {
+                return Err(format!(
+                    "I include: `with:` is only valid on a Scenario Outline, \
+                     but {:?} is a plain Scenario",
+                    sc.name
+                ));
+            }
+            // The row's own values are irrelevant here: with `with:`, every
+            // placeholder becomes a runtime token regardless of what this
+            // (validation-time, possibly not-yet-interpolated) row contains
+            // — only its PRESENCE matters, to enforce "exactly one data row".
+            let [header, _row] = table else {
+                return Err(format!(
+                    "I include {:?}: `with:` must have exactly one data row, found {}",
+                    sc.name,
+                    table.len().saturating_sub(1)
+                ));
+            };
+            let placeholders = scenario_placeholders(sc);
+            for column in header {
+                if !placeholders.contains(column) {
+                    return Err(format!(
+                        "I include {:?}: `with:` column {column:?} is not a \
+                         placeholder this scenario uses",
+                        sc.name
+                    ));
+                }
+            }
+            for name in &placeholders {
+                if !header.contains(name) {
+                    return Err(format!(
+                        "I include {:?}: placeholder <{name}> has no value in `with:`",
+                        sc.name
+                    ));
+                }
+            }
+            let tokens: Vec<String> = header.iter().map(|name| format!("<<{name}>>")).collect();
+            let steps = sc
+                .steps
+                .iter()
+                .map(to_step)
+                .map(|s| ExpandedStep {
+                    keyword: s.keyword,
+                    text: substitute(&s.text, header, &tokens),
+                    line: s.line,
+                    docstring: s.docstring.map(|d| substitute(&d, header, &tokens)),
+                    table: s.table.map(|t| {
+                        t.iter()
+                            .map(|r| r.iter().map(|c| substitute(c, header, &tokens)).collect())
+                            .collect()
+                    }),
+                })
+                .collect();
+            Ok(ExpandedScenario {
+                name: sc.name.clone(),
+                line: sc.position.line,
+                steps,
+            })
+        }
+        None => {
+            let mut expanded = crate::feature::expand_outlines(sc);
+            match expanded.len() {
+                1 => Ok(expanded.remove(0)),
+                n => Err(format!(
+                    "I include {:?}: has {n} Examples rows — pass `with:` to pick one, \
+                     or reduce Examples to a single row",
+                    sc.name
+                )),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
     use tempfile::tempdir;
+
+    fn parse_scenario(body: &str) -> gherkin::Scenario {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("s.feature");
+        fs::write(&path, format!("Feature: f\n{body}")).unwrap();
+        let lf = crate::feature::load(&path).unwrap();
+        lf.feature.scenarios[0].clone()
+    }
 
     #[test]
     fn check_literal_rejects_a_runtime_token() {
@@ -200,5 +304,78 @@ mod tests {
         let lf = crate::feature::load(&path).unwrap();
         let err = select_scenario(&lf, Some("nope")).unwrap_err();
         assert!(err.contains("nope"), "{err}");
+    }
+
+    #[test]
+    fn build_scenario_rejects_with_on_a_plain_scenario() {
+        let sc = parse_scenario("  Scenario: s\n    Given x\n");
+        let table = vec![vec!["a".to_string()], vec!["1".to_string()]];
+        let err = build_scenario(&sc, Some(&table)).unwrap_err();
+        assert!(err.contains("Scenario Outline"), "{err}");
+    }
+
+    #[test]
+    fn build_scenario_rejects_more_than_one_data_row() {
+        let sc = parse_scenario(
+            "  Scenario Outline: s\n    Given I do <a>\n    Examples:\n      | a |\n      | 1 |\n",
+        );
+        let table = vec![
+            vec!["a".to_string()],
+            vec!["1".to_string()],
+            vec!["2".to_string()],
+        ];
+        let err = build_scenario(&sc, Some(&table)).unwrap_err();
+        assert!(err.contains("one data row"), "{err}");
+    }
+
+    #[test]
+    fn build_scenario_rejects_a_column_that_is_not_a_placeholder() {
+        let sc = parse_scenario(
+            "  Scenario Outline: s\n    Given I do <a>\n    Examples:\n      | a |\n      | 1 |\n",
+        );
+        let table = vec![
+            vec!["a".to_string(), "b".to_string()],
+            vec!["1".to_string(), "2".to_string()],
+        ];
+        let err = build_scenario(&sc, Some(&table)).unwrap_err();
+        assert!(err.contains('b'), "{err}");
+    }
+
+    #[test]
+    fn build_scenario_rejects_a_missing_placeholder_value() {
+        let sc = parse_scenario(
+            "  Scenario Outline: s\n    Given I do <a>\n    And I do <b>\n    Examples:\n      | a | b |\n      | 1 | 2 |\n",
+        );
+        let table = vec![vec!["a".to_string()], vec!["1".to_string()]];
+        let err = build_scenario(&sc, Some(&table)).unwrap_err();
+        assert!(err.contains('b'), "{err}");
+    }
+
+    #[test]
+    fn build_scenario_rewrites_a_with_placeholder_to_a_runtime_token() {
+        let sc = parse_scenario(
+            "  Scenario Outline: s\n    Given I sign up as \"<email>\"\n    Examples:\n      | email |\n      | x |\n",
+        );
+        let table = vec![vec!["email".to_string()], vec!["ignored".to_string()]];
+        let ex = build_scenario(&sc, Some(&table)).unwrap();
+        assert_eq!(ex.steps[0].text, r#"I sign up as "<<email>>""#);
+    }
+
+    #[test]
+    fn build_scenario_uses_the_lone_examples_row_when_no_with_is_given() {
+        let sc = parse_scenario(
+            "  Scenario Outline: s\n    Given I sign up as \"<email>\"\n    Examples:\n      | email |\n      | x |\n",
+        );
+        let ex = build_scenario(&sc, None).unwrap();
+        assert_eq!(ex.steps[0].text, r#"I sign up as "x""#);
+    }
+
+    #[test]
+    fn build_scenario_rejects_multiple_examples_rows_with_no_with() {
+        let sc = parse_scenario(
+            "  Scenario Outline: s\n    Given I sign up as \"<email>\"\n    Examples:\n      | email |\n      | x |\n      | y |\n",
+        );
+        let err = build_scenario(&sc, None).unwrap_err();
+        assert!(err.contains("with:"), "{err}");
     }
 }
