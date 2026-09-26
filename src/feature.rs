@@ -190,12 +190,42 @@ pub fn to_step(s: &gherkin::Step) -> ExpandedStep {
 static PLACEHOLDER: std::sync::LazyLock<regex::Regex> =
     std::sync::LazyLock::new(|| regex::Regex::new(r"<<(\w+)>>|<(\w+)>").expect("constant regex"));
 
+/// Every `<name>` (single-bracket, Outline-style) token a scenario's steps,
+/// docstrings and table cells use. Used to validate an `I include ... with:`
+/// table: its columns must be exactly this set (see `src/include.rs`).
+#[allow(dead_code)]
+pub fn scenario_placeholders(sc: &gherkin::Scenario) -> std::collections::HashSet<String> {
+    // Consumed starting in Task 6 when `I include ... with:` validates its table.
+    let mut out = std::collections::HashSet::new();
+    let mut collect = |text: &str| {
+        for caps in PLACEHOLDER.captures_iter(text) {
+            if let Some(m) = caps.get(2) {
+                out.insert(m.as_str().to_string());
+            }
+        }
+    };
+    for step in &sc.steps {
+        collect(&step.value);
+        if let Some(d) = &step.docstring {
+            collect(d);
+        }
+        if let Some(t) = &step.table {
+            for row in &t.rows {
+                for cell in row {
+                    collect(cell);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Substitutes `<key>` from an Examples row. Single pass, because a naive
 /// `replace("<key>", v)` would eat the inner `<key>` inside the runtime token `<<key>>`
 /// (in `<<userId>>` the substring `<userId>` starts at position 1) — and `<<…>>` must
 /// survive untouched until execution. Double brackets match the first alternative
 /// and are returned as-is; single brackets are replaced by the column value.
-fn substitute(text: &str, keys: &[String], row: &[String]) -> String {
+pub(crate) fn substitute(text: &str, keys: &[String], row: &[String]) -> String {
     PLACEHOLDER
         .replace_all(text, |caps: &regex::Captures| {
             if let Some(m) = caps.get(1) {
@@ -728,5 +758,28 @@ Feature: f
             let sc = &lf.feature.scenarios[0];
             assert_eq!(exports_of(&lf, sc).unwrap(), Vec::<String>::new());
         }
+    }
+
+    fn parse_inline_scenario(body: &str) -> gherkin::Scenario {
+        let src = format!("Feature: f\n  {body}");
+        let f = parse_str(&src).expect("gherkin parses");
+        f.scenarios[0].clone()
+    }
+
+    #[test]
+    fn scenario_placeholders_collects_every_name_used() {
+        let sc = parse_inline_scenario(
+            "Scenario Outline: s\n  Given I do <a>\n  When I check:\n    \"\"\"\n    <b>\n    \"\"\"\n",
+        );
+        let names = scenario_placeholders(&sc);
+        assert!(names.contains("a"));
+        assert!(names.contains("b"));
+        assert_eq!(names.len(), 2);
+    }
+
+    #[test]
+    fn scenario_placeholders_ignores_double_bracket_runtime_tokens() {
+        let sc = parse_inline_scenario("Scenario Outline: s\n  Given I use \"<<userId>>\"\n");
+        assert!(scenario_placeholders(&sc).is_empty());
     }
 }
