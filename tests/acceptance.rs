@@ -2978,3 +2978,43 @@ fn debug_mode_logs_the_includes_with_and_export_lines() {
         "stderr should contain '  export seen = ' (with two-space indentation):\n{stderr}"
     );
 }
+
+#[test]
+fn doctor_reports_a_broken_include_the_same_way_run_does() {
+    // Same missing-file fixture as include_of_a_missing_file_is_a_problem (Task 7),
+    // but invoke `bddkit doctor --config cfg.yaml` instead of `run`.
+    // Assert: exit code 1 (doctor's own convention — 0 or 1 only, never 2,
+    // per CLAUDE.md) with the missing file's name appearing in stdout.
+    let cfg = write_doctor_project(
+        "doctor-include",
+        "http://127.0.0.1:1/",
+        "Feature: caller\n  Scenario: test\n    Given I include \"nope.feature\"\n",
+        "",
+    );
+
+    let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
+        .args(["doctor", "--config", cfg.to_str().expect("path is UTF-8")])
+        .output()
+        .expect("failed to run bddkit");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // Doctor exits 1 (never 2) even for a config that would make run exit 2
+    assert_eq!(out.status.code(), Some(1), "{stdout}");
+    // The missing file name is mentioned in the output
+    assert!(stdout.contains("nope.feature"), "{stdout}");
+}
+
+#[test]
+fn steps_list_includes_both_include_steps() {
+    let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
+        .args(["steps", "list"])
+        .output()
+        .expect("failed to run bddkit");
+
+    let text = String::from_utf8_lossy(&out.stdout);
+    // Both Include and IncludeScenario steps start with "I include"
+    assert!(
+        text.contains("I include"),
+        "steps list should contain 'I include': {text}"
+    );
+}
