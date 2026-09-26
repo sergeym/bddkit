@@ -92,7 +92,7 @@ pub fn check(features: &[&LoadedFeature], reg: &Registry, filter: &TagFilter) ->
                 Ok(None) => problems.push(Problem {
                     file: lf.path.clone(),
                     line: step.line,
-                    message: format!("unknown step: {}", step.text),
+                    message: format!("unknown step: {:?}", step.text),
                 }),
                 Err(e) => problems.push(Problem {
                     file: lf.path.clone(),
@@ -222,6 +222,7 @@ fn check_include_recursive(
     let canonical = resolved.canonicalize().unwrap_or_else(|_| resolved.clone());
     let included = crate::feature::load(&resolved).map_err(|e| e.to_string())?;
     let scenario = crate::include::select_scenario(&included, scenario_name)?;
+    crate::feature::exports_of(&included, scenario)?;
     let node = (canonical, scenario.name.clone());
     if let Some(pos) = stack.iter().position(|n| n == &node) {
         let mut chain: Vec<String> = stack[pos..]
@@ -248,7 +249,11 @@ fn check_include_recursive(
         let result = check_include_body_step(step, &included_base, reg, stack);
         if let Err(e) = result {
             stack.pop();
-            return Err(e);
+            return Err(format!(
+                "{}:{}: {e}",
+                crate::feature::display_path(&resolved),
+                step.line
+            ));
         }
     }
     stack.pop();
@@ -274,6 +279,9 @@ fn check_include_body_step(
                 crate::steps::StepId::Include | crate::steps::StepId::IncludeScenario
             ) =>
         {
+            if step.docstring.is_some() {
+                return Err("I include does not support a docstring".into());
+            }
             let scenario_name = if id == crate::steps::StepId::IncludeScenario {
                 Some(caps[1].as_str())
             } else {
@@ -585,7 +593,8 @@ Feature: f
         let problems = check(&[&lf], &reg, &filter);
         assert!(
             problems.iter().any(|p| p.message.contains("unknown step")
-                && p.message.contains("this step does not exist")),
+                && p.message.contains("this step does not exist")
+                && p.message.contains("target.feature")),
             "{problems:?}"
         );
     }
@@ -609,5 +618,60 @@ Feature: f
         let filter = crate::feature::TagFilter::new(&[]);
         let problems = check(&[&lf], &reg, &filter);
         assert!(problems.is_empty(), "{problems:?}");
+    }
+
+    #[test]
+    fn a_nested_include_with_a_docstring_is_rejected_at_validation_time() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("inner.feature"),
+            "Feature: f\n  Scenario: only\n    Given I am in debug mode\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("middle.feature"),
+            "Feature: f\n  Scenario: only\n    Given I include \"inner.feature\"\n      \"\"\"\n      not allowed\n      \"\"\"\n",
+        )
+        .unwrap();
+        let path = dir.path().join("caller.feature");
+        std::fs::write(
+            &path,
+            "Feature: f\n  Scenario: s\n    Given I include \"middle.feature\"\n",
+        )
+        .unwrap();
+        let lf = crate::feature::load(&path).unwrap();
+        let reg = crate::steps::Registry::new().unwrap();
+        let filter = crate::feature::TagFilter::new(&[]);
+        let problems = check(&[&lf], &reg, &filter);
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.message.contains("does not support a docstring")),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn a_malformed_exports_tag_on_an_included_scenario_is_caught_at_validation_time() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("target.feature"),
+            "Feature: f\n  @exports(a,,b)\n  Scenario: only\n    Given I am in debug mode\n",
+        )
+        .unwrap();
+        let path = dir.path().join("caller.feature");
+        std::fs::write(
+            &path,
+            "Feature: f\n  Scenario: s\n    Given I include \"target.feature\"\n",
+        )
+        .unwrap();
+        let lf = crate::feature::load(&path).unwrap();
+        let reg = crate::steps::Registry::new().unwrap();
+        let filter = crate::feature::TagFilter::new(&[]);
+        let problems = check(&[&lf], &reg, &filter);
+        assert!(
+            !problems.is_empty(),
+            "expected a validation problem, got none"
+        );
     }
 }

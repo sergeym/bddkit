@@ -7,9 +7,7 @@ use std::path::{Path, PathBuf};
 /// Rejects a runtime token or a macro parameter in an include's file
 /// literal: the path decides which steps run, so it must be known before
 /// interpolation, same reasoning as invariant 1.
-#[allow(dead_code)]
 pub fn check_literal(path_literal: &str) -> Result<(), String> {
-    // Consumed starting in Task 8 when `validate::check` validates include paths
     if path_literal.contains("<<") || path_literal.contains(">>") {
         return Err(format!(
             "I include {path_literal:?}: the path must be a literal — a `<<...>>` \
@@ -29,9 +27,7 @@ pub fn check_literal(path_literal: &str) -> Result<(), String> {
 /// Resolves an include's file literal relative to `base_dir` (the directory
 /// of the `.feature` file, or the macro YAML file, the step is written in).
 /// Absolute literals are used as-is.
-#[allow(dead_code)]
 pub fn resolve(path_literal: &str, base_dir: &Path) -> Result<PathBuf, String> {
-    // Consumed starting in Task 8 when `validate::check` resolves include paths
     let candidate = Path::new(path_literal);
     let resolved = if candidate.is_absolute() {
         candidate.to_path_buf()
@@ -56,12 +52,10 @@ pub fn resolve(path_literal: &str, base_dir: &Path) -> Result<PathBuf, String> {
 /// Picks the one scenario an include runs. With no name: the file must hold
 /// exactly one scenario (an Outline counts as one). With a name: an exact
 /// match, and exactly one.
-#[allow(dead_code)]
 pub fn select_scenario<'a>(
     included: &'a LoadedFeature,
     scenario_name: Option<&str>,
 ) -> Result<&'a gherkin::Scenario, String> {
-    // Consumed starting in Task 8 when `validate::check` and Task 10 when `runner::run_include` select scenarios
     let path = display_path(&included.path);
     match scenario_name {
         None => match included.feature.scenarios.as_slice() {
@@ -107,13 +101,10 @@ pub fn select_scenario<'a>(
 ///   substitution already answers this — `Vec<ExpandedScenario>`'s single
 ///   element from `expand_outlines` is used unchanged.
 /// - A plain `Scenario`, no `with:`: its steps as written.
-#[allow(dead_code)]
 pub fn build_scenario(
     sc: &gherkin::Scenario,
     with_table: Option<&[Vec<String>]>,
 ) -> Result<ExpandedScenario, String> {
-    // Consumed starting in Task 8 when `validate::check` validates includes
-    // and Task 10 when `runner::run_include` builds the concrete scenario
     match with_table {
         Some(table) => {
             if sc.examples.is_empty() {

@@ -362,10 +362,11 @@ fn run_include<'a>(
                 execute_step(world, reg, step, &included_base, generator, depth + 1).await
             {
                 run_result = Err(format!(
-                    "{}:{} → {}\n  {}\n{e}",
+                    "{}:{} → {}:{}\n  {}\n{e}",
                     crate::feature::display_path(source),
                     caller_step.line,
                     crate::feature::display_path(&resolved),
+                    step.line,
                     step.text
                 ));
                 break;

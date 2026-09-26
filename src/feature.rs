@@ -143,9 +143,7 @@ static EXPORTS_TAG: std::sync::LazyLock<regex::Regex> =
 /// `@exports(a,b,*)`. A scenario may carry more than one such tag (its own
 /// plus one inherited from `Feature:`, already merged into `sc.tags` by
 /// `load`) — every one contributes, in the order found.
-#[allow(dead_code)]
 pub fn exports_of(lf: &LoadedFeature, sc: &gherkin::Scenario) -> Result<Vec<String>, String> {
-    // Consumed starting in Task 9 when `I include` executes scenario-level exports
     let mut out = Vec::new();
     for tag in &sc.tags {
         let Some(c) = EXPORTS_TAG.captures(strip_at(tag)) else {
@@ -193,9 +191,7 @@ static PLACEHOLDER: std::sync::LazyLock<regex::Regex> =
 /// Every `<name>` (single-bracket, Outline-style) token a scenario's steps,
 /// docstrings and table cells use. Used to validate an `I include ... with:`
 /// table: its columns must be exactly this set (see `src/include.rs`).
-#[allow(dead_code)]
 pub fn scenario_placeholders(sc: &gherkin::Scenario) -> std::collections::HashSet<String> {
-    // Consumed starting in Task 6 when `I include ... with:` validates its table.
     let mut out = std::collections::HashSet::new();
     let mut collect = |text: &str| {
         for caps in PLACEHOLDER.captures_iter(text) {

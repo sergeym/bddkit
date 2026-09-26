@@ -12,7 +12,7 @@ Feature: `I include` — reusing scenarios from another file
 
   Scenario: includes a Scenario Outline with a caller-supplied row
     Given set variable "myValue" to "from-caller"
-    When I include "include_setup.feature" scenario "records what it was given"
+    When I include "include_setup.feature" scenario "records what it was given" with:
       | value |
       | <<myValue>> |
     Then variable "seen" should be equal to "from-caller"
