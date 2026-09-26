@@ -2557,6 +2557,192 @@ fn with_table_cell_is_interpolated_against_the_callers_scope() {
     );
 }
 
+/// Invariant 2 (state scoping) says variables never flow into an included
+/// scenario except through `with:` — this proves the negative directly: the
+/// included scenario reads a variable the caller set and must find it
+/// genuinely UNDEFINED, not merely empty. `variable "callerOnly" should be
+/// empty` first calls `variable(w, name)` (`steps/vars.rs`), which fails with
+/// `variable "callerOnly" is not set` for anything never `set` in the
+/// included scenario's own fresh `VarStack` — a stale-but-visible value would
+/// instead either match (if still `"secret"`) or fail on content, never on
+/// "not set". If `run_include` ever stopped swapping in a fresh `VarStack`
+/// (or swapped it in too late), this test would fail differently: the
+/// assertion would report the value `"secret"` instead of "is not set", or
+/// pass outright were the check changed to tolerate that.
+#[test]
+fn a_caller_variable_is_not_visible_inside_an_included_scenario() {
+    let dir = std::env::temp_dir().join(format!(
+        "bddkit-include-isolation-test-{}",
+        std::process::id()
+    ));
+    // Same layout as `a_failed_include_still_restores_the_callers_var_stack`:
+    // the included scenario fails on purpose, so both fixtures live under
+    // `tests/fixtures/include/`, and the target sits in a sibling `targets/`
+    // directory outside `paths: [features]` so it is reached only through
+    // the include, never discovered and run a second time on its own.
+    std::fs::create_dir_all(dir.join("features")).expect("mkdir");
+    std::fs::create_dir_all(dir.join("targets")).expect("mkdir");
+    std::fs::copy(
+        "tests/fixtures/include/isolation_target_cannot_read_caller.feature",
+        dir.join("targets/isolation_target_cannot_read_caller.feature"),
+    )
+    .expect("copy isolation_target_cannot_read_caller.feature");
+    std::fs::copy(
+        "tests/fixtures/include/isolation_caller_cannot_read.feature",
+        dir.join("features/isolation_caller_cannot_read.feature"),
+    )
+    .expect("copy isolation_caller_cannot_read.feature");
+    std::fs::write(
+        dir.join("cfg.yaml"),
+        "paths: [features]\nresources:\n  api:\n    stub:\n      base_url: http://example.test\n",
+    )
+    .expect("write config");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
+        .args(["run", "--config", "cfg.yaml"])
+        .current_dir(&dir)
+        .output()
+        .expect("failed to run bddkit");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "the included scenario's own assertion must fail (the variable is \
+         genuinely undefined inside the include), which fails the include \
+         step and the caller scenario with it: \
+         --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+    );
+    assert!(
+        stdout.contains(r#"variable "callerOnly" is not set"#),
+        "the failure must name the variable as UNSET, not merely empty or \
+         mismatched — proving the caller's value never crossed into the \
+         included scenario's scope: --- stdout ---\n{stdout}"
+    );
+}
+
+/// Invariant 2's other half: a DECLARED `@exports` name reaches the caller,
+/// but anything else the included scenario sets does not, even though both
+/// live in the same fresh `VarStack` while the include runs. Two scenarios
+/// sharing the caller file's `VarStack` (persisted across scenarios within
+/// one file, per invariant 2): the first includes and checks the declared
+/// export `kept` arrived; the second — without including anything itself —
+/// asserts `notExported` is still undefined. If `run_include` ever copied
+/// the whole included scope back instead of just the declared exports, the
+/// second scenario would find `notExported == "no"` and pass instead of
+/// failing — so this test is provative in the direction that matters: a
+/// leak turns its expected failure into an unexpected pass, not the reverse.
+#[test]
+fn only_the_declared_export_reaches_the_caller() {
+    let dir = std::env::temp_dir().join(format!(
+        "bddkit-include-export-boundary-test-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(dir.join("features")).expect("mkdir");
+    std::fs::create_dir_all(dir.join("targets")).expect("mkdir");
+    std::fs::copy(
+        "tests/fixtures/include/isolation_target_export_boundary.feature",
+        dir.join("targets/isolation_target_export_boundary.feature"),
+    )
+    .expect("copy isolation_target_export_boundary.feature");
+    std::fs::copy(
+        "tests/fixtures/include/isolation_caller_export_boundary.feature",
+        dir.join("features/isolation_caller_export_boundary.feature"),
+    )
+    .expect("copy isolation_caller_export_boundary.feature");
+    std::fs::write(
+        dir.join("cfg.yaml"),
+        "paths: [features]\nresources:\n  api:\n    stub:\n      base_url: http://example.test\n",
+    )
+    .expect("write config");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
+        .args(["run", "--config", "cfg.yaml"])
+        .current_dir(&dir)
+        .output()
+        .expect("failed to run bddkit");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "scenario 1 (declared export `kept`) must pass; scenario 2 must \
+         fail on purpose, proving `notExported` never crossed the boundary: \
+         --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+    );
+    assert!(
+        stdout.contains("scenarios: 2, failed: 1"),
+        "scenario 1 must pass silently (the declared export `kept` arrived \
+         and equalled \"yes\") — a failure there would mean the export \
+         itself is broken, not just the boundary: \
+         --- stdout ---\n{stdout}"
+    );
+    assert!(
+        stdout.contains(r#"variable "notExported" is not set"#),
+        "scenario 2's failure must name `notExported` as UNSET — not \
+         merely empty or some other mismatch — proving it never arrived, \
+         rather than arriving as an unexpected value: \
+         --- stdout ---\n{stdout}"
+    );
+}
+
+/// A declared `@exports` name that the included scenario never `set`s must
+/// fail the include step itself — not the caller scenario's own next
+/// assertion — with an error naming the missing export, per `run_include`'s
+/// `export_result` handling in `src/runner.rs`. If a regression silently
+/// dropped an unresolved export instead of failing (e.g. by skipping it
+/// rather than recording `missing`), this run would exit 0 instead of 1 and
+/// the output would never mention "neverSet".
+#[test]
+fn a_declared_export_that_is_never_set_fails_the_include_step() {
+    let dir = std::env::temp_dir().join(format!(
+        "bddkit-include-missing-export-test-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(dir.join("features")).expect("mkdir");
+    std::fs::create_dir_all(dir.join("targets")).expect("mkdir");
+    std::fs::copy(
+        "tests/fixtures/include/isolation_target_missing_export.feature",
+        dir.join("targets/isolation_target_missing_export.feature"),
+    )
+    .expect("copy isolation_target_missing_export.feature");
+    std::fs::copy(
+        "tests/fixtures/include/isolation_caller_missing_export.feature",
+        dir.join("features/isolation_caller_missing_export.feature"),
+    )
+    .expect("copy isolation_caller_missing_export.feature");
+    std::fs::write(
+        dir.join("cfg.yaml"),
+        "paths: [features]\nresources:\n  api:\n    stub:\n      base_url: http://example.test\n",
+    )
+    .expect("write config");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_bddkit"))
+        .args(["run", "--config", "cfg.yaml"])
+        .current_dir(&dir)
+        .output()
+        .expect("failed to run bddkit");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "the missing export must fail the include step (and the caller \
+         scenario with it), a scenario failure rather than a validation \
+         (exit 2) or a silent pass: \
+         --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+    );
+    assert!(
+        stdout.contains("declared export \"neverSet\"")
+            && stdout.contains("the variable is not set"),
+        "the failure must clearly name the missing export \"neverSet\": \
+         --- stdout ---\n{stdout}"
+    );
+}
+
 #[test]
 fn include_by_scenario_name_picks_the_named_one() {
     let dir =
