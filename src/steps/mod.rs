@@ -105,6 +105,9 @@ pub enum StepId {
     SrpVerifierWithSalt,
     SrpStartLogin,
     SrpCompleteLogin,
+    // include
+    Include,
+    IncludeScenario,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -688,6 +691,18 @@ pub const BUILTIN_STEPS: &[StepDef] = &[
         "srp",
         r#"^I complete SRP login "(?P<prefix>[^"]*)" for "(?P<username>[^"]*)" with password "(?P<password>[^"]*)" salt "(?P<salt>[^"]*)" and "(?P<server_public>[^"]*)"$"#,
         "answers the server challenge into <prefix>_M1, <prefix>_M2 and <prefix>_sessionKey",
+    ),
+    action(
+        StepId::Include,
+        "general",
+        r#"^I include "(?P<file>[^"]*)"$"#,
+        "Runs the only scenario of another feature file inline, sharing HTTP/DB/plugin state.",
+    ),
+    action(
+        StepId::IncludeScenario,
+        "general",
+        r#"^I include "(?P<file>[^"]*)" scenario "(?P<name>[^"]*)"$"#,
+        "Runs one named scenario of another feature file inline, sharing HTTP/DB/plugin state.",
     ),
 ];
 
@@ -1327,6 +1342,9 @@ pub async fn dispatch(w: &mut World, id: StepId, a: &Args, attempt: u64) -> Atte
         StepId::SrpCompleteLogin => {
             srp::complete_login(w, a.cap(0), a.cap(1), a.cap(2), a.cap(3), a.cap(4))
         }
+        StepId::Include | StepId::IncludeScenario => {
+            unreachable!("execute_step intercepts Include/IncludeScenario before calling dispatch")
+        }
     };
     result.map_err(AttemptError::Fatal)
 }
@@ -1823,5 +1841,45 @@ mod tests {
     #[test]
     fn unknown_step_returns_none() {
         assert!(reg().find("I refund the order").unwrap().is_none());
+    }
+
+    #[test]
+    fn include_step_matches_a_bare_file() {
+        let reg = Registry::new().unwrap();
+        let (target, caps) = reg
+            .find(r#"I include "flows/register.feature""#)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            target,
+            StepTarget::Builtin {
+                id: StepId::Include,
+                ..
+            }
+        ));
+        assert_eq!(caps, vec!["flows/register.feature".to_string()]);
+    }
+
+    #[test]
+    fn include_step_matches_file_and_scenario_name() {
+        let reg = Registry::new().unwrap();
+        let (target, caps) = reg
+            .find(r#"I include "flows/admin.feature" scenario "Activate a user""#)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            target,
+            StepTarget::Builtin {
+                id: StepId::IncludeScenario,
+                ..
+            }
+        ));
+        assert_eq!(
+            caps,
+            vec![
+                "flows/admin.feature".to_string(),
+                "Activate a user".to_string()
+            ]
+        );
     }
 }
