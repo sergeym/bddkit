@@ -5,6 +5,7 @@ mod doctor;
 mod feature;
 mod hawk;
 mod http;
+mod include;
 mod json;
 mod macros;
 mod options;

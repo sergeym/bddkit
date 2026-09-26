@@ -4,7 +4,7 @@ use crate::plugin::abi::{DispatchRequest, OptionsJson, Status};
 use crate::polling::{AttemptError, Polling};
 use crate::report::render_file;
 use crate::report::{FileResult, ScenarioResult, StepResult, StepStatus};
-use crate::steps::{Args, OptionsSource, Registry, StepKind, StepTarget, dispatch};
+use crate::steps::{Args, OptionsSource, Registry, StepId, StepKind, StepTarget, dispatch};
 use crate::unique::Generator;
 use crate::vars::{VarStack, interpolate};
 use crate::world::World;
@@ -58,6 +58,7 @@ fn execute_step<'a>(
     world: &'a mut World,
     reg: &'a Registry,
     step: &'a ExpandedStep,
+    source: &'a std::path::Path,
     generator: &'a Generator,
     depth: usize,
 ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
@@ -67,18 +68,21 @@ fn execute_step<'a>(
         };
         match target {
             StepTarget::Builtin { id, kind } => {
+                if matches!(id, StepId::Include | StepId::IncludeScenario) {
+                    return run_include(world, reg, step, id, caps, source, generator, depth).await;
+                }
                 let args = prepare(step, caps, &world.vars, generator)?;
                 match kind {
                     StepKind::Action => dispatch(world, id, &args, 0)
                         .await
                         .map_err(AttemptError::into_message),
-                    StepKind::Assertion(source) => {
+                    StepKind::Assertion(source_kind) => {
                         let Some(layer) = world.take_options() else {
                             return dispatch(world, id, &args, 0)
                                 .await
                                 .map_err(AttemptError::into_message);
                         };
-                        let base = match source {
+                        let base = match source_kind {
                             OptionsSource::Global => world.options.clone(),
                             OptionsSource::Http => world.http.options_for_last_response()?.clone(),
                             OptionsSource::Db => world.db.options()?.clone(),
@@ -117,6 +121,10 @@ fn execute_step<'a>(
                     world.vars.set(name, value);
                 }
 
+                // A macro body resolves ITS OWN includes relative to the
+                // macro's own source file, never the caller's — the same
+                // rule the spec states for `I include`.
+                let macro_source = definition.source.clone();
                 for body_step in &definition.body {
                     let expanded = ExpandedStep {
                         keyword: String::new(),
@@ -126,7 +134,8 @@ fn execute_step<'a>(
                         table: None,
                     };
                     if let Err(error) =
-                        execute_step(world, reg, &expanded, generator, depth + 1).await
+                        execute_step(world, reg, &expanded, &macro_source, generator, depth + 1)
+                            .await
                     {
                         world.vars.pop_frame(&[])?;
                         return Err(format!("  {}\n{error}", body_step.text));
@@ -250,6 +259,175 @@ fn execute_step<'a>(
             }
         }
     })
+}
+
+/// Runs `I include "<file>"` / `I include "<file>" scenario "<name>"`. The
+/// caller's `World` is reused in place — HTTP state, the current API
+/// resource, the DB connection, debug mode and every plugin instance carry
+/// over in both directions, because `reset_scenario` is never called here.
+/// Only `world.vars` is swapped for a fresh, isolated `VarStack`: the spec
+/// requires the caller's globals to be invisible inside the include, which a
+/// pushed frame (as macros use) would not give — `get` still falls back to
+/// `globals` from any frame, so isolation needs the whole stack replaced,
+/// not just a new top frame.
+#[allow(clippy::too_many_arguments)]
+fn run_include<'a>(
+    world: &'a mut World,
+    reg: &'a Registry,
+    caller_step: &'a ExpandedStep,
+    id: StepId,
+    caps: Vec<String>,
+    source: &'a std::path::Path,
+    generator: &'a Generator,
+    depth: usize,
+) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+    Box::pin(async move {
+        if caller_step.docstring.is_some() {
+            return Err("I include does not support a docstring".into());
+        }
+        if depth >= 16 {
+            return Err("include nesting exceeds 16".into());
+        }
+
+        let path_literal = &caps[0];
+        let scenario_name = if id == StepId::IncludeScenario {
+            Some(caps[1].as_str())
+        } else {
+            None
+        };
+
+        let base_dir = source
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+
+        crate::include::check_literal(path_literal)?;
+        let resolved = crate::include::resolve(path_literal, &base_dir)?;
+        let included = crate::feature::load(&resolved).map_err(|e| e.to_string())?;
+        let scenario = crate::include::select_scenario(&included, scenario_name)?;
+        let exports = crate::feature::exports_of(&included, scenario)?;
+
+        // build_scenario validates the with: table's shape (exactly one data row) —
+        // do this BEFORE extracting values, so there is one authoritative shape
+        // check, not two independently-written ones with different error messages.
+        let expanded = crate::include::build_scenario(scenario, caller_step.table.as_deref())?;
+
+        // `with:` cells are interpolated in the CALLER's scope, before the swap.
+        // The shape (exactly one data row) is already guaranteed by build_scenario above.
+        let with_values: Vec<(String, String)> = match &caller_step.table {
+            Some(table) => {
+                let [header, row] = table.as_slice() else {
+                    unreachable!("build_scenario already validated exactly one data row")
+                };
+                let mut out = Vec::with_capacity(header.len());
+                for (name, raw) in header.iter().zip(row.iter()) {
+                    let value = interpolate(raw, &world.vars, generator)?;
+                    out.push((name.clone(), value));
+                }
+                out
+            }
+            None => Vec::new(),
+        };
+
+        if world.debug {
+            eprintln!(
+                "include {} › {:?}",
+                crate::feature::display_path(&resolved),
+                expanded.name
+            );
+            for (k, v) in &with_values {
+                eprintln!("  with {k} = {}", debug_display(v));
+            }
+        }
+
+        let included_base = resolved
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let background: Vec<ExpandedStep> = included
+            .feature
+            .background
+            .as_ref()
+            .map(|bg| bg.steps.iter().map(crate::feature::to_step).collect())
+            .unwrap_or_default();
+
+        let fresh = VarStack::new();
+        let saved = std::mem::replace(&mut world.vars, fresh);
+        for (name, value) in &with_values {
+            world.vars.set(name, value.clone());
+        }
+
+        let mut run_result: Result<(), String> = Ok(());
+        for step in background.iter().chain(expanded.steps.iter()) {
+            if let Err(e) =
+                execute_step(world, reg, step, &included_base, generator, depth + 1).await
+            {
+                run_result = Err(format!(
+                    "{}:{} → {}:{}\n  {}\n{e}",
+                    crate::feature::display_path(source),
+                    caller_step.line,
+                    crate::feature::display_path(&resolved),
+                    step.line,
+                    step.text
+                ));
+                break;
+            }
+        }
+
+        let export_result = if run_result.is_ok() {
+            let mut resolved_exports = Vec::new();
+            let mut missing = None;
+            for name in &exports {
+                if let Some(prefix) = name.strip_suffix('*') {
+                    for (k, v) in world.vars.all_vars() {
+                        if k.starts_with(prefix) {
+                            resolved_exports.push((k, v));
+                        }
+                    }
+                } else if let Some(v) = world.vars.get(name) {
+                    resolved_exports.push((name.clone(), v.to_string()));
+                } else {
+                    missing = Some(format!(
+                        "I include {path_literal:?}: declared export {name:?}, but the variable is not set"
+                    ));
+                    break;
+                }
+            }
+            match missing {
+                Some(e) => Err(e),
+                None => Ok(resolved_exports),
+            }
+        } else {
+            Ok(Vec::new())
+        };
+
+        if world.debug
+            && let Ok(exported) = &export_result
+        {
+            for (k, v) in exported {
+                eprintln!("  export {k} = {}", debug_display(v));
+            }
+        }
+
+        world.vars = saved;
+
+        run_result?;
+        let exported = export_result?;
+        for (name, value) in exported {
+            world.vars.set(&name, value);
+        }
+        Ok(())
+    })
+}
+
+/// The SQL-NULL sentinel prints as `<<null>>` in debug output, never the raw
+/// NUL bytes — the same rule `steps/db.rs`'s debug lines already follow.
+fn debug_display(value: &str) -> &str {
+    if value == crate::vars::NULL_SENTINEL {
+        "<<null>>"
+    } else {
+        value
+    }
 }
 
 /// Everything shared across the whole run, behind one `Arc`: a worker clones
@@ -389,7 +567,8 @@ pub async fn run_file(lf: Arc<LoadedFeature>, ctx: Arc<RunContext>) -> FileResul
                 // lists every step of the scenario either way.
                 let status = if failure.is_some() {
                     StepStatus::Skipped
-                } else if let Err(e) = execute_step(&mut world, &ctx.reg, step, &generator, 0).await
+                } else if let Err(e) =
+                    execute_step(&mut world, &ctx.reg, step, &lf.path, &generator, 0).await
                 {
                     let mut msg = format!("  {}\n{e}", step.text);
                     if let Some(ex) = world.http.last() {
@@ -684,7 +863,8 @@ mod tests {
             table: None,
         };
         let generator = world.generator.clone();
-        execute_step(world, reg, &step, &generator, 0).await
+        let source = std::path::Path::new("test.feature");
+        execute_step(world, reg, &step, source, &generator, 0).await
     }
 
     #[tokio::test]

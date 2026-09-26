@@ -136,6 +136,34 @@ pub fn priority_of(lf: &LoadedFeature) -> Result<i64, String> {
     Ok(best.unwrap_or(0))
 }
 
+static EXPORTS_TAG: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"^exports\((.*)\)$").expect("constant regex"));
+
+/// Names an `I include`-d scenario hands back to its caller, from
+/// `@exports(a,b,*)`. A scenario may carry more than one such tag (its own
+/// plus one inherited from `Feature:`, already merged into `sc.tags` by
+/// `load`) — every one contributes, in the order found.
+pub fn exports_of(lf: &LoadedFeature, sc: &gherkin::Scenario) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    for tag in &sc.tags {
+        let Some(c) = EXPORTS_TAG.captures(strip_at(tag)) else {
+            continue;
+        };
+        let raw = c.get(1).expect("group 1 is required").as_str();
+        for name in raw.split(',') {
+            let name = name.trim();
+            if name.is_empty() {
+                return Err(format!(
+                    "{}: @exports() tag has an empty name",
+                    display_path(&lf.path)
+                ));
+            }
+            out.push(name.to_string());
+        }
+    }
+    Ok(out)
+}
+
 impl LoadedFeature {
     /// Whether the file has at least one scenario passing the filter. Expanding
     /// a Scenario Outline does not change tags, so this can be checked before that.
@@ -160,12 +188,40 @@ pub fn to_step(s: &gherkin::Step) -> ExpandedStep {
 static PLACEHOLDER: std::sync::LazyLock<regex::Regex> =
     std::sync::LazyLock::new(|| regex::Regex::new(r"<<(\w+)>>|<(\w+)>").expect("constant regex"));
 
+/// Every `<name>` (single-bracket, Outline-style) token a scenario's steps,
+/// docstrings and table cells use. Used to validate an `I include ... with:`
+/// table: its columns must be exactly this set (see `src/include.rs`).
+pub fn scenario_placeholders(sc: &gherkin::Scenario) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    let mut collect = |text: &str| {
+        for caps in PLACEHOLDER.captures_iter(text) {
+            if let Some(m) = caps.get(2) {
+                out.insert(m.as_str().to_string());
+            }
+        }
+    };
+    for step in &sc.steps {
+        collect(&step.value);
+        if let Some(d) = &step.docstring {
+            collect(d);
+        }
+        if let Some(t) = &step.table {
+            for row in &t.rows {
+                for cell in row {
+                    collect(cell);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Substitutes `<key>` from an Examples row. Single pass, because a naive
 /// `replace("<key>", v)` would eat the inner `<key>` inside the runtime token `<<key>>`
 /// (in `<<userId>>` the substring `<userId>` starts at position 1) — and `<<…>>` must
 /// survive untouched until execution. Double brackets match the first alternative
 /// and are returned as-is; single brackets are replaced by the column value.
-fn substitute(text: &str, keys: &[String], row: &[String]) -> String {
+pub(crate) fn substitute(text: &str, keys: &[String], row: &[String]) -> String {
     PLACEHOLDER
         .replace_all(text, |caps: &regex::Captures| {
             if let Some(m) = caps.get(1) {
@@ -635,5 +691,91 @@ Feature: f
             "the scenario's own tag must survive: {:?}",
             lf.feature.scenarios[0].tags
         );
+    }
+
+    mod exports_tag {
+        use super::super::*;
+
+        fn loaded(src: &str) -> LoadedFeature {
+            LoadedFeature {
+                path: PathBuf::from("t.feature"),
+                feature: parse_str(src).expect("gherkin parses"),
+            }
+        }
+
+        #[test]
+        fn exports_of_reads_a_single_tag() {
+            let lf = loaded(
+                "Feature: f\n  @exports(userId)\n  Scenario: s\n    Then the response code is 200\n",
+            );
+            let sc = &lf.feature.scenarios[0];
+            assert_eq!(exports_of(&lf, sc).unwrap(), vec!["userId".to_string()]);
+        }
+
+        #[test]
+        fn exports_of_splits_comma_separated_names_and_trims() {
+            let lf = loaded(
+                "Feature: f\n  @exports(userId,token)\n  Scenario: s\n    Then the response code is 200\n",
+            );
+            let sc = &lf.feature.scenarios[0];
+            assert_eq!(
+                exports_of(&lf, sc).unwrap(),
+                vec!["userId".to_string(), "token".to_string()]
+            );
+        }
+
+        #[test]
+        fn exports_of_keeps_a_trailing_glob_star_as_one_token() {
+            let lf = loaded(
+                "Feature: f\n  @exports(last_insert_id_*)\n  Scenario: s\n    Then the response code is 200\n",
+            );
+            let sc = &lf.feature.scenarios[0];
+            assert_eq!(
+                exports_of(&lf, sc).unwrap(),
+                vec!["last_insert_id_*".to_string()]
+            );
+        }
+
+        #[test]
+        fn exports_of_unions_two_exports_tags() {
+            let lf = loaded(
+                "Feature: f\n  @exports(a) @exports(b)\n  Scenario: s\n    Then the response code is 200\n",
+            );
+            let sc = &lf.feature.scenarios[0];
+            assert_eq!(
+                exports_of(&lf, sc).unwrap(),
+                vec!["a".to_string(), "b".to_string()]
+            );
+        }
+
+        #[test]
+        fn exports_of_is_empty_with_no_tag() {
+            let lf = loaded("Feature: f\n  Scenario: s\n    Then the response code is 200\n");
+            let sc = &lf.feature.scenarios[0];
+            assert_eq!(exports_of(&lf, sc).unwrap(), Vec::<String>::new());
+        }
+    }
+
+    fn parse_inline_scenario(body: &str) -> gherkin::Scenario {
+        let src = format!("Feature: f\n  {body}");
+        let f = parse_str(&src).expect("gherkin parses");
+        f.scenarios[0].clone()
+    }
+
+    #[test]
+    fn scenario_placeholders_collects_every_name_used() {
+        let sc = parse_inline_scenario(
+            "Scenario Outline: s\n  Given I do <a>\n  When I check:\n    \"\"\"\n    <b>\n    \"\"\"\n",
+        );
+        let names = scenario_placeholders(&sc);
+        assert!(names.contains("a"));
+        assert!(names.contains("b"));
+        assert_eq!(names.len(), 2);
+    }
+
+    #[test]
+    fn scenario_placeholders_ignores_double_bracket_runtime_tokens() {
+        let sc = parse_inline_scenario("Scenario Outline: s\n  Given I use \"<<userId>>\"\n");
+        assert!(scenario_placeholders(&sc).is_empty());
     }
 }

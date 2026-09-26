@@ -105,6 +105,9 @@ pub enum StepId {
     SrpVerifierWithSalt,
     SrpStartLogin,
     SrpCompleteLogin,
+    // include
+    Include,
+    IncludeScenario,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -689,6 +692,18 @@ pub const BUILTIN_STEPS: &[StepDef] = &[
         r#"^I complete SRP login "(?P<prefix>[^"]*)" for "(?P<username>[^"]*)" with password "(?P<password>[^"]*)" salt "(?P<salt>[^"]*)" and "(?P<server_public>[^"]*)"$"#,
         "answers the server challenge into <prefix>_M1, <prefix>_M2 and <prefix>_sessionKey",
     ),
+    action(
+        StepId::Include,
+        "general",
+        r#"^I include "(?P<file>[^"]*)"(?: with:)?$"#,
+        "Runs the only scenario of another feature file inline, sharing HTTP/DB/plugin state.",
+    ),
+    action(
+        StepId::IncludeScenario,
+        "general",
+        r#"^I include "(?P<file>[^"]*)" scenario "(?P<name>[^"]*)"(?: with:)?$"#,
+        "Runs one named scenario of another feature file inline, sharing HTTP/DB/plugin state.",
+    ),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1021,17 +1036,26 @@ static GROUP_NAME: LazyLock<Regex> = LazyLock::new(|| {
 
 fn builtin_patterns(pattern: &str) -> Vec<Vec<PatternToken>> {
     // A group name is display metadata for `bddkit steps list`, and the
-    // tokenizer below recognizes `([^"]*)`, `(\d+)` and the method alternation
-    // by their literal text. An unrecognized construct does not fail here — it
-    // degrades into literal characters, which would quietly stop a macro from
-    // conflicting with the builtin it shadows. Stripping the names first leaves
-    // the token stream exactly as it was before the table was annotated.
+    // tokenizer below recognizes `([^"]*)`, `(\d+)`, the method alternation
+    // and the `(?: with:)?` table suffix by their literal text. Any other
+    // parenthesized construct panics rather than degrading into literal
+    // characters — a silent degradation here would quietly stop a macro from
+    // conflicting with the builtin it shadows, and `every_builtin_pattern_is_fully_tokenizable`
+    // (below) exists precisely to turn that into a loud, CI-caught failure.
+    // Stripping the names first leaves the token stream exactly as it was
+    // before the table was annotated.
     let pattern = &*GROUP_NAME.replace_all(pattern, "");
     const METHODS: &str = "(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)";
+    const WITH_SUFFIX: &str = "(?: with:)?";
     let variants: Vec<String> = if pattern.contains(METHODS) {
         ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]
             .iter()
             .map(|method| pattern.replace(METHODS, method))
+            .collect()
+    } else if pattern.contains(WITH_SUFFIX) {
+        [" with:", ""]
+            .iter()
+            .map(|suffix| pattern.replace(WITH_SUFFIX, suffix))
             .collect()
     } else {
         vec![pattern.to_string()]
@@ -1052,6 +1076,18 @@ fn builtin_patterns(pattern: &str) -> Vec<Vec<PatternToken>> {
                     rest = tail;
                 } else {
                     let char_ = rest.chars().next().expect("string is not empty");
+                    if char_ == '(' || char_ == ')' {
+                        panic!(
+                            "builtin_patterns: unrecognized regex grouping construct in \
+                             pattern {source:?} — remaining unparsed text is {rest:?}. This is \
+                             the CLAUDE.md-documented silent-degradation trap: an unrecognized \
+                             construct must never be treated as a literal character, or the \
+                             macro-conflict detector goes silently blind to this pattern. Extend \
+                             this function's recognized-construct list (mirroring how `([^\"]*)`, \
+                             `(\\d+)`, the METHODS alternation and `(?: with:)?` are each \
+                             recognized by literal text) before adding a pattern shaped like this."
+                        );
+                    }
                     tokens.push(PatternToken::One(CharClass::Exact(char_)));
                     rest = &rest[char_.len_utf8()..];
                 }
@@ -1327,6 +1363,9 @@ pub async fn dispatch(w: &mut World, id: StepId, a: &Args, attempt: u64) -> Atte
         StepId::SrpCompleteLogin => {
             srp::complete_login(w, a.cap(0), a.cap(1), a.cap(2), a.cap(3), a.cap(4))
         }
+        StepId::Include | StepId::IncludeScenario => {
+            unreachable!("execute_step intercepts Include/IncludeScenario before calling dispatch")
+        }
     };
     result.map_err(AttemptError::Fatal)
 }
@@ -1545,6 +1584,46 @@ mod tests {
 
         let error = Registry::with_macros(catalog).expect_err("the macro shadows a builtin");
         assert!(error.contains("conflicts with builtin"), "{error}");
+    }
+
+    #[test]
+    fn a_macro_conflicting_with_include_is_still_rejected() {
+        // Regression: `(?: with:)?` was added to the Include/IncludeScenario
+        // patterns to support the Gherkin `with:` table suffix, but
+        // `builtin_patterns` didn't know that construct and silently degraded
+        // it to literal characters — which made a macro named exactly
+        // `I include "setup.feature"` load with no conflict warning.
+        let path = std::env::temp_dir().join(format!(
+            "bddkit-steps-include-conflict-{}.yaml",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            "- step: I include \"setup.feature\"\n  do: [Show all variables]\n",
+        )
+        .expect("write macro file");
+        let catalog = MacroCatalog::load(std::slice::from_ref(&path)).expect("macro loads");
+        std::fs::remove_file(&path).ok();
+
+        let error =
+            Registry::with_macros(catalog).expect_err("the macro shadows the Include builtin");
+        assert!(error.contains("conflicts with builtin"), "{error}");
+    }
+
+    #[test]
+    fn every_builtin_pattern_is_fully_tokenizable() {
+        // `builtin_patterns` is only ever called (in production) from inside
+        // `validate_macros`, which only runs when a suite actually declares
+        // macros. A pattern with a construct the tokenizer can't recognize
+        // would silently degrade to literal characters, defeating conflict
+        // detection, and no test would notice unless some macro fixture
+        // happened to exercise it. Calling it directly on every entry forces
+        // that failure to surface as a panic (`builtin_patterns`'s fallback
+        // branch panics on an unrecognized `(`/`)`) regardless of whether
+        // any suite loads macros.
+        for def in BUILTIN_STEPS {
+            let _ = builtin_patterns(def.pattern);
+        }
     }
 
     #[test]
@@ -1823,5 +1902,62 @@ mod tests {
     #[test]
     fn unknown_step_returns_none() {
         assert!(reg().find("I refund the order").unwrap().is_none());
+    }
+
+    #[test]
+    fn include_step_matches_a_bare_file() {
+        let reg = Registry::new().unwrap();
+        let (target, caps) = reg
+            .find(r#"I include "flows/register.feature""#)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            target,
+            StepTarget::Builtin {
+                id: StepId::Include,
+                ..
+            }
+        ));
+        assert_eq!(caps, vec!["flows/register.feature".to_string()]);
+    }
+
+    #[test]
+    fn include_step_matches_file_and_scenario_name() {
+        let reg = Registry::new().unwrap();
+        let (target, caps) = reg
+            .find(r#"I include "flows/admin.feature" scenario "Activate a user""#)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            target,
+            StepTarget::Builtin {
+                id: StepId::IncludeScenario,
+                ..
+            }
+        ));
+        assert_eq!(
+            caps,
+            vec![
+                "flows/admin.feature".to_string(),
+                "Activate a user".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn include_step_matches_the_with_suffixed_form() {
+        let reg = Registry::new().unwrap();
+        let (target, caps) = reg
+            .find(r#"I include "flows/register.feature" with:"#)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            target,
+            StepTarget::Builtin {
+                id: StepId::Include,
+                ..
+            }
+        ));
+        assert_eq!(caps, vec!["flows/register.feature".to_string()]);
     }
 }

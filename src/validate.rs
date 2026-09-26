@@ -1,6 +1,6 @@
 use crate::feature::{LoadedFeature, TagFilter, display_path, expand_outlines};
 use crate::steps::{Registry, StepTarget};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
 pub struct Problem {
@@ -21,35 +21,82 @@ impl std::fmt::Display for Problem {
     }
 }
 
+struct SelectedStep {
+    text: String,
+    line: usize,
+    has_docstring: bool,
+    table: Option<Vec<Vec<String>>>,
+}
+
 /// Matches every step of every file before the first request. Returns ALL
 /// problems at once — a run that fails midway due to a typo costs more
 /// than a full check that takes milliseconds.
 pub fn check(features: &[&LoadedFeature], reg: &Registry, filter: &TagFilter) -> Vec<Problem> {
     let mut problems = Vec::new();
     for lf in features {
-        for (text, line, has_docstring, has_table) in selected_steps(lf, filter) {
-            match reg.find(&text) {
-                Ok(Some((StepTarget::Macro(_), _))) if has_docstring => {
+        let base_dir = lf
+            .path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        for step in selected_steps(lf, filter) {
+            match reg.find(&step.text) {
+                Ok(Some((StepTarget::Macro(_), _))) if step.has_docstring => {
                     problems.push(Problem {
                         file: lf.path.clone(),
-                        line,
+                        line: step.line,
                         message: "macro calls do not support a docstring".into(),
                     });
                 }
-                Ok(Some((StepTarget::Macro(_), _))) if has_table => problems.push(Problem {
-                    file: lf.path.clone(),
-                    line,
-                    message: "macro calls do not support a table".into(),
-                }),
+                Ok(Some((StepTarget::Macro(_), _))) if step.table.is_some() => {
+                    problems.push(Problem {
+                        file: lf.path.clone(),
+                        line: step.line,
+                        message: "macro calls do not support a table".into(),
+                    })
+                }
+                Ok(Some((StepTarget::Builtin { id, .. }, caps)))
+                    if matches!(
+                        id,
+                        crate::steps::StepId::Include | crate::steps::StepId::IncludeScenario
+                    ) =>
+                {
+                    if step.has_docstring {
+                        problems.push(Problem {
+                            file: lf.path.clone(),
+                            line: step.line,
+                            message: "I include does not support a docstring".into(),
+                        });
+                        continue;
+                    }
+                    let scenario_name = if id == crate::steps::StepId::IncludeScenario {
+                        Some(caps[1].as_str())
+                    } else {
+                        None
+                    };
+                    if let Err(message) = check_one_include(
+                        &caps[0],
+                        scenario_name,
+                        &base_dir,
+                        step.table.as_deref(),
+                        reg,
+                    ) {
+                        problems.push(Problem {
+                            file: lf.path.clone(),
+                            line: step.line,
+                            message,
+                        });
+                    }
+                }
                 Ok(Some(_)) => {}
                 Ok(None) => problems.push(Problem {
                     file: lf.path.clone(),
-                    line,
-                    message: format!("unknown step: {text:?}"),
+                    line: step.line,
+                    message: format!("unknown step: {:?}", step.text),
                 }),
                 Err(e) => problems.push(Problem {
                     file: lf.path.clone(),
-                    line,
+                    line: step.line,
                     message: e,
                 }),
             }
@@ -58,20 +105,19 @@ pub fn check(features: &[&LoadedFeature], reg: &Registry, filter: &TagFilter) ->
     problems
 }
 
-/// `(text, line, has docstring, has table)` of every step a run would execute
-/// from this file. Background is always included: it runs before every
-/// selected scenario. Filtered-out scenarios are not — a typo in something
-/// that never runs must not fail the run.
-fn selected_steps(lf: &LoadedFeature, filter: &TagFilter) -> Vec<(String, usize, bool, bool)> {
-    let mut all_steps: Vec<(String, usize, bool, bool)> = Vec::new();
+/// Every step a run would execute from this file. Background is always
+/// included: it runs before every selected scenario. Filtered-out scenarios
+/// are not — a typo in something that never runs must not fail the run.
+fn selected_steps(lf: &LoadedFeature, filter: &TagFilter) -> Vec<SelectedStep> {
+    let mut all_steps: Vec<SelectedStep> = Vec::new();
     if let Some(bg) = &lf.feature.background {
         for s in &bg.steps {
-            all_steps.push((
-                s.value.clone(),
-                s.position.line,
-                s.docstring.is_some(),
-                s.table.is_some(),
-            ));
+            all_steps.push(SelectedStep {
+                text: s.value.clone(),
+                line: s.position.line,
+                has_docstring: s.docstring.is_some(),
+                table: s.table.as_ref().map(|t| t.rows.clone()),
+            });
         }
     }
     for sc in &lf.feature.scenarios {
@@ -80,7 +126,12 @@ fn selected_steps(lf: &LoadedFeature, filter: &TagFilter) -> Vec<(String, usize,
         }
         for ex in expand_outlines(sc) {
             for st in ex.steps {
-                all_steps.push((st.text, st.line, st.docstring.is_some(), st.table.is_some()));
+                all_steps.push(SelectedStep {
+                    text: st.text,
+                    line: st.line,
+                    has_docstring: st.docstring.is_some(),
+                    table: st.table,
+                });
             }
         }
     }
@@ -104,8 +155,8 @@ pub fn unserved_resources(
 ) -> Vec<Problem> {
     let mut problems: Vec<Problem> = Vec::new();
     for lf in features {
-        for (text, line, _, _) in selected_steps(lf, filter) {
-            let Ok(Some((target, _))) = reg.find(&text) else {
+        for step in selected_steps(lf, filter) {
+            let Ok(Some((target, _))) = reg.find(&step.text) else {
                 continue;
             };
             let Some(message) = unserved(&target) else {
@@ -119,12 +170,144 @@ pub fn unserved_resources(
             }
             problems.push(Problem {
                 file: lf.path.clone(),
-                line,
+                line: step.line,
                 message,
             });
         }
     }
     problems
+}
+
+/// One include call, checked in full: literal path, resolution, scenario
+/// selection, its `with:`/Examples shape, and — recursively — every step of
+/// the selected scenario itself (Background + body), including any further
+/// `I include` it contains. Detects a cycle (the same resolved absolute file
+/// and scenario name reappearing on the current call stack) and caps nesting
+/// at depth 16, mirroring the macro cycle-DFS's reasoning without sharing its
+/// code (see CLAUDE.md).
+fn check_one_include(
+    path_literal: &str,
+    scenario_name: Option<&str>,
+    base_dir: &Path,
+    with_table: Option<&[Vec<String>]>,
+    reg: &Registry,
+) -> Result<(), String> {
+    let mut stack = Vec::new();
+    check_include_recursive(
+        path_literal,
+        scenario_name,
+        base_dir,
+        with_table,
+        reg,
+        &mut stack,
+    )
+}
+
+fn check_include_recursive(
+    path_literal: &str,
+    scenario_name: Option<&str>,
+    base_dir: &Path,
+    with_table: Option<&[Vec<String>]>,
+    reg: &Registry,
+    stack: &mut Vec<(PathBuf, String)>,
+) -> Result<(), String> {
+    if stack.len() >= 16 {
+        return Err(format!(
+            "I include {path_literal:?}: nesting exceeds 16 (chain: {})",
+            render_chain(stack)
+        ));
+    }
+    crate::include::check_literal(path_literal)?;
+    let resolved = crate::include::resolve(path_literal, base_dir)?;
+    let canonical = resolved.canonicalize().unwrap_or_else(|_| resolved.clone());
+    let included = crate::feature::load(&resolved).map_err(|e| e.to_string())?;
+    let scenario = crate::include::select_scenario(&included, scenario_name)?;
+    crate::feature::exports_of(&included, scenario)?;
+    let node = (canonical, scenario.name.clone());
+    if let Some(pos) = stack.iter().position(|n| n == &node) {
+        let mut chain: Vec<String> = stack[pos..]
+            .iter()
+            .map(|(p, s)| format!("{} › {s:?}", display_path(p)))
+            .collect();
+        chain.push(format!("{} › {:?}", display_path(&node.0), node.1));
+        return Err(format!("cycle in includes: {}", chain.join(" → ")));
+    }
+    let expanded = crate::include::build_scenario(scenario, with_table)?;
+    let included_base = resolved
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let background: Vec<crate::feature::ExpandedStep> = included
+        .feature
+        .background
+        .as_ref()
+        .map(|bg| bg.steps.iter().map(crate::feature::to_step).collect())
+        .unwrap_or_default();
+
+    stack.push(node);
+    for step in background.iter().chain(expanded.steps.iter()) {
+        let result = check_include_body_step(step, &included_base, reg, stack);
+        if let Err(e) = result {
+            stack.pop();
+            return Err(format!(
+                "{}:{}: {e}",
+                crate::feature::display_path(&resolved),
+                step.line
+            ));
+        }
+    }
+    stack.pop();
+    Ok(())
+}
+
+fn check_include_body_step(
+    step: &crate::feature::ExpandedStep,
+    base_dir: &Path,
+    reg: &Registry,
+    stack: &mut Vec<(PathBuf, String)>,
+) -> Result<(), String> {
+    match reg.find(&step.text) {
+        Ok(Some((StepTarget::Macro(_), _))) if step.docstring.is_some() => {
+            Err("macro calls do not support a docstring".into())
+        }
+        Ok(Some((StepTarget::Macro(_), _))) if step.table.is_some() => {
+            Err("macro calls do not support a table".into())
+        }
+        Ok(Some((StepTarget::Builtin { id, .. }, caps)))
+            if matches!(
+                id,
+                crate::steps::StepId::Include | crate::steps::StepId::IncludeScenario
+            ) =>
+        {
+            if step.docstring.is_some() {
+                return Err("I include does not support a docstring".into());
+            }
+            let scenario_name = if id == crate::steps::StepId::IncludeScenario {
+                Some(caps[1].as_str())
+            } else {
+                None
+            };
+            check_include_recursive(
+                &caps[0],
+                scenario_name,
+                base_dir,
+                step.table.as_deref(),
+                reg,
+                stack,
+            )
+        }
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(format!("unknown step: {:?}", step.text)),
+        Err(e) => Err(e),
+    }
+}
+
+fn render_chain(stack: &[(PathBuf, String)]) -> String {
+    stack
+        .iter()
+        .map(|(p, s)| format!("{} › {s:?}", display_path(p)))
+        .collect::<Vec<_>>()
+        .join(" → ")
 }
 
 #[cfg(test)]
@@ -332,5 +515,189 @@ Feature: f
 
         assert_eq!(problems.len(), 1);
         assert!(problems[0].message.contains("table"), "{problems:?}");
+    }
+
+    #[test]
+    fn include_of_a_missing_file_is_a_problem() {
+        let dir = std::env::temp_dir().join(format!(
+            "bddkit-validate-missing-file-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("caller.feature");
+        std::fs::write(
+            &path,
+            "Feature: f\n  Scenario: s\n    Given I include \"nope.feature\"\n",
+        )
+        .unwrap();
+        let lf = crate::feature::load(&path).unwrap();
+        let reg = crate::steps::Registry::new().unwrap();
+        let filter = crate::feature::TagFilter::new(&[]);
+        let problems = check(&[&lf], &reg, &filter);
+        assert!(problems.iter().any(|p| p.message.contains("nope.feature")));
+    }
+
+    #[test]
+    fn include_with_a_runtime_token_path_is_a_problem() {
+        let dir = std::env::temp_dir().join(format!(
+            "bddkit-validate-runtime-token-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("caller.feature");
+        std::fs::write(
+            &path,
+            "Feature: f\n  Scenario: s\n    Given I include \"<<name>>.feature\"\n",
+        )
+        .unwrap();
+        let lf = crate::feature::load(&path).unwrap();
+        let reg = crate::steps::Registry::new().unwrap();
+        let filter = crate::feature::TagFilter::new(&[]);
+        let problems = check(&[&lf], &reg, &filter);
+        assert!(problems.iter().any(|p| p.message.contains("literal")));
+    }
+
+    #[test]
+    fn a_two_file_include_cycle_is_a_problem() {
+        let dir =
+            std::env::temp_dir().join(format!("bddkit-validate-cycle-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("a.feature"),
+            "Feature: a\n  Scenario: sa\n    Given I include \"b.feature\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("b.feature"),
+            "Feature: b\n  Scenario: sb\n    Given I include \"a.feature\"\n",
+        )
+        .unwrap();
+        let path = dir.join("a.feature");
+        let lf = crate::feature::load(&path).unwrap();
+        let reg = crate::steps::Registry::new().unwrap();
+        let filter = crate::feature::TagFilter::new(&[]);
+        let problems = check(&[&lf], &reg, &filter);
+        assert!(
+            problems.iter().any(|p| p.message.contains("cycle")),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_step_inside_an_included_scenario_is_a_problem_naming_the_included_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "bddkit-validate-unknown-step-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("target.feature"),
+            "Feature: t\n  Scenario: only\n    Given this step does not exist\n",
+        )
+        .unwrap();
+        let path = dir.join("caller.feature");
+        std::fs::write(
+            &path,
+            "Feature: f\n  Scenario: s\n    Given I include \"target.feature\"\n",
+        )
+        .unwrap();
+        let lf = crate::feature::load(&path).unwrap();
+        let reg = crate::steps::Registry::new().unwrap();
+        let filter = crate::feature::TagFilter::new(&[]);
+        let problems = check(&[&lf], &reg, &filter);
+        assert!(
+            problems.iter().any(|p| p.message.contains("unknown step")
+                && p.message.contains("this step does not exist")
+                && p.message.contains("target.feature")),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn include_of_a_valid_one_scenario_file_has_no_problem() {
+        let dir = std::env::temp_dir().join(format!(
+            "bddkit-validate-valid-include-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("target.feature"),
+            "Feature: f\n  Scenario: only\n    Given I am in debug mode\n",
+        )
+        .unwrap();
+        let path = dir.join("caller.feature");
+        std::fs::write(
+            &path,
+            "Feature: f\n  Scenario: s\n    Given I include \"target.feature\"\n",
+        )
+        .unwrap();
+        let lf = crate::feature::load(&path).unwrap();
+        let reg = crate::steps::Registry::new().unwrap();
+        let filter = crate::feature::TagFilter::new(&[]);
+        let problems = check(&[&lf], &reg, &filter);
+        assert!(problems.is_empty(), "{problems:?}");
+    }
+
+    #[test]
+    fn a_nested_include_with_a_docstring_is_rejected_at_validation_time() {
+        let dir = std::env::temp_dir().join(format!(
+            "bddkit-validate-nested-docstring-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("inner.feature"),
+            "Feature: f\n  Scenario: only\n    Given I am in debug mode\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("middle.feature"),
+            "Feature: f\n  Scenario: only\n    Given I include \"inner.feature\"\n      \"\"\"\n      not allowed\n      \"\"\"\n",
+        )
+        .unwrap();
+        let path = dir.join("caller.feature");
+        std::fs::write(
+            &path,
+            "Feature: f\n  Scenario: s\n    Given I include \"middle.feature\"\n",
+        )
+        .unwrap();
+        let lf = crate::feature::load(&path).unwrap();
+        let reg = crate::steps::Registry::new().unwrap();
+        let filter = crate::feature::TagFilter::new(&[]);
+        let problems = check(&[&lf], &reg, &filter);
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.message.contains("does not support a docstring")),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn a_malformed_exports_tag_on_an_included_scenario_is_caught_at_validation_time() {
+        let dir = std::env::temp_dir().join(format!(
+            "bddkit-validate-malformed-exports-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("target.feature"),
+            "Feature: f\n  @exports(a,,b)\n  Scenario: only\n    Given I am in debug mode\n",
+        )
+        .unwrap();
+        let path = dir.join("caller.feature");
+        std::fs::write(
+            &path,
+            "Feature: f\n  Scenario: s\n    Given I include \"target.feature\"\n",
+        )
+        .unwrap();
+        let lf = crate::feature::load(&path).unwrap();
+        let reg = crate::steps::Registry::new().unwrap();
+        let filter = crate::feature::TagFilter::new(&[]);
+        let problems = check(&[&lf], &reg, &filter);
+        assert!(
+            !problems.is_empty(),
+            "expected a validation problem, got none"
+        );
     }
 }

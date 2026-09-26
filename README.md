@@ -172,6 +172,25 @@ Text reaches a variable from more places than the response body — `I extract` 
 
 A variable that is not set fails the step, and so does a JSON step over a variable whose text is not JSON — naming the variable and the parse error, not reporting a mismatch. Every variable assertion, `should be equal to` included, fails on its first mismatch even under `I expect the next assertion to pass …`: nothing runs between two attempts, so the value cannot change and polling it would only burn the timeout.
 
+### Including other feature files
+
+Scenarios often follow the same setup steps, and duplicating them across files gets tedious. `I include "<file>"` pulls one scenario from another feature file and runs it inline, with access to the same HTTP state, database connection, and plugin instances — giving the caller a chance to reuse setup work and inspect what it left behind. Variables are isolated: the included scenario runs in a fresh `VarStack`, so the caller's globals are invisible inside it, and only variables declared via the `@exports` tag come back.
+
+| Step | Effect |
+|---|---|
+| `I include "<file>"` | Runs the file's sole scenario. A Scenario Outline with no `Examples:` block at all is a plain Scenario for this purpose, run as written. A Scenario Outline with an `Examples:` table is only includable this way if that table holds exactly one data row; more than one row (or an Examples table present with zero data rows) requires a `with:` table to pick one, and is otherwise a validation error; the included scenario's HTTP/DB/plugin state flows back to the caller, but variables are isolated |
+| `I include "<file>" scenario "<name>"` | Runs the scenario named exactly `<name>` from `<file>` — no match, or more than one scenario sharing that name, is a validation error |
+
+A `with:` table feeds a single row of parameters into an included Scenario Outline — the table must have exactly one data row (a header row plus one values row); anything else (zero data rows, or two or more) is a hard validation error, "with: must have exactly one data row." The caller builds the cells by interpolating `<<...>>` values **against the caller's own variables**, not the included file's scope. The included scenario's `@exports(a,b,*)` tag declares which result variables come back to the caller; undeclared variables are discarded when the scenario ends. `@exports(*)` brings back all of them, `@exports(user_id,token)` brings back only those two — the comma-separated names take no space between them, since Gherkin tags cannot contain spaces. For a scenario with no `@exports` tag, nothing returns.
+
+State that carries across the include boundary unchanged — no reset happens because of the include itself: the HTTP response from the last request, the current API resource and its headers, the current database connection, and plugin instances with their per-scenario state. (Separately, and unrelated to including: a plugin's instance selection resets like the API does, but only at an ordinary scenario boundary — an include does not introduce one.) Variables do not carry across — only what the `@exports` tag names comes back; all other variables are discarded.
+
+An include can nest up to 16 levels deep, checked at validation time; a cycle (file A includes file B which includes file A) is a static error, reported before the first request, naming every file in the cycle. The path `"<file>"` is a compile-time literal — a string, never a variable — and is resolved relative to the directory of the feature file that wrote the step. A missing file, a file that isn't `.feature`, or — when `scenario "<name>"` is used — a name that matches zero or more than one scenario in the resolved file, is caught at validation time, before the first request.
+
+**Known limitations, deliberately out of scope:**
+- Calling every scenario in a file, or every Examples row of a Scenario Outline, in one include step — would require a new step form that has not yet been designed.
+- A call-site export prefix — letting the caller spell something like `I include "setup" with prefix "u"` and get back `u_user_id` instead of `user_id` — has no step syntax.
+
 ## What a resource's config takes
 
 `bddkit resource fields` prints the keys each kind of `resources` entry accepts, which key is mandatory, what value it takes, and what it is for:
