@@ -58,10 +58,12 @@ fn execute_step<'a>(
     world: &'a mut World,
     reg: &'a Registry,
     step: &'a ExpandedStep,
+    #[allow(unused_variables)] source: &'a std::path::Path,
     generator: &'a Generator,
     depth: usize,
 ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
     Box::pin(async move {
+        // source is threaded through and unused until Task 9 (I include)
         let Some((target, caps)) = reg.find(&step.text)? else {
             return Err("unknown step".into());
         };
@@ -72,13 +74,13 @@ fn execute_step<'a>(
                     StepKind::Action => dispatch(world, id, &args, 0)
                         .await
                         .map_err(AttemptError::into_message),
-                    StepKind::Assertion(source) => {
+                    StepKind::Assertion(source_kind) => {
                         let Some(layer) = world.take_options() else {
                             return dispatch(world, id, &args, 0)
                                 .await
                                 .map_err(AttemptError::into_message);
                         };
-                        let base = match source {
+                        let base = match source_kind {
                             OptionsSource::Global => world.options.clone(),
                             OptionsSource::Http => world.http.options_for_last_response()?.clone(),
                             OptionsSource::Db => world.db.options()?.clone(),
@@ -117,6 +119,10 @@ fn execute_step<'a>(
                     world.vars.set(name, value);
                 }
 
+                // A macro body resolves ITS OWN includes relative to the
+                // macro's own source file, never the caller's — the same
+                // rule the spec states for `I include`.
+                let macro_source = definition.source.clone();
                 for body_step in &definition.body {
                     let expanded = ExpandedStep {
                         keyword: String::new(),
@@ -126,7 +132,8 @@ fn execute_step<'a>(
                         table: None,
                     };
                     if let Err(error) =
-                        execute_step(world, reg, &expanded, generator, depth + 1).await
+                        execute_step(world, reg, &expanded, &macro_source, generator, depth + 1)
+                            .await
                     {
                         world.vars.pop_frame(&[])?;
                         return Err(format!("  {}\n{error}", body_step.text));
@@ -389,7 +396,8 @@ pub async fn run_file(lf: Arc<LoadedFeature>, ctx: Arc<RunContext>) -> FileResul
                 // lists every step of the scenario either way.
                 let status = if failure.is_some() {
                     StepStatus::Skipped
-                } else if let Err(e) = execute_step(&mut world, &ctx.reg, step, &generator, 0).await
+                } else if let Err(e) =
+                    execute_step(&mut world, &ctx.reg, step, &lf.path, &generator, 0).await
                 {
                     let mut msg = format!("  {}\n{e}", step.text);
                     if let Some(ex) = world.http.last() {
@@ -684,7 +692,8 @@ mod tests {
             table: None,
         };
         let generator = world.generator.clone();
-        execute_step(world, reg, &step, &generator, 0).await
+        let source = std::path::Path::new("test.feature");
+        execute_step(world, reg, &step, source, &generator, 0).await
     }
 
     #[tokio::test]
