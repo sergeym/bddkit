@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.3](https://github.com/sergeym/bddkit/compare/v0.2.2...v0.2.3) - 2026-09-28
+
+### Added
+
+- add curl/irm install scripts for GitHub Releases
+- warn when a global variable write has no visible effect (issue #51)
+
 ## [0.2.2](https://github.com/bddkit/bddkit/compare/v0.2.1...v0.2.2) - 2026-09-28
 
 ### Added
