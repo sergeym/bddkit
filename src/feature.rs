@@ -195,7 +195,8 @@ pub struct ScenarioRef<'a> {
 /// names with no position, and `from_text` then merges rule and feature tags into
 /// each scenario, so neither the line nor the level survives in the tree. The tags
 /// of an element are the `@` lines directly above its keyword, past any blank or
-/// `#` lines; a `#` inside a tag line starts a comment, as gherkin reads it.
+/// `#` lines; a word that begins with `#` starts a comment, as gherkin reads it
+/// (`@b#x` is one tag, `b#x`).
 fn scan_tags(text: &str, feature: &Feature) -> BTreeMap<usize, Vec<(String, usize)>> {
     let mut keywords = vec![feature.position.line];
     let scenarios = |keywords: &mut Vec<usize>, scenarios: &[gherkin::Scenario]| {
@@ -323,7 +324,8 @@ impl LoadedFeature {
     }
 
     /// What a scenario is tagged with as the filter sees it: its own tags, then
-    /// its rule's, then the feature's — the order `from_text` merges them in.
+    /// its rule's, then the feature's — the order `from_text` merges them in. A name
+    /// written at two levels is listed once, with the line of the first.
     #[cfg_attr(
         not(test),
         expect(dead_code, reason = "read by the event stream in a later commit")
@@ -334,10 +336,12 @@ impl LoadedFeature {
             sc.rule.map(|r| r.position.line),
             Some(self.feature.position.line),
         ];
+        let mut seen = BTreeSet::new();
         lines
             .into_iter()
             .flatten()
             .flat_map(|line| self.own_tags(line))
+            .filter(|(name, _)| seen.insert(name))
             .map(|(name, line)| (name.as_str(), *line))
             .collect()
     }
@@ -1169,7 +1173,7 @@ Feature: F
 
     #[test]
     fn a_scenario_lists_its_own_tags_then_its_rules_then_the_features() {
-        let src = "@f\nFeature: F\n  @r\n  Rule: R\n    @s\n    Scenario: T\n      Given y\n";
+        let src = "@f\nFeature: F\n  @r @f\n  Rule: R\n    @s @r\n    Scenario: T\n      Given y\n";
         let lf = LoadedFeature::from_text(PathBuf::from("t.feature"), src).unwrap();
         let sc = lf.scenarios().next().unwrap();
         let tags: Vec<_> = lf
@@ -1177,12 +1181,13 @@ Feature: F
             .into_iter()
             .map(|(n, l)| (n.to_string(), l))
             .collect();
+        // `r` is also the scenario's own tag and `f` the rule's: the first mention wins.
         assert_eq!(
             tags,
             [
                 ("s".to_string(), 5),
-                ("r".to_string(), 3),
-                ("f".to_string(), 1)
+                ("r".to_string(), 5),
+                ("f".to_string(), 3)
             ]
         );
     }
