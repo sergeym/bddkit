@@ -324,6 +324,44 @@ pub fn expand_outlines(sc: &gherkin::Scenario) -> Vec<ExpandedScenario> {
     out
 }
 
+/// The description a tester wrote, from the source `lines` between an element's
+/// keyword line and its first child. gherkin joins paragraphs with a single `\n`,
+/// trims every line and drops `#` lines, so what it returns cannot be shown as
+/// written. Here `#` lines go, a run of blank lines becomes one paragraph break
+/// (none at the edges), and the longest indentation every line shares is removed
+/// — a prefix, not a count, because Gherkin allows tabs.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used by the source scan in the next commit")
+)]
+pub(crate) fn description_of<'a>(lines: impl Iterator<Item = &'a str>) -> Option<String> {
+    let mut kept: Vec<&str> = Vec::new();
+    for line in lines.filter(|l| !l.trim_start().starts_with('#')) {
+        let line = line.trim_end();
+        if line.is_empty() && kept.last().is_none_or(|l| l.is_empty()) {
+            continue;
+        }
+        kept.push(line);
+    }
+    if kept.last().is_some_and(|l| l.is_empty()) {
+        kept.pop();
+    }
+    let indent = kept
+        .iter()
+        .filter(|l| !l.is_empty())
+        .map(|l| &l[..l.len() - l.trim_start().len()])
+        .reduce(|a, b| {
+            let end = a.chars().zip(b.chars()).take_while(|(x, y)| x == y);
+            &a[..end.map(|(c, _)| c.len_utf8()).sum()]
+        })?;
+    let text = kept
+        .iter()
+        .map(|l| l.strip_prefix(indent).unwrap_or(l))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(text)
+}
+
 pub fn load(path: &Path) -> Result<LoadedFeature> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read {}", display_path(path)))?;
@@ -714,6 +752,66 @@ Feature: f
     fn display_path_leaves_a_unix_style_path_unchanged() {
         let p = PathBuf::from("features/api/users/create.feature");
         assert_eq!(display_path(&p), "features/api/users/create.feature");
+    }
+
+    fn describe(src: &str) -> Option<String> {
+        description_of(src.lines())
+    }
+
+    #[test]
+    fn a_description_keeps_its_paragraphs() {
+        assert_eq!(
+            describe("  First line\n  second line\n\n  Second paragraph\n").as_deref(),
+            Some("First line\nsecond line\n\nSecond paragraph")
+        );
+    }
+
+    #[test]
+    fn a_description_keeps_relative_indentation() {
+        assert_eq!(
+            describe("    Steps:\n      - one\n      - two\n    Done\n").as_deref(),
+            Some("Steps:\n  - one\n  - two\nDone")
+        );
+    }
+
+    #[test]
+    fn a_comment_line_is_not_part_of_a_description() {
+        assert_eq!(describe("  a\n  # note\n  b\n").as_deref(), Some("a\nb"));
+        assert_eq!(
+            describe("  a\n\n  # note\n\n  b\n").as_deref(),
+            Some("a\n\nb")
+        );
+        assert_eq!(describe("  # only a comment\n"), None);
+    }
+
+    #[test]
+    fn blank_runs_collapse_and_the_edges_are_dropped() {
+        assert_eq!(
+            describe("\n\n  a\n\n\n\n  b\n\n").as_deref(),
+            Some("a\n\nb")
+        );
+        assert_eq!(describe("\n  \n\t\n"), None);
+        assert_eq!(describe(""), None);
+    }
+
+    #[test]
+    fn crlf_does_not_leave_a_carriage_return_behind() {
+        assert_eq!(describe("  a\r\n  \r\n  b\r\n").as_deref(), Some("a\n\nb"));
+    }
+
+    #[test]
+    fn indentation_is_removed_by_the_exact_common_prefix() {
+        assert_eq!(describe("\t\ta\n\t\t  b\n").as_deref(), Some("a\n  b"));
+        // A tab against spaces shares no prefix: nothing is cut in the wrong place.
+        assert_eq!(describe("\ta\n    b\n").as_deref(), Some("\ta\n    b"));
+    }
+
+    #[test]
+    fn a_non_ascii_space_in_the_indent_does_not_split_a_character() {
+        assert_eq!(
+            describe("\u{a0}\u{a0}a\n\u{a0}b\n").as_deref(),
+            Some("\u{a0}a\nb")
+        );
     }
 
     #[test]
