@@ -34,6 +34,12 @@ pub struct LoadedFeature {
         expect(dead_code, reason = "read by the event stream in a later commit")
     )]
     descriptions: BTreeMap<usize, String>,
+    /// Each element's own tags as `(name without "@", line)`, by keyword line.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "read by the event stream in a later commit")
+    )]
+    tags: BTreeMap<usize, Vec<(String, usize)>>,
 }
 
 /// Formats a path for user-facing output with `/` throughout, even on Windows,
@@ -185,6 +191,51 @@ pub struct ScenarioRef<'a> {
     pub rule: Option<&'a gherkin::Rule>,
 }
 
+/// Reads every element's own tags from the source. gherkin keeps them as bare
+/// names with no position, and `from_text` then merges rule and feature tags into
+/// each scenario, so neither the line nor the level survives in the tree. The tags
+/// of an element are the `@` lines directly above its keyword, past any blank or
+/// `#` lines; a `#` inside a tag line starts a comment, as gherkin reads it.
+fn scan_tags(text: &str, feature: &Feature) -> BTreeMap<usize, Vec<(String, usize)>> {
+    let mut keywords = vec![feature.position.line];
+    let scenarios = |keywords: &mut Vec<usize>, scenarios: &[gherkin::Scenario]| {
+        for sc in scenarios {
+            keywords.push(sc.position.line);
+            keywords.extend(sc.examples.iter().map(|ex| ex.position.line));
+        }
+    };
+    scenarios(&mut keywords, &feature.scenarios);
+    for rule in &feature.rules {
+        keywords.push(rule.position.line);
+        scenarios(&mut keywords, &rule.scenarios);
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    keywords
+        .into_iter()
+        .filter_map(|keyword| {
+            let mut above: Vec<Vec<(String, usize)>> = Vec::new();
+            for line in (1..keyword).rev() {
+                let text = lines.get(line - 1)?.trim();
+                if text.is_empty() || text.starts_with('#') {
+                    continue;
+                }
+                if !text.starts_with('@') {
+                    break;
+                }
+                above.push(
+                    text.split_whitespace()
+                        .take_while(|word| !word.starts_with('#'))
+                        .filter_map(|word| word.strip_prefix('@'))
+                        .map(|name| (name.to_string(), line))
+                        .collect(),
+                );
+            }
+            let tags: Vec<_> = above.into_iter().rev().flatten().collect();
+            (!tags.is_empty()).then_some((keyword, tags))
+        })
+        .collect()
+}
+
 impl LoadedFeature {
     /// A feature built or changed by hand, which has no source text to describe.
     #[cfg(test)]
@@ -193,6 +244,7 @@ impl LoadedFeature {
             path,
             feature,
             descriptions: BTreeMap::new(),
+            tags: BTreeMap::new(),
         }
     }
 
@@ -215,10 +267,12 @@ impl LoadedFeature {
             }
         }
         let descriptions = scan_descriptions(text, &feature);
+        let tags = scan_tags(text, &feature);
         Ok(LoadedFeature {
             path,
             feature,
             descriptions,
+            tags,
         })
     }
 
@@ -256,6 +310,36 @@ impl LoadedFeature {
     )]
     pub fn description(&self, line: usize) -> Option<&str> {
         self.descriptions.get(&line).map(String::as_str)
+    }
+
+    /// The tags written directly above the element whose keyword is on `line`
+    /// (feature, rule, scenario or examples), each with the line it is written on.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "read by the event stream in a later commit")
+    )]
+    pub fn own_tags(&self, line: usize) -> &[(String, usize)] {
+        self.tags.get(&line).map_or(&[], Vec::as_slice)
+    }
+
+    /// What a scenario is tagged with as the filter sees it: its own tags, then
+    /// its rule's, then the feature's — the order `from_text` merges them in.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "read by the event stream in a later commit")
+    )]
+    pub fn effective_tags(&self, sc: ScenarioRef<'_>) -> Vec<(&str, usize)> {
+        let lines = [
+            Some(sc.scenario.position.line),
+            sc.rule.map(|r| r.position.line),
+            Some(self.feature.position.line),
+        ];
+        lines
+            .into_iter()
+            .flatten()
+            .flat_map(|line| self.own_tags(line))
+            .map(|(name, line)| (name.as_str(), *line))
+            .collect()
     }
 
     /// Whether the file has at least one scenario passing the filter. Expanding
@@ -913,7 +997,7 @@ Feature: F
 
   @s1
   # c
-  @s2
+  @s2 # see @x
   Scenario Outline: S
     sc desc
       indented
@@ -1059,6 +1143,125 @@ Feature: F
                 "{kind}: no description seen"
             );
         }
+    }
+
+    /// `(name, line)` of an element's own tags, names without the `@`.
+    fn own(lf: &LoadedFeature, keyword_line: usize) -> Vec<(&str, usize)> {
+        lf.own_tags(keyword_line)
+            .iter()
+            .map(|(name, line)| (name.as_str(), *line))
+            .collect()
+    }
+
+    #[test]
+    fn tags_keep_their_own_line_and_order_per_element() {
+        let src = "@a @b\n# c\n@c\nFeature: F\n\n  @s1 @s2 # trailing @x\n  # c\n\n  @s3\n  Scenario: S\n    Given x\n\n  @r1\n  Rule: R\n    @e\n    Scenario: T\n      Given y\n";
+        let lf = LoadedFeature::from_text(PathBuf::from("t.feature"), src).unwrap();
+        let f = &lf.feature;
+        assert_eq!(own(&lf, f.position.line), [("a", 1), ("b", 1), ("c", 3)]);
+        assert_eq!(
+            own(&lf, f.scenarios[0].position.line),
+            [("s1", 6), ("s2", 6), ("s3", 9)]
+        );
+        assert_eq!(own(&lf, f.rules[0].position.line), [("r1", 13)]);
+        assert_eq!(own(&lf, f.rules[0].scenarios[0].position.line), [("e", 15)]);
+    }
+
+    #[test]
+    fn a_scenario_lists_its_own_tags_then_its_rules_then_the_features() {
+        let src = "@f\nFeature: F\n  @r\n  Rule: R\n    @s\n    Scenario: T\n      Given y\n";
+        let lf = LoadedFeature::from_text(PathBuf::from("t.feature"), src).unwrap();
+        let sc = lf.scenarios().next().unwrap();
+        let tags: Vec<_> = lf
+            .effective_tags(sc)
+            .into_iter()
+            .map(|(n, l)| (n.to_string(), l))
+            .collect();
+        assert_eq!(
+            tags,
+            [
+                ("s".to_string(), 5),
+                ("r".to_string(), 3),
+                ("f".to_string(), 1)
+            ]
+        );
+    }
+
+    #[test]
+    fn the_scanned_tags_are_the_ones_gherkin_parsed_for_every_element() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let dirs: Vec<PathBuf> = ["tests", "examples", "selftest"]
+            .iter()
+            .map(|d| root.join(d))
+            .collect();
+        let mut sources: Vec<(String, String)> = discover(&dirs)
+            .unwrap()
+            .into_iter()
+            .map(|f| (display_path(&f), std::fs::read_to_string(&f).unwrap()))
+            .collect();
+        sources.push(("DESCRIBED".into(), DESCRIBED.into()));
+
+        let mut tagged: BTreeMap<&str, usize> = BTreeMap::new();
+        for (name, text) in &sources {
+            let lf = LoadedFeature::from_text(PathBuf::from(name), text).unwrap();
+            // `from_text` merges feature and rule tags into each scenario; the
+            // parser's own, unmerged view is the reference.
+            let raw = Feature::parse(text, GherkinEnv::default()).unwrap();
+            for (kind, line, tags) in tagged_elements(&raw) {
+                let scanned: Vec<&str> =
+                    lf.own_tags(line).iter().map(|(n, _)| n.as_str()).collect();
+                assert_eq!(tags, scanned, "{name}:{line} ({kind})");
+                if !tags.is_empty() {
+                    *tagged.entry(kind).or_default() += 1;
+                }
+            }
+        }
+        for kind in ["feature", "rule", "scenario", "examples"] {
+            assert!(
+                tagged.get(kind).is_some_and(|n| *n > 0),
+                "{kind}: no tags seen"
+            );
+        }
+    }
+
+    /// (kind, keyword line, gherkin's own tags) of every element that can carry tags.
+    fn tagged_elements(f: &Feature) -> Vec<(&'static str, usize, Vec<&str>)> {
+        fn scenario<'a>(
+            out: &mut Vec<(&'static str, usize, Vec<&'a str>)>,
+            sc: &'a gherkin::Scenario,
+        ) {
+            out.push((
+                "scenario",
+                sc.position.line,
+                sc.tags.iter().map(String::as_str).collect(),
+            ));
+            for ex in &sc.examples {
+                out.push((
+                    "examples",
+                    ex.position.line,
+                    ex.tags.iter().map(String::as_str).collect(),
+                ));
+            }
+        }
+        let mut out = vec![(
+            "feature",
+            f.position.line,
+            f.tags.iter().map(String::as_str).collect(),
+        )];
+        for sc in &f.scenarios {
+            scenario(&mut out, sc);
+        }
+        for rule in &f.rules {
+            out.push((
+                "rule",
+                rule.position.line,
+                rule.tags.iter().map(String::as_str).collect(),
+            ));
+            for sc in &rule.scenarios {
+                scenario(&mut out, sc);
+            }
+        }
+        out
     }
 
     #[test]
