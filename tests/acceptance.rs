@@ -3554,6 +3554,68 @@ async fn the_stream_opens_with_run_started_and_closes_with_run_finished() {
     assert_eq!(of_type(&stream, "run_finished").len(), 1);
 }
 
+#[test]
+fn run_started_carries_the_config_and_the_selection() {
+    let cfg = write_events_project(
+        "run-started-selection",
+        "",
+        &[(
+            "a.feature",
+            "Feature: f\n  @smoke\n  Scenario: s\n    Given set variable \"a\" to \"1\"\n",
+        )],
+        None,
+    );
+    let features = cfg.with_file_name("features");
+    let features_text = path_text(&features);
+
+    // Named on the command line, with a selection.
+    let (out, stream, _) =
+        run_with_events(&cfg, &["--tag", "smoke", "--tag", "@x", &features_text]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert_eq!(stream[0]["config"], path_text(&cfg));
+    assert_eq!(stream[0]["config_source"], "flag");
+    assert_eq!(
+        stream[0]["selection"],
+        serde_json::json!({"tags": ["smoke", "@x"], "paths": [features_text]}),
+        "the values as typed"
+    );
+
+    // Nothing selected: both lists are there, empty.
+    let (_, stream, _) = run_with_events(&cfg, &[]);
+    assert_eq!(
+        stream[0]["selection"],
+        serde_json::json!({"tags": [], "paths": []})
+    );
+
+    // Named by the environment, and found in the working directory.
+    let events = cfg.with_file_name("events.ndjson");
+    let run = |dir: &std::path::Path, env: Option<&std::path::Path>| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_bddkit"));
+        command
+            .current_dir(dir)
+            .env_remove("BDDKIT_CONFIG")
+            .env_remove("BDDKIT_ARTIFACTS_DIR")
+            .args(["run", "--events"])
+            .arg(&events);
+        if let Some(env) = env {
+            command.env("BDDKIT_CONFIG", env);
+        }
+        assert_eq!(command.output().expect("run bddkit").status.code(), Some(0));
+        read_stream(&events).remove(0)
+    };
+    let first = run(&std::env::temp_dir(), Some(&cfg));
+    assert_eq!(first["config_source"], "env");
+    assert_eq!(first["config"], path_text(&cfg));
+
+    std::fs::copy(&cfg, cfg.with_file_name("bddkit.yaml")).expect("copy config");
+    let first = run(cfg.parent().expect("dir"), None);
+    assert_eq!(first["config_source"], "discovered");
+    assert_eq!(
+        first["config"], "./bddkit.yaml",
+        "the path as it was resolved"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_files_running_together_interleave_in_the_stream() {
     // The barrier opens only when both requests are in flight, so both
