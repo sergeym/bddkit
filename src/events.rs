@@ -266,9 +266,9 @@ impl Trace {
         let feature = &lf.feature;
         let mut fields = json!({
             "file": trace.file,
+            "name": trace.redactor.mask(&feature.name),
             "tags": trace.tags(lf.own_tags(feature.position.line).iter().map(|(name, _)| name.as_str())),
         });
-        trace.put(&mut fields, "name", &feature.name);
         trace.put_description(&mut fields, lf.description(feature.position.line));
         if let Some(background) = &feature.background {
             fields["background"] = trace.element(

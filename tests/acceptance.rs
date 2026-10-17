@@ -3569,6 +3569,10 @@ fn feature_background_rule_and_examples_descriptions_reach_the_stream() {
                 "Feature: Bare\n  Background:\n    Given set variable \"a\" to \"1\"\n  Scenario: s\n    Given set variable \"b\" to \"2\"\n",
             ),
             (
+                "d.feature",
+                "Feature:\n  Scenario: s\n    Given set variable \"a\" to \"1\"\n",
+            ),
+            (
                 "c.feature",
                 "Feature: Ruled\n  Scenario: Loose\n    Given set variable \"a\" to \"1\"\n  Rule: Money\n    Everything about money.\n    Background: Prep\n      Prep text.\n      Given set variable \"a\" to \"1\"\n    Scenario Outline: pay\n      Given set variable \"n\" to \"<n>\"\n      Examples: Amounts\n        Rows of amounts.\n        | n |\n        | 1 |\n        | 2 |\n",
             ),
@@ -3621,6 +3625,9 @@ fn feature_background_rule_and_examples_descriptions_reach_the_stream() {
         described["background"],
         serde_json::json!({"line": 9, "name": "Setup", "description": "Runs first."})
     );
+
+    // An unnamed feature keeps the `name` it always had.
+    assert_eq!(file("")["name"], "");
 
     // Nothing to say is nothing in the stream, except `tags`, always a list.
     let bare = file("Bare");
