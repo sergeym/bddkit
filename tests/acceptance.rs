@@ -3555,6 +3555,46 @@ async fn the_stream_opens_with_run_started_and_closes_with_run_finished() {
 }
 
 #[test]
+fn feature_background_rule_and_examples_descriptions_reach_the_stream() {
+    let cfg = write_events_project(
+        "descriptions-file",
+        "",
+        &[
+            (
+                "a.feature",
+                "@ft1\n# c\n@ft2\nFeature: Described\n  What the file is for.\n\n    Indented line.\n\n  Background: Setup\n    Runs first.\n    Given set variable \"a\" to \"1\"\n\n  Scenario: s\n    Given set variable \"b\" to \"2\"\n",
+            ),
+            (
+                "b.feature",
+                "Feature: Bare\n  Background:\n    Given set variable \"a\" to \"1\"\n  Scenario: s\n    Given set variable \"b\" to \"2\"\n",
+            ),
+        ],
+        None,
+    );
+    let (out, stream, _) = run_with_events(&cfg, &[]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let started = of_type(&stream, "file_started");
+    let file = |name: &str| started.iter().find(|e| e["name"] == name).expect(name);
+
+    let described = file("Described");
+    assert_eq!(
+        described["description"],
+        "What the file is for.\n\n  Indented line."
+    );
+    assert_eq!(described["tags"], serde_json::json!(["@ft1", "@ft2"]));
+    assert_eq!(
+        described["background"],
+        serde_json::json!({"line": 9, "name": "Setup", "description": "Runs first."})
+    );
+
+    // Nothing to say is nothing in the stream, except `tags`, always a list.
+    let bare = file("Bare");
+    assert_eq!(bare["tags"], serde_json::json!([]));
+    assert_eq!(bare["background"], serde_json::json!({"line": 2}));
+    assert!(bare.get("description").is_none(), "{bare}");
+}
+
+#[test]
 fn run_started_carries_the_config_and_the_selection() {
     let cfg = write_events_project(
         "run-started-selection",

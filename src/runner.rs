@@ -777,8 +777,9 @@ pub async fn run_file(lf: Arc<LoadedFeature>, ctx: Arc<RunContext>) -> FileResul
         ctx.options.clone(),
         ctx.artifacts.clone(),
     );
-    world.trace = Trace::new(ctx.events.clone(), &lf.path, &lf.feature.name);
-    world.set_redactor(ctx.redactor.fork());
+    let redactor = ctx.redactor.fork();
+    world.trace = Trace::new(ctx.events.clone(), &lf, redactor.clone());
+    world.set_redactor(redactor);
     if ctx.evidence {
         world.collect_evidence();
     }

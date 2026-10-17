@@ -29,16 +29,8 @@ pub struct LoadedFeature {
     pub path: PathBuf,
     pub feature: Feature,
     /// Descriptions as written, by the line of their element's keyword.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "read by the event stream in a later commit")
-    )]
     descriptions: BTreeMap<usize, String>,
     /// Each element's own tags as `(name without "@", line)`, by keyword line.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "read by the event stream in a later commit")
-    )]
     tags: BTreeMap<usize, Vec<(String, usize)>>,
 }
 
@@ -305,20 +297,12 @@ impl LoadedFeature {
 
     /// The description written under the element whose keyword is on `line`
     /// (`position.line` of a feature, background, rule, scenario or examples).
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "read by the event stream in a later commit")
-    )]
     pub fn description(&self, line: usize) -> Option<&str> {
         self.descriptions.get(&line).map(String::as_str)
     }
 
     /// The tags written directly above the element whose keyword is on `line`
     /// (feature, rule, scenario or examples), each with the line it is written on.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "read by the event stream in a later commit")
-    )]
     pub fn own_tags(&self, line: usize) -> &[(String, usize)] {
         self.tags.get(&line).map_or(&[], Vec::as_slice)
     }
