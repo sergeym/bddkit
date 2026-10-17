@@ -186,6 +186,42 @@ pub struct ScenarioRef<'a> {
 }
 
 impl LoadedFeature {
+    /// A feature built or changed by hand, which has no source text to describe.
+    #[cfg(test)]
+    pub(crate) fn without_source(path: PathBuf, feature: Feature) -> Self {
+        LoadedFeature {
+            path,
+            feature,
+            descriptions: BTreeMap::new(),
+        }
+    }
+
+    /// Parses `text` the way `load` does for the file at `path`.
+    pub fn from_text(path: PathBuf, text: &str) -> Result<Self> {
+        let mut feature = Feature::parse(text, GherkinEnv::default())
+            .with_context(|| format!("failed to parse {}", display_path(&path)))?;
+        // Tags above `Feature:` apply to all of its scenarios. gherkin stores them
+        // separately, but a tester who writes @billing above the feature expects the
+        // filter to select the whole file.
+        let feature_tags = feature.tags.clone();
+        for sc in &mut feature.scenarios {
+            sc.tags.extend(feature_tags.iter().cloned());
+        }
+        // A rule's scenario carries its own tags, its rule's and its feature's.
+        for rule in &mut feature.rules {
+            for sc in &mut rule.scenarios {
+                sc.tags.extend(rule.tags.iter().cloned());
+                sc.tags.extend(feature_tags.iter().cloned());
+            }
+        }
+        let descriptions = scan_descriptions(text, &feature);
+        Ok(LoadedFeature {
+            path,
+            feature,
+            descriptions,
+        })
+    }
+
     /// Every scenario in file order: those outside any rule, then each rule's.
     /// The one way to walk a feature — nothing reads `feature.scenarios` directly.
     pub fn scenarios(&self) -> impl Iterator<Item = ScenarioRef<'_>> {
@@ -433,44 +469,6 @@ fn scan_descriptions(text: &str, feature: &Feature) -> BTreeMap<usize, String> {
             Some((line, description_of(body)?))
         })
         .collect()
-}
-
-impl LoadedFeature {
-    /// A feature built or changed by hand, which has no source text to describe.
-    #[cfg(test)]
-    pub(crate) fn without_source(path: PathBuf, feature: Feature) -> Self {
-        LoadedFeature {
-            path,
-            feature,
-            descriptions: BTreeMap::new(),
-        }
-    }
-
-    /// Parses `text` the way `load` does for the file at `path`.
-    pub fn from_text(path: PathBuf, text: &str) -> Result<Self> {
-        let mut feature = Feature::parse(text, GherkinEnv::default())
-            .with_context(|| format!("failed to parse {}", display_path(&path)))?;
-        // Tags above `Feature:` apply to all of its scenarios. gherkin stores them
-        // separately, but a tester who writes @billing above the feature expects the
-        // filter to select the whole file.
-        let feature_tags = feature.tags.clone();
-        for sc in &mut feature.scenarios {
-            sc.tags.extend(feature_tags.iter().cloned());
-        }
-        // A rule's scenario carries its own tags, its rule's and its feature's.
-        for rule in &mut feature.rules {
-            for sc in &mut rule.scenarios {
-                sc.tags.extend(rule.tags.iter().cloned());
-                sc.tags.extend(feature_tags.iter().cloned());
-            }
-        }
-        let descriptions = scan_descriptions(text, &feature);
-        Ok(LoadedFeature {
-            path,
-            feature,
-            descriptions,
-        })
-    }
 }
 
 pub fn load(path: &Path) -> Result<LoadedFeature> {
@@ -968,6 +966,99 @@ Feature: F
             Some("rb desc")
         );
         assert_eq!(said(rule.scenarios[0].position.line), Some("rs desc"));
+    }
+
+    /// (kind, keyword line, gherkin's description) of an element that can carry one.
+    type Element<'a> = (&'static str, usize, Option<&'a str>);
+
+    /// Every element that can carry a description.
+    fn described_elements(f: &Feature) -> Vec<Element<'_>> {
+        let mut out = vec![("feature", f.position.line, f.description.as_deref())];
+        fn scenario<'a>(out: &mut Vec<Element<'a>>, sc: &'a gherkin::Scenario) {
+            out.push(("scenario", sc.position.line, sc.description.as_deref()));
+            for ex in &sc.examples {
+                out.push(("examples", ex.position.line, ex.description.as_deref()));
+            }
+        }
+        if let Some(bg) = &f.background {
+            out.push(("background", bg.position.line, bg.description.as_deref()));
+        }
+        for sc in &f.scenarios {
+            scenario(&mut out, sc);
+        }
+        for rule in &f.rules {
+            out.push(("rule", rule.position.line, rule.description.as_deref()));
+            if let Some(bg) = &rule.background {
+                out.push((
+                    "rule background",
+                    bg.position.line,
+                    bg.description.as_deref(),
+                ));
+            }
+            for sc in &rule.scenarios {
+                scenario(&mut out, sc);
+            }
+        }
+        out
+    }
+
+    /// What two descriptions say, ignoring what gherkin throws away or we keep:
+    /// blank lines and indentation.
+    fn said(text: Option<&str>) -> Vec<&str> {
+        text.map_or_else(Vec::new, |t| {
+            t.lines().map(str::trim).filter(|l| !l.is_empty()).collect()
+        })
+    }
+
+    #[test]
+    fn the_parser_and_the_scanner_agree_on_which_elements_have_a_description() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let dirs: Vec<PathBuf> = ["tests", "examples", "selftest"]
+            .iter()
+            .map(|d| root.join(d))
+            .collect();
+        let mut files = discover(&dirs).unwrap();
+        assert!(files.len() > 20, "found only {files:?}");
+        let mut sources: Vec<(String, String)> = files
+            .drain(..)
+            .map(|f| (display_path(&f), std::fs::read_to_string(&f).unwrap()))
+            .collect();
+        sources.push(("DESCRIBED".into(), DESCRIBED.into()));
+
+        let mut with_text: BTreeMap<&str, usize> = BTreeMap::new();
+        for (name, text) in &sources {
+            let lf = LoadedFeature::from_text(PathBuf::from(name), text)
+                .unwrap_or_else(|e| panic!("{name} does not parse: {e:#}"));
+            for (kind, line, parsed) in described_elements(&lf.feature) {
+                let scanned = lf.description(line);
+                assert_eq!(
+                    said(parsed),
+                    said(scanned),
+                    "{name}:{line} ({kind}): gherkin says {parsed:?}, the scanner {scanned:?}"
+                );
+                assert_eq!(
+                    parsed.is_some(),
+                    scanned.is_some(),
+                    "{name}:{line} ({kind}): gherkin says {parsed:?}, the scanner {scanned:?}"
+                );
+                if scanned.is_some() {
+                    *with_text.entry(kind).or_default() += 1;
+                }
+            }
+        }
+        for kind in [
+            "feature",
+            "background",
+            "rule",
+            "rule background",
+            "scenario",
+            "examples",
+        ] {
+            assert!(
+                with_text.get(kind).is_some_and(|n| *n > 0),
+                "{kind}: no description seen"
+            );
+        }
     }
 
     #[test]
