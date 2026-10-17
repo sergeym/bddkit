@@ -186,6 +186,103 @@ pub struct ScenarioRef<'a> {
     pub rule: Option<&'a gherkin::Rule>,
 }
 
+/// An element of a feature that gherkin gives a keyword line to.
+struct Element<'a> {
+    /// `feature`, `background`, `rule`, `rule background`, `scenario` or `examples`.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "named in the agreement tests' messages")
+    )]
+    kind: &'static str,
+    line: usize,
+    /// gherkin's own description, with what it loses.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the reference the agreement test compares to")
+    )]
+    description: Option<&'a str>,
+    /// gherkin's own tags; `None` where Gherkin has none (a Background).
+    tags: Option<&'a [String]>,
+}
+
+/// Every element in file order, and the lines of what hangs below them (steps and
+/// `Examples` tables) — the one walk of the tree both source scanners start from.
+struct Walk<'a> {
+    elements: Vec<Element<'a>>,
+    below: Vec<usize>,
+}
+
+impl<'a> Walk<'a> {
+    fn new(f: &'a Feature) -> Self {
+        let mut walk = Walk {
+            elements: Vec::new(),
+            below: Vec::new(),
+        };
+        walk.push("feature", f.position.line, &f.description, Some(&f.tags));
+        if let Some(bg) = &f.background {
+            walk.background("background", bg);
+        }
+        for sc in &f.scenarios {
+            walk.scenario(sc);
+        }
+        for rule in &f.rules {
+            walk.push(
+                "rule",
+                rule.position.line,
+                &rule.description,
+                Some(&rule.tags),
+            );
+            if let Some(bg) = &rule.background {
+                walk.background("rule background", bg);
+            }
+            for sc in &rule.scenarios {
+                walk.scenario(sc);
+            }
+        }
+        walk
+    }
+
+    fn push(
+        &mut self,
+        kind: &'static str,
+        line: usize,
+        description: &'a Option<String>,
+        tags: Option<&'a [String]>,
+    ) {
+        let description = description.as_deref();
+        self.elements.push(Element {
+            kind,
+            line,
+            description,
+            tags,
+        });
+    }
+
+    fn background(&mut self, kind: &'static str, bg: &'a gherkin::Background) {
+        self.push(kind, bg.position.line, &bg.description, None);
+        self.below.extend(bg.steps.iter().map(|s| s.position.line));
+    }
+
+    fn scenario(&mut self, sc: &'a gherkin::Scenario) {
+        self.push(
+            "scenario",
+            sc.position.line,
+            &sc.description,
+            Some(&sc.tags),
+        );
+        self.below.extend(sc.steps.iter().map(|s| s.position.line));
+        for ex in &sc.examples {
+            self.push(
+                "examples",
+                ex.position.line,
+                &ex.description,
+                Some(&ex.tags),
+            );
+            self.below.extend(ex.table.iter().map(|t| t.position.line));
+        }
+    }
+}
+
 /// Reads every element's own tags from the source. gherkin keeps them as bare
 /// names with no position, and `from_text` then merges rule and feature tags into
 /// each scenario, so neither the line nor the level survives in the tree. The tags
@@ -193,21 +290,14 @@ pub struct ScenarioRef<'a> {
 /// `#` lines; a word that begins with `#` starts a comment, as gherkin reads it
 /// (`@b#x` is one tag, `b#x`).
 fn scan_tags(text: &str, feature: &Feature) -> BTreeMap<usize, Vec<(String, usize)>> {
-    let mut keywords = vec![feature.position.line];
-    let scenarios = |keywords: &mut Vec<usize>, scenarios: &[gherkin::Scenario]| {
-        for sc in scenarios {
-            keywords.push(sc.position.line);
-            keywords.extend(sc.examples.iter().map(|ex| ex.position.line));
-        }
-    };
-    scenarios(&mut keywords, &feature.scenarios);
-    for rule in &feature.rules {
-        keywords.push(rule.position.line);
-        scenarios(&mut keywords, &rule.scenarios);
-    }
+    let walk = Walk::new(feature);
+    let keywords = walk
+        .elements
+        .iter()
+        .filter(|e| e.tags.is_some())
+        .map(|e| e.line);
     let lines: Vec<&str> = text.lines().collect();
     keywords
-        .into_iter()
         .filter_map(|keyword| {
             let mut above: Vec<Vec<(String, usize)>> = Vec::new();
             for line in (1..keyword).rev() {
@@ -484,26 +574,6 @@ pub(crate) fn description_of<'a>(lines: impl Iterator<Item = &'a str>) -> Option
     Some(text)
 }
 
-/// The `line` of every element that can carry a description go in `described`;
-/// the lines of what can follow one (steps, tables) in `others`.
-fn collect_background(
-    bg: &gherkin::Background,
-    described: &mut Vec<usize>,
-    others: &mut Vec<usize>,
-) {
-    described.push(bg.position.line);
-    others.extend(bg.steps.iter().map(|s| s.position.line));
-}
-
-fn collect_scenario(sc: &gherkin::Scenario, described: &mut Vec<usize>, others: &mut Vec<usize>) {
-    described.push(sc.position.line);
-    others.extend(sc.steps.iter().map(|s| s.position.line));
-    for ex in &sc.examples {
-        described.push(ex.position.line);
-        others.extend(ex.table.iter().map(|t| t.position.line));
-    }
-}
-
 /// Reads every description from the source. An element's description is the text
 /// between its keyword line and the next line gherkin gave a position to — the
 /// positions, not a list of keywords, so a `# language: ru` file needs nothing
@@ -511,27 +581,17 @@ fn collect_scenario(sc: &gherkin::Scenario, described: &mut Vec<usize>, others: 
 /// no rule of its own: gherkin positions every table, and a `|` line elsewhere is
 /// description text.
 fn scan_descriptions(text: &str, feature: &Feature) -> BTreeMap<usize, String> {
-    let mut described = vec![feature.position.line];
-    let mut others = Vec::new();
-    if let Some(bg) = &feature.background {
-        collect_background(bg, &mut described, &mut others);
-    }
-    for sc in &feature.scenarios {
-        collect_scenario(sc, &mut described, &mut others);
-    }
-    for rule in &feature.rules {
-        described.push(rule.position.line);
-        if let Some(bg) = &rule.background {
-            collect_background(bg, &mut described, &mut others);
-        }
-        for sc in &rule.scenarios {
-            collect_scenario(sc, &mut described, &mut others);
-        }
-    }
+    let walk = Walk::new(feature);
     let lines: Vec<&str> = text.lines().collect();
-    let marks: BTreeSet<usize> = described.iter().chain(&others).copied().collect();
-    described
-        .into_iter()
+    let marks: BTreeSet<usize> = walk
+        .elements
+        .iter()
+        .map(|e| e.line)
+        .chain(walk.below.iter().copied())
+        .collect();
+    walk.elements
+        .iter()
+        .map(|e| e.line)
         .filter_map(|line| {
             // Lines are 1-based, so `lines[line..]` starts right after the keyword.
             let end = marks
@@ -1042,38 +1102,22 @@ Feature: F
         assert_eq!(said(rule.scenarios[0].position.line), Some("rs desc"));
     }
 
-    /// (kind, keyword line, gherkin's description) of an element that can carry one.
-    type Element<'a> = (&'static str, usize, Option<&'a str>);
-
-    /// Every element that can carry a description.
-    fn described_elements(f: &Feature) -> Vec<Element<'_>> {
-        let mut out = vec![("feature", f.position.line, f.description.as_deref())];
-        fn scenario<'a>(out: &mut Vec<Element<'a>>, sc: &'a gherkin::Scenario) {
-            out.push(("scenario", sc.position.line, sc.description.as_deref()));
-            for ex in &sc.examples {
-                out.push(("examples", ex.position.line, ex.description.as_deref()));
-            }
-        }
-        if let Some(bg) = &f.background {
-            out.push(("background", bg.position.line, bg.description.as_deref()));
-        }
-        for sc in &f.scenarios {
-            scenario(&mut out, sc);
-        }
-        for rule in &f.rules {
-            out.push(("rule", rule.position.line, rule.description.as_deref()));
-            if let Some(bg) = &rule.background {
-                out.push((
-                    "rule background",
-                    bg.position.line,
-                    bg.description.as_deref(),
-                ));
-            }
-            for sc in &rule.scenarios {
-                scenario(&mut out, sc);
-            }
-        }
-        out
+    /// Every `.feature` in the repository's own suites, and `DESCRIBED`, as
+    /// `(name, source)` — what the agreement tests check the scanners against.
+    fn fixture_sources() -> Vec<(String, String)> {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let dirs: Vec<PathBuf> = ["tests", "examples", "selftest"]
+            .iter()
+            .map(|d| root.join(d))
+            .collect();
+        let files = discover(&dirs).unwrap();
+        assert!(files.len() > 20, "found only {files:?}");
+        let mut sources: Vec<_> = files
+            .iter()
+            .map(|f| (display_path(f), std::fs::read_to_string(f).unwrap()))
+            .collect();
+        sources.push(("DESCRIBED".into(), DESCRIBED.into()));
+        sources
     }
 
     /// What two descriptions say, ignoring what gherkin throws away or we keep:
@@ -1086,24 +1130,17 @@ Feature: F
 
     #[test]
     fn the_parser_and_the_scanner_agree_on_which_elements_have_a_description() {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let dirs: Vec<PathBuf> = ["tests", "examples", "selftest"]
-            .iter()
-            .map(|d| root.join(d))
-            .collect();
-        let mut files = discover(&dirs).unwrap();
-        assert!(files.len() > 20, "found only {files:?}");
-        let mut sources: Vec<(String, String)> = files
-            .drain(..)
-            .map(|f| (display_path(&f), std::fs::read_to_string(&f).unwrap()))
-            .collect();
-        sources.push(("DESCRIBED".into(), DESCRIBED.into()));
-
         let mut with_text: BTreeMap<&str, usize> = BTreeMap::new();
-        for (name, text) in &sources {
+        for (name, text) in &fixture_sources() {
             let lf = LoadedFeature::from_text(PathBuf::from(name), text)
                 .unwrap_or_else(|e| panic!("{name} does not parse: {e:#}"));
-            for (kind, line, parsed) in described_elements(&lf.feature) {
+            for Element {
+                kind,
+                line,
+                description: parsed,
+                ..
+            } in Walk::new(&lf.feature).elements
+            {
                 let scanned = lf.description(line);
                 assert_eq!(
                     said(parsed),
@@ -1180,28 +1217,20 @@ Feature: F
 
     #[test]
     fn the_scanned_tags_are_the_ones_gherkin_parsed_for_every_element() {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let dirs: Vec<PathBuf> = ["tests", "examples", "selftest"]
-            .iter()
-            .map(|d| root.join(d))
-            .collect();
-        let mut sources: Vec<(String, String)> = discover(&dirs)
-            .unwrap()
-            .into_iter()
-            .map(|f| (display_path(&f), std::fs::read_to_string(&f).unwrap()))
-            .collect();
-        sources.push(("DESCRIBED".into(), DESCRIBED.into()));
-
         let mut tagged: BTreeMap<&str, usize> = BTreeMap::new();
-        for (name, text) in &sources {
+        for (name, text) in &fixture_sources() {
             let lf = LoadedFeature::from_text(PathBuf::from(name), text).unwrap();
             // `from_text` merges feature and rule tags into each scenario; the
             // parser's own, unmerged view is the reference.
             let raw = Feature::parse(text, GherkinEnv::default()).unwrap();
-            for (kind, line, tags) in tagged_elements(&raw) {
+            for Element {
+                kind, line, tags, ..
+            } in Walk::new(&raw).elements
+            {
+                let Some(tags) = tags else { continue };
                 let scanned: Vec<&str> =
                     lf.own_tags(line).iter().map(|(n, _)| n.as_str()).collect();
-                assert_eq!(tags, scanned, "{name}:{line} ({kind})");
+                assert_eq!(tags, scanned.as_slice(), "{name}:{line} ({kind})");
                 if !tags.is_empty() {
                     *tagged.entry(kind).or_default() += 1;
                 }
@@ -1215,46 +1244,6 @@ Feature: F
         }
     }
 
-    /// (kind, keyword line, gherkin's own tags) of every element that can carry tags.
-    fn tagged_elements(f: &Feature) -> Vec<(&'static str, usize, Vec<&str>)> {
-        fn scenario<'a>(
-            out: &mut Vec<(&'static str, usize, Vec<&'a str>)>,
-            sc: &'a gherkin::Scenario,
-        ) {
-            out.push((
-                "scenario",
-                sc.position.line,
-                sc.tags.iter().map(String::as_str).collect(),
-            ));
-            for ex in &sc.examples {
-                out.push((
-                    "examples",
-                    ex.position.line,
-                    ex.tags.iter().map(String::as_str).collect(),
-                ));
-            }
-        }
-        let mut out = vec![(
-            "feature",
-            f.position.line,
-            f.tags.iter().map(String::as_str).collect(),
-        )];
-        for sc in &f.scenarios {
-            scenario(&mut out, sc);
-        }
-        for rule in &f.rules {
-            out.push((
-                "rule",
-                rule.position.line,
-                rule.tags.iter().map(String::as_str).collect(),
-            ));
-            for sc in &rule.scenarios {
-                scenario(&mut out, sc);
-            }
-        }
-        out
-    }
-
     #[test]
     fn a_description_line_that_starts_with_a_pipe_is_kept() {
         let src = "Feature: F\n  intro\n  | not a table\n  Scenario: s\n    why | because\n    | x |\n    Given set variable \"a\" to \"1\"\n";
@@ -1262,8 +1251,11 @@ Feature: F
         assert_eq!(lf.description(1), Some("intro\n| not a table"));
         assert_eq!(lf.description(4), Some("why | because\n| x |"));
         // gherkin reads the same lines as description text.
-        for (_, line, parsed) in described_elements(&lf.feature) {
-            assert_eq!(said(parsed), said(lf.description(line)), "line {line}");
+        for Element {
+            line, description, ..
+        } in Walk::new(&lf.feature).elements
+        {
+            assert_eq!(said(description), said(lf.description(line)), "line {line}");
         }
     }
 

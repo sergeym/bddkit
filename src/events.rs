@@ -269,12 +269,16 @@ impl Trace {
             "name": trace.redactor.mask(&feature.name),
             "tags": trace.tags(lf.own_tags(feature.position.line).iter().map(|(name, _)| name.as_str())),
         });
-        trace.put_description(&mut fields, lf.description(feature.position.line));
+        trace.put(
+            &mut fields,
+            "description",
+            lf.description(feature.position.line).unwrap_or(""),
+        );
         if let Some(background) = &feature.background {
             fields["background"] = trace.element(
                 background.position.line,
                 &background.name,
-                lf.description(background.position.line),
+                lf.description(background.position.line).unwrap_or(""),
             );
         }
         events.emit("file_started", fields);
@@ -290,17 +294,11 @@ impl Trace {
         }
     }
 
-    fn put_description(&self, fields: &mut Value, description: Option<&str>) {
-        if let Some(description) = description {
-            self.put(fields, "description", description);
-        }
-    }
-
     /// `{"line", "name", "description"}` of a background, rule or examples block.
-    fn element(&self, line: usize, name: &str, description: Option<&str>) -> Value {
+    fn element(&self, line: usize, name: &str, description: &str) -> Value {
         let mut element = json!({"line": line});
         self.put(&mut element, "name", name);
-        self.put_description(&mut element, description);
+        self.put(&mut element, "description", description);
         element
     }
 
@@ -330,16 +328,23 @@ impl Trace {
         if let Some(example) = ex.example {
             fields["example"] = example.into();
         }
-        self.put_description(&mut fields, lf.description(ex.line));
+        self.put(
+            &mut fields,
+            "description",
+            lf.description(ex.line).unwrap_or(""),
+        );
         if let Some(rule) = sc.rule {
             let mut element = self.element(
                 rule.position.line,
                 &rule.name,
-                lf.description(rule.position.line),
+                lf.description(rule.position.line).unwrap_or(""),
             );
             if let Some(bg) = &rule.background {
-                element["background"] =
-                    self.element(bg.position.line, &bg.name, lf.description(bg.position.line));
+                element["background"] = self.element(
+                    bg.position.line,
+                    &bg.name,
+                    lf.description(bg.position.line).unwrap_or(""),
+                );
             }
             fields["rule"] = element;
         }
@@ -354,7 +359,7 @@ impl Trace {
             fields["examples"] = self.element(
                 line,
                 block.name.as_deref().unwrap_or(""),
-                lf.description(line),
+                lf.description(line).unwrap_or(""),
             );
         }
         events.emit("scenario_started", fields);
