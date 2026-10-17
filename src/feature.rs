@@ -325,7 +325,9 @@ pub fn expand_outlines(sc: &gherkin::Scenario) -> Vec<ExpandedScenario> {
 }
 
 pub fn load(path: &Path) -> Result<LoadedFeature> {
-    let mut feature = Feature::parse_path(path, GherkinEnv::default())
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read {}", display_path(path)))?;
+    let mut feature = Feature::parse(&text, GherkinEnv::default())
         .with_context(|| format!("failed to parse {}", display_path(path)))?;
     // Tags above `Feature:` apply to all of its scenarios. gherkin stores them
     // separately, but a tester who writes @billing above the feature expects the
@@ -712,6 +714,31 @@ Feature: f
     fn display_path_leaves_a_unix_style_path_unchanged() {
         let p = PathBuf::from("features/api/users/create.feature");
         assert_eq!(display_path(&p), "features/api/users/create.feature");
+    }
+
+    #[test]
+    fn load_names_the_path_when_the_file_cannot_be_read() {
+        let path = std::env::temp_dir()
+            .join("bddkit_no_such_dir")
+            .join("a.feature");
+        let err = format!("{:#}", load(&path).unwrap_err());
+        assert!(err.contains("failed to read"), "{err}");
+        assert!(err.contains("bddkit_no_such_dir/a.feature"), "{err}");
+    }
+
+    #[test]
+    fn load_names_the_path_and_position_of_a_syntax_error() {
+        let path = std::env::temp_dir().join("bddkit_syntax_error.feature");
+        std::fs::write(
+            &path,
+            "Feature: x\n  Scenario: a\n    Given foo\n  Bogus line\n",
+        )
+        .unwrap();
+        let err = format!("{:#}", load(&path).unwrap_err());
+        std::fs::remove_file(&path).ok();
+        assert!(err.contains("failed to parse"), "{err}");
+        assert!(err.contains("bddkit_syntax_error.feature"), "{err}");
+        assert!(err.contains("Error at 5:1"), "{err}");
     }
 
     #[test]
