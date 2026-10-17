@@ -507,8 +507,9 @@ fn collect_scenario(sc: &gherkin::Scenario, described: &mut Vec<usize>, others: 
 /// Reads every description from the source. An element's description is the text
 /// between its keyword line and the next line gherkin gave a position to — the
 /// positions, not a list of keywords, so a `# language: ru` file needs nothing
-/// extra. Tags have no position, so a tag line ends the text too, and so does a
-/// table row.
+/// extra. Tags have no position, so a tag line ends the text too. A table row needs
+/// no rule of its own: gherkin positions every table, and a `|` line elsewhere is
+/// description text.
 fn scan_descriptions(text: &str, feature: &Feature) -> BTreeMap<usize, String> {
     let mut described = vec![feature.position.line];
     let mut others = Vec::new();
@@ -538,7 +539,7 @@ fn scan_descriptions(text: &str, feature: &Feature) -> BTreeMap<usize, String> {
                 .next()
                 .map_or(lines.len(), |next| next - 1);
             let body = lines.get(line..end)?.iter().copied();
-            let body = body.take_while(|l| !l.trim_start().starts_with(['@', '|']));
+            let body = body.take_while(|l| !l.trim_start().starts_with('@'));
             Some((line, description_of(body)?))
         })
         .collect()
@@ -1252,6 +1253,18 @@ Feature: F
             }
         }
         out
+    }
+
+    #[test]
+    fn a_description_line_that_starts_with_a_pipe_is_kept() {
+        let src = "Feature: F\n  intro\n  | not a table\n  Scenario: s\n    why | because\n    | x |\n    Given set variable \"a\" to \"1\"\n";
+        let lf = LoadedFeature::from_text(PathBuf::from("t.feature"), src).unwrap();
+        assert_eq!(lf.description(1), Some("intro\n| not a table"));
+        assert_eq!(lf.description(4), Some("why | because\n| x |"));
+        // gherkin reads the same lines as description text.
+        for (_, line, parsed) in described_elements(&lf.feature) {
+            assert_eq!(said(parsed), said(lf.description(line)), "line {line}");
+        }
     }
 
     #[test]
