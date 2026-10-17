@@ -7,7 +7,7 @@
 //! so a slow reader of a FIFO cannot change a test's timing.
 
 use crate::artifacts::{Artifacts, media_type};
-use crate::feature::{LoadedFeature, display_path};
+use crate::feature::{ExpandedScenario, LoadedFeature, ScenarioRef, display_path};
 use crate::http::Exchange;
 use crate::plugin::abi::Diagnostic;
 use crate::privacy::{Redactor, mask_ranges};
@@ -311,17 +311,51 @@ impl Trace {
             .collect()
     }
 
-    pub fn scenario_started(&mut self, name: &str, line: usize, example: Option<usize>) {
+    pub fn scenario_started(
+        &mut self,
+        lf: &LoadedFeature,
+        sc: ScenarioRef<'_>,
+        ex: &ExpandedScenario,
+    ) {
         let Some(events) = &self.events else { return };
         self.scenario = self.scenarios;
         self.scenarios += 1;
         self.steps = 0;
         self.open.clear();
+        let tags = lf.effective_tags(sc).into_iter().map(|(name, _)| name);
         let mut fields = json!({
-            "file": self.file, "scenario": self.scenario, "name": self.redactor.mask(name), "line": line,
+            "file": self.file, "scenario": self.scenario, "name": self.redactor.mask(&ex.name),
+            "line": ex.line, "tags": self.tags(tags),
         });
-        if let Some(example) = example {
+        if let Some(example) = ex.example {
             fields["example"] = example.into();
+        }
+        self.put_description(&mut fields, lf.description(ex.line));
+        if let Some(rule) = sc.rule {
+            let mut element = self.element(
+                rule.position.line,
+                &rule.name,
+                lf.description(rule.position.line),
+            );
+            if let Some(bg) = &rule.background {
+                element["background"] =
+                    self.element(bg.position.line, &bg.name, lf.description(bg.position.line));
+            }
+            fields["rule"] = element;
+        }
+        let block = ex.examples_line.and_then(|line| {
+            sc.scenario
+                .examples
+                .iter()
+                .find(|e| e.position.line == line)
+        });
+        if let Some(block) = block {
+            let line = block.position.line;
+            fields["examples"] = self.element(
+                line,
+                block.name.as_deref().unwrap_or(""),
+                lf.description(line),
+            );
         }
         events.emit("scenario_started", fields);
     }

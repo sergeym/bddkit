@@ -3568,11 +3568,46 @@ fn feature_background_rule_and_examples_descriptions_reach_the_stream() {
                 "b.feature",
                 "Feature: Bare\n  Background:\n    Given set variable \"a\" to \"1\"\n  Scenario: s\n    Given set variable \"b\" to \"2\"\n",
             ),
+            (
+                "c.feature",
+                "Feature: Ruled\n  Scenario: Loose\n    Given set variable \"a\" to \"1\"\n  Rule: Money\n    Everything about money.\n    Background: Prep\n      Prep text.\n      Given set variable \"a\" to \"1\"\n    Scenario Outline: pay\n      Given set variable \"n\" to \"<n>\"\n      Examples: Amounts\n        Rows of amounts.\n        | n |\n        | 1 |\n        | 2 |\n",
+            ),
         ],
         None,
     );
     let (out, stream, _) = run_with_events(&cfg, &[]);
     assert_eq!(out.status.code(), Some(0), "{out:?}");
+
+    // A scenario inside a rule names the rule, its background and, for an
+    // outline row, the Examples block it came from.
+    let scenarios = of_type(&stream, "scenario_started");
+    let rows: Vec<_> = scenarios
+        .iter()
+        .filter(|e| e["name"].as_str().is_some_and(|n| n.starts_with("pay")))
+        .collect();
+    assert_eq!(rows.len(), 2, "{scenarios:?}");
+    for row in rows {
+        assert_eq!(
+            row["rule"],
+            serde_json::json!({
+                "line": 4, "name": "Money", "description": "Everything about money.",
+                "background": {"line": 6, "name": "Prep", "description": "Prep text."},
+            })
+        );
+        assert_eq!(
+            row["examples"],
+            serde_json::json!({"line": 11, "name": "Amounts", "description": "Rows of amounts."})
+        );
+    }
+    let loose = scenarios
+        .iter()
+        .find(|e| e["name"] == "Loose")
+        .expect("Loose");
+    assert!(
+        loose.get("rule").is_none() && loose.get("examples").is_none(),
+        "{loose}"
+    );
+
     let started = of_type(&stream, "file_started");
     let file = |name: &str| started.iter().find(|e| e["name"] == name).expect(name);
 
@@ -3592,6 +3627,96 @@ fn feature_background_rule_and_examples_descriptions_reach_the_stream() {
     assert_eq!(bare["tags"], serde_json::json!([]));
     assert_eq!(bare["background"], serde_json::json!({"line": 2}));
     assert!(bare.get("description").is_none(), "{bare}");
+}
+
+#[test]
+fn a_scenario_description_reaches_the_stream_with_its_paragraphs() {
+    let cfg = write_events_project(
+        "descriptions-scenario",
+        "",
+        &[(
+            "a.feature",
+            "Feature: f\n  Scenario: Described\n    Why this exists.\n\n      Indented bit.\n\n    Second paragraph.\n    Given set variable \"a\" to \"1\"\n  Scenario: Bare\n    Given set variable \"a\" to \"1\"\n",
+        )],
+        None,
+    );
+    let (out, stream, _) = run_with_events(&cfg, &[]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let started = of_type(&stream, "scenario_started");
+    let by = |name: &str| started.iter().find(|e| e["name"] == name).expect(name);
+    assert_eq!(
+        by("Described")["description"],
+        "Why this exists.\n\n  Indented bit.\n\nSecond paragraph."
+    );
+    assert!(by("Bare").get("description").is_none(), "{}", by("Bare"));
+}
+
+#[test]
+fn scenario_started_carries_the_tags_the_filter_saw() {
+    let cfg = write_events_project(
+        "descriptions-tags",
+        "",
+        &[
+            (
+                "a.feature",
+                "@f @dup\nFeature: Tagged\n  Scenario: Untagged\n    Given set variable \"a\" to \"1\"\n  @r\n  Rule: R\n    @s @dup\n    Scenario: Picked\n      Given set variable \"a\" to \"1\"\n",
+            ),
+            (
+                "b.feature",
+                "Feature: Plain\n  Scenario: Plain one\n    Given set variable \"a\" to \"1\"\n",
+            ),
+        ],
+        None,
+    );
+
+    // Own tags, then the rule's, then the feature's, each name once.
+    let (_, stream, _) = run_with_events(&cfg, &["--tag", "s"]);
+    let started = of_type(&stream, "scenario_started");
+    assert_eq!(
+        started.len(),
+        1,
+        "only what the filter selected: {started:?}"
+    );
+    assert_eq!(
+        started[0]["tags"],
+        serde_json::json!(["@s", "@dup", "@r", "@f"])
+    );
+
+    let (_, stream, _) = run_with_events(&cfg, &[]);
+    let started = of_type(&stream, "scenario_started");
+    let tags = |name: &str| started.iter().find(|e| e["name"] == name).expect(name)["tags"].clone();
+    assert_eq!(tags("Untagged"), serde_json::json!(["@f", "@dup"]));
+    assert_eq!(tags("Plain one"), serde_json::json!([]), "always present");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_secret_in_a_description_is_masked_in_the_stream() {
+    let base = common::spawn().await;
+    let feature = "Feature: Secrets\n  Bearer cfg-secret-value-77 is in the feature description.\n  Scenario: first\n    Given set variable \"secret_note\" to \"stream-note-4321\"\n  Scenario: second\n    Quotes stream-note-4321 and Bearer cfg-secret-value-77 here.\n    Given set variable \"x\" to \"1\"\n";
+    let cfg = masking_project(
+        "mask-description",
+        &base,
+        feature,
+        "      default_headers:\n        Authorization: Bearer cfg-secret-value-77\n",
+        "",
+    );
+    let events = cfg.with_file_name("events.ndjson");
+    let (code, _, stderr) = run_masking(&cfg, &["--events", events.to_str().expect("utf-8")], &[]);
+    assert_eq!(code, 0, "{stderr}");
+
+    let text = std::fs::read_to_string(&events).expect("stream");
+    assert!(!text.contains("cfg-secret-value-77"), "{text}");
+    let stream = read_stream(&events);
+    // Known from the config: hidden before the first scenario runs.
+    assert_eq!(
+        of_type(&stream, "file_started")[0]["description"],
+        "*** is in the feature description."
+    );
+    // Learned in scenario one, quoted in scenario two: the file's set is shared.
+    assert_eq!(
+        of_type(&stream, "scenario_started")[1]["description"],
+        "Quotes *** and *** here."
+    );
 }
 
 #[test]

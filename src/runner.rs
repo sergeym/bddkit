@@ -789,7 +789,8 @@ pub async fn run_file(lf: Arc<LoadedFeature>, ctx: Arc<RunContext>) -> FileResul
     // would conflict with the later `&mut world` in the dispatch call.
     let generator = world.generator.clone();
 
-    for ScenarioRef { scenario: sc, rule } in lf.scenarios() {
+    for scenario_ref in lf.scenarios() {
+        let ScenarioRef { scenario: sc, rule } = scenario_ref;
         if !ctx.filter.matches(&sc.tags) {
             continue;
         }
@@ -828,7 +829,7 @@ pub async fn run_file(lf: Arc<LoadedFeature>, ctx: Arc<RunContext>) -> FileResul
                 }
             };
 
-            world.trace.scenario_started(&ex.name, ex.line, ex.example);
+            world.trace.scenario_started(&lf, scenario_ref, &ex);
             let started = Instant::now();
             let mut steps = Vec::with_capacity(background.len() + ex.steps.len());
             for step in background.iter().chain(ex.steps.iter()) {
