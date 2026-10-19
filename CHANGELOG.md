@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.3](https://github.com/sergeym/bddkit/compare/v0.3.2...v0.3.3) - 2026-10-19
+
+### Added
+
+- *(report)* an interrupt leaves no temporary file; docs and CI for --embed-artifacts (bddkit/bddkit#111)
+- *(report)* a progress line on a terminal (bddkit/bddkit#111)
+- *(report)* --embed-images lossy and --embed-quality (bddkit/bddkit#111)
+- *(report)* --embed-images lossless, PNG as lossless WebP (bddkit/bddkit#111)
+- *(report)* embed the files a report links to, as they are (bddkit/bddkit#111)
+- *(report)* --embed-* flags and their refusals (bddkit/bddkit#111)
+
 ## [0.3.2](https://github.com/bddkit/bddkit/compare/v0.3.1...v0.3.2) - 2026-10-18
 
 ### Added
