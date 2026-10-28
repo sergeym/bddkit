@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/sergeym/bddkit/compare/v0.3.4...v0.4.0) - 2026-10-28
+
+### Added
+
+- *(doctor)* one finding per problem, explain and suggest for an unknown step (bddkit/bddkit#91)
+- *(steps)* [**breaking**] quotes around typed step parameters are optional, decided by the type (bddkit/bddkit#79)
+- *(doctor)* hint on include results read from the shared response and on exports never set (bddkit/bddkit#149)
+
+### Fixed
+
+- *(plugin)* a failed same-version reinstall keeps the working copy (bddkit/bddkit#69)
+- *(plugin)* keep a release another lock file still points at (bddkit/bddkit#69)
+- *(plugin)* write a symlinked lock file through the link (bddkit/bddkit#69)
+- *(plugin)* write lock files atomically (bddkit/bddkit#69)
+- *(plugin)* refuse before the network, warn on shadow correctly, time out (bddkit/bddkit#69)
+
+### Other
+
+- *(plugin)* update with a failing entry, dry-run, absolute user path, hand-written remove, lock shape (bddkit/bddkit#69)
+- *(plugin)* one dll_name helper per side of the binary/integration boundary (bddkit/bddkit#69)
+- Merge pull request #164 from sergeym/fix/issue-69-plugin-atomicity
+- *(doctor)* share the include helpers, give up on plugin steps and Outline names in the include hints (bddkit/bddkit#149)
+
 ## [0.3.4](https://github.com/bddkit/bddkit/compare/v0.3.3...v0.3.4) - 2026-10-27
 
 ### Added
